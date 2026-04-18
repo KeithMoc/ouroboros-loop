@@ -216,7 +216,34 @@ class EvolveStepHandler:
                 )
 
         execute = arguments.get("execute", True)
-        parallel = bool(arguments.get("parallel", get_parallel_default()))
+
+        # Parse parallel with strict validation to avoid truthy string inversion
+        raw_parallel = arguments.get("parallel", get_parallel_default())
+        if isinstance(raw_parallel, bool):
+            parallel = raw_parallel
+        elif raw_parallel is None:
+            parallel = get_parallel_default()
+        elif isinstance(raw_parallel, str):
+            normalized = raw_parallel.strip().lower()
+            if normalized == "true":
+                parallel = True
+            elif normalized == "false":
+                parallel = False
+            else:
+                return Result.err(
+                    MCPToolError(
+                        f"Invalid parallel value: {raw_parallel!r}. Expected boolean or 'true'/'false'.",
+                        tool_name="ouroboros_evolve_step",
+                    )
+                )
+        else:
+            return Result.err(
+                MCPToolError(
+                    f"Invalid parallel type: {type(raw_parallel).__name__}. Expected boolean.",
+                    tool_name="ouroboros_evolve_step",
+                )
+            )
+
         project_dir = arguments.get("project_dir")
         normalized_project_dir = (
             project_dir if isinstance(project_dir, str) and project_dir else None
@@ -351,9 +378,33 @@ class EvolveStepHandler:
             for mf in gen.ontology_delta.modified_fields:
                 text_lines.append(f"- **Modified**: {mf.field_name}: {mf.old_type} → {mf.new_type}")
 
-        # Post-execution QA
+        # Post-execution QA — parse skip_qa with strict validation
         qa_meta = None
-        skip_qa = bool(arguments.get("skip_qa", get_skip_qa_default()))
+        raw_skip_qa = arguments.get("skip_qa", get_skip_qa_default())
+        if isinstance(raw_skip_qa, bool):
+            skip_qa = raw_skip_qa
+        elif raw_skip_qa is None:
+            skip_qa = get_skip_qa_default()
+        elif isinstance(raw_skip_qa, str):
+            normalized = raw_skip_qa.strip().lower()
+            if normalized == "true":
+                skip_qa = True
+            elif normalized == "false":
+                skip_qa = False
+            else:
+                return Result.err(
+                    MCPToolError(
+                        f"Invalid skip_qa value: {raw_skip_qa!r}. Expected boolean or 'true'/'false'.",
+                        tool_name="ouroboros_evolve_step",
+                    )
+                )
+        else:
+            return Result.err(
+                MCPToolError(
+                    f"Invalid skip_qa type: {type(raw_skip_qa).__name__}. Expected boolean.",
+                    tool_name="ouroboros_evolve_step",
+                )
+            )
         if step.action.value in ("continue", "converged") and execute and not skip_qa:
             from ouroboros.mcp.tools.qa import QAHandler
 

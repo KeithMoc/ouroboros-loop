@@ -437,14 +437,14 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                         return Result.err(
                             MCPToolError(
                                 f"Invalid skip_qa value: {raw_skip_qa!r}. Expected boolean or 'true'/'false'.",
-                                tool_name="ouroboros_run_seed",
+                                tool_name="ouroboros_execute_seed",
                             )
                         )
                 else:
                     return Result.err(
                         MCPToolError(
                             f"Invalid skip_qa type: {type(raw_skip_qa).__name__}. Expected boolean.",
-                            tool_name="ouroboros_run_seed",
+                            tool_name="ouroboros_execute_seed",
                         )
                     )
                 if not is_resume:
