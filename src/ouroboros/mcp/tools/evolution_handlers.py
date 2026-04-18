@@ -157,14 +157,14 @@ class EvolveStepHandler:
                         "False: sequential execution (slower, more stable code generation)."
                     ),
                     required=False,
-                    default=True,
+                    default=get_parallel_default(),
                 ),
                 MCPToolParameter(
                     name="skip_qa",
                     type=ToolInputType.BOOLEAN,
                     description="Skip post-execution QA evaluation. Default: false",
                     required=False,
-                    default=False,
+                    default=get_skip_qa_default(),
                 ),
                 MCPToolParameter(
                     name="project_dir",

@@ -463,7 +463,7 @@ async def check_atomicity(
         complexity_label: Complexity = (
             llm_complexity
             if llm_complexity is not None
-            else _complexity_from_score(complexity_score)
+            else "normal"
         )
 
         result = AtomicityResult(

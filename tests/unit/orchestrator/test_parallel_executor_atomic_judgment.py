@@ -47,7 +47,7 @@ async def test_try_decompose_ac_treats_atomic_response_as_terminal() -> None:
     )
 
     assert sub_acs is None
-    assert complexity in {"simple", "normal", "complex"}
+    assert complexity == "normal"
 
 
 @pytest.mark.asyncio

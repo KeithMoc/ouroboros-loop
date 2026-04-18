@@ -421,7 +421,32 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     checkpoint_store=checkpoint_store,
                 )
 
-                skip_qa = bool(arguments.get("skip_qa", get_skip_qa_default()))
+                # Parse skip_qa with strict validation to avoid truthy string inversion
+                raw_skip_qa = arguments.get("skip_qa", get_skip_qa_default())
+                if isinstance(raw_skip_qa, bool):
+                    skip_qa = raw_skip_qa
+                elif raw_skip_qa is None:
+                    skip_qa = get_skip_qa_default()
+                elif isinstance(raw_skip_qa, str):
+                    normalized = raw_skip_qa.strip().lower()
+                    if normalized in {"true", "1"}:
+                        skip_qa = True
+                    elif normalized in {"false", "0"}:
+                        skip_qa = False
+                    else:
+                        return Result.err(
+                            MCPToolError(
+                                f"Invalid skip_qa value: {raw_skip_qa!r}. Expected boolean or 'true'/'false'.",
+                                tool_name="ouroboros_run_seed",
+                            )
+                        )
+                else:
+                    return Result.err(
+                        MCPToolError(
+                            f"Invalid skip_qa type: {type(raw_skip_qa).__name__}. Expected boolean.",
+                            tool_name="ouroboros_run_seed",
+                        )
+                    )
                 if not is_resume:
                     prepared = await runner.prepare_session(
                         seed,
