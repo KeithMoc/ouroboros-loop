@@ -436,7 +436,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     else:
                         return Result.err(
                             MCPToolError(
-                                f"Invalid skip_qa value: {raw_skip_qa!r}. Expected boolean or 'true'/'false'.",
+                                f"Invalid skip_qa value: {raw_skip_qa!r}. Expected boolean, 'true'/'false', or '1'/'0'.",
                                 tool_name="ouroboros_execute_seed",
                             )
                         )
