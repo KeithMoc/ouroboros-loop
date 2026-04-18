@@ -113,6 +113,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -253,6 +254,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 del prompt, tools, system_prompt, resume_session_id
                 yield AgentMessage(
@@ -370,6 +372,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -475,6 +478,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 del prompt, tools, system_prompt, resume_session_id
                 yield AgentMessage(
@@ -541,6 +545,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 del prompt, tools, system_prompt, resume_handle, resume_session_id
                 try:
@@ -562,7 +567,7 @@ class TestParallelACExecutor:
             "ouroboros.orchestrator.parallel_executor.DECOMPOSITION_TIMEOUT_SECONDS",
             0.01,
         ):
-            result = await executor._try_decompose_ac(
+            sub_acs, complexity = await executor._try_decompose_ac(
                 ac_content="Implement the full OpenCode runtime adapter.",
                 ac_index=0,
                 seed_goal="Ship OpenCode support",
@@ -570,7 +575,8 @@ class TestParallelACExecutor:
                 system_prompt="system",
             )
 
-        assert result is None
+        assert sub_acs is None
+        assert complexity == "normal"
         assert runtime.cancelled is True
 
     @pytest.mark.asyncio
@@ -584,7 +590,11 @@ class TestParallelACExecutor:
         )
         executor._emit_subtask_event = AsyncMock()
         executor._try_decompose_ac = AsyncMock(
-            side_effect=[["Extract parser", "Wire parser"], None, None]
+            side_effect=[
+                (["Extract parser", "Wire parser"], "complex"),
+                (None, "normal"),
+                (None, "normal"),
+            ]
         )
 
         async def fake_execute_atomic_ac(**kwargs: Any) -> ACExecutionResult:
@@ -649,7 +659,11 @@ class TestParallelACExecutor:
         )
         executor._emit_subtask_event = AsyncMock()
         executor._try_decompose_ac = AsyncMock(
-            side_effect=[["Extract parser", "Wire parser"], None, None]
+            side_effect=[
+                (["Extract parser", "Wire parser"], "complex"),
+                (None, "normal"),
+                (None, "normal"),
+            ]
         )
 
         async def fake_execute_atomic_ac(**kwargs: Any) -> ACExecutionResult:
@@ -701,7 +715,7 @@ class TestParallelACExecutor:
         executor._emit_subtask_event = AsyncMock()
         executor._try_decompose_ac = AsyncMock(
             side_effect=[
-                ["Depth 3 child A", "Depth 3 child B"],
+                (["Depth 3 child A", "Depth 3 child B"], "complex"),
             ]
         )
 
@@ -902,7 +916,11 @@ class TestParallelACExecutor:
         )
         executor._emit_subtask_event = AsyncMock()
         executor._try_decompose_ac = AsyncMock(
-            side_effect=[["Retry leaf", "Stable leaf"], None, None]
+            side_effect=[
+                (["Retry leaf", "Stable leaf"], "complex"),
+                (None, "normal"),
+                (None, "normal"),
+            ]
         )
 
         async def fake_execute_atomic_ac(**kwargs: Any) -> ACExecutionResult:
@@ -1057,6 +1075,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1165,6 +1184,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1293,6 +1313,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1405,6 +1426,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 assert isinstance(resume_handle, RuntimeHandle)
                 reconnectable_handle = RuntimeHandle(
@@ -1512,6 +1534,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1627,6 +1650,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1745,6 +1769,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1891,6 +1916,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -1981,6 +2007,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -2114,6 +2141,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -2260,6 +2288,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -2367,6 +2396,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {
@@ -3344,6 +3374,7 @@ class TestParallelACExecutor:
                 system_prompt: str | None = None,
                 resume_handle: RuntimeHandle | None = None,
                 resume_session_id: str | None = None,
+                model: str | None = None,
             ):
                 self.calls.append(
                     {

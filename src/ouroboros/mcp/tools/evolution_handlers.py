@@ -15,6 +15,7 @@ from typing import Any
 import structlog
 import yaml
 
+from ouroboros.config import get_parallel_default, get_skip_qa_default
 from ouroboros.core.project_paths import resolve_path_against_base, resolve_seed_project_path
 from ouroboros.core.seed import Seed
 from ouroboros.core.text import truncate_head_tail
@@ -215,7 +216,7 @@ class EvolveStepHandler:
                 )
 
         execute = arguments.get("execute", True)
-        parallel = arguments.get("parallel", True)
+        parallel = bool(arguments.get("parallel", get_parallel_default()))
         project_dir = arguments.get("project_dir")
         normalized_project_dir = (
             project_dir if isinstance(project_dir, str) and project_dir else None
@@ -352,7 +353,7 @@ class EvolveStepHandler:
 
         # Post-execution QA
         qa_meta = None
-        skip_qa = arguments.get("skip_qa", False)
+        skip_qa = bool(arguments.get("skip_qa", get_skip_qa_default()))
         if step.action.value in ("continue", "converged") and execute and not skip_qa:
             from ouroboros.mcp.tools.qa import QAHandler
 

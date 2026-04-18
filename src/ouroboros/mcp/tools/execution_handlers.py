@@ -17,6 +17,12 @@ from rich.console import Console
 import structlog
 import yaml
 
+from ouroboros.config import (
+    get_enable_decomposition_default,
+    get_max_decomposition_depth_default,
+    get_parallel_default,
+    get_skip_qa_default,
+)
 from ouroboros.core.errors import ValidationError
 from ouroboros.core.project_paths import resolve_seed_project_path
 from ouroboros.core.security import InputValidator
@@ -407,14 +413,15 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     mcp_manager=self.mcp_manager,
                     mcp_tool_prefix=self.mcp_tool_prefix,
                     debug=False,
-                    enable_decomposition=True,
+                    enable_decomposition=get_enable_decomposition_default(),
+                    max_decomposition_depth=get_max_decomposition_depth_default(),
                     inherited_runtime_handle=inherited_runtime_handle,
                     inherited_tools=inherited_effective_tools,
                     task_workspace=workspace,
                     checkpoint_store=checkpoint_store,
                 )
 
-                skip_qa = arguments.get("skip_qa", False)
+                skip_qa = bool(arguments.get("skip_qa", get_skip_qa_default()))
                 if not is_resume:
                     prepared = await runner.prepare_session(
                         seed,
@@ -451,7 +458,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                             result = await _runner.execute_precreated_session(
                                 seed=_seed,
                                 tracker=_tracker,
-                                parallel=True,
+                                parallel=get_parallel_default(),
                             )
                         if result.is_err:
                             log.error(
