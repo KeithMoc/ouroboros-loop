@@ -374,6 +374,7 @@ class TestOrchestratorRunner:
             seed=sample_seed,
             tracker=tracker,
             parallel=True,
+            mode=None,
         )
 
     @pytest.mark.asyncio
