@@ -1608,11 +1608,16 @@ class OrchestratorRunner:
             # guidance (Claude-CLI auto-load doesn't apply to SDK sessions).
             strategy = get_strategy(seed.task_type)
             if resolved_mode == "compounding":
+                workspace_root = (
+                    self._task_workspace.worktree_path
+                    if self._task_workspace is not None
+                    else self._effective_cwd()
+                )
                 system_prompt = build_system_prompt(
                     seed,
                     strategy=strategy,
                     include_claude_md=True,
-                    workspace_root=self._effective_cwd(),
+                    workspace_root=workspace_root,
                 )
             else:
                 system_prompt = build_system_prompt(seed, strategy=strategy)
@@ -2113,6 +2118,7 @@ class OrchestratorRunner:
                 tools=merged_tools,
                 tool_catalog=tool_catalog.tools,
                 system_prompt=system_prompt,
+                externally_satisfied_acs=externally_satisfied_acs,
             )
         else:
             parallel_result = await parallel_executor.execute_parallel(

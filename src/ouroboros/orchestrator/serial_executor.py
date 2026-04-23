@@ -100,6 +100,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         dependency_graph: "DependencyGraph | None" = None,
         execution_plan: "StagedExecutionPlan | None" = None,
         fail_fast: bool = True,
+        externally_satisfied_acs: "dict[int, dict[str, Any]] | None" = None,
     ) -> ParallelExecutionResult:
         """Execute ACs strictly serially with compounding postmortems.
 
@@ -120,6 +121,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 fails after retries. The compounding chain up to that
                 point is still returned. When False, continue to the
                 next AC with a failed postmortem recorded.
+            externally_satisfied_acs: Map of AC indices already satisfied
+                externally. When provided, those ACs will be skipped and
+                recorded with SATISFIED_EXTERNALLY outcome.
 
         Returns:
             ParallelExecutionResult with one stage per AC so downstream
@@ -139,6 +143,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         results: list[ACExecutionResult] = []
         stages: list[ParallelExecutionStageResult] = []
         execution_counters = {"messages_count": 0, "tool_calls_count": 0}
+        external_completed = externally_satisfied_acs or {}
 
         log.info(
             "serial_executor.started",
@@ -169,6 +174,50 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         started=False,
                     )
                 )
+                continue
+
+            # Check if AC is externally satisfied; skip execution if so.
+            if ac_index in external_completed:
+                metadata = external_completed.get(ac_index, {})
+                reason = metadata.get("reason")
+                commit = metadata.get("commit")
+                notes: list[str] = [
+                    "Skipped via --skip-completed; existing working tree state is treated as satisfied."
+                ]
+                if isinstance(reason, str) and reason.strip():
+                    notes.append(f"Reason: {reason.strip()}")
+                if isinstance(commit, str) and commit.strip():
+                    notes.append(f"Commit: {commit.strip()}")
+
+                satisfied_result = ACExecutionResult(
+                    ac_index=ac_index,
+                    ac_content=seed.acceptance_criteria[ac_index],
+                    success=True,
+                    final_message="\n".join(notes),
+                    retry_attempt=0,
+                    outcome=ACExecutionOutcome.SATISFIED_EXTERNALLY,
+                )
+                results.append(satisfied_result)
+                stages.append(
+                    ParallelExecutionStageResult(
+                        stage_index=position,
+                        ac_indices=(ac_index,),
+                        results=(satisfied_result,),
+                        started=False,
+                    )
+                )
+                log.info(
+                    "serial_executor.ac.satisfied_externally",
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    reason=reason,
+                    commit=commit,
+                )
+                # Still add to postmortem chain to provide context
+                postmortem = self._build_postmortem_from_result(
+                    satisfied_result, workspace_root=self._task_cwd
+                )
+                chain = chain.append(postmortem)
                 continue
 
             # Compose the compounding-context section from the current chain.
@@ -251,21 +300,31 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 halted = True
 
         total_duration = (datetime.now(UTC) - start_time).total_seconds()
-        success_count = sum(1 for r in results if r.success)
+        success_count = sum(
+            1 for r in results if r.outcome == ACExecutionOutcome.SUCCEEDED
+        )
+        externally_satisfied_count = sum(
+            1 for r in results if r.outcome == ACExecutionOutcome.SATISFIED_EXTERNALLY
+        )
         failure_count = sum(
             1 for r in results if r.outcome == ACExecutionOutcome.FAILED
         )
         blocked_count = sum(
             1 for r in results if r.outcome == ACExecutionOutcome.BLOCKED
         )
+        # Serial execution has no INVALID outcomes (all ACs are in the linearized plan),
+        # so skipped_count equals blocked_count.
+        skipped_count = blocked_count
 
         log.info(
             "serial_executor.completed",
             session_id=session_id,
             total_acs=len(ac_order),
             success=success_count,
+            externally_satisfied=externally_satisfied_count,
             failed=failure_count,
             blocked=blocked_count,
+            skipped=skipped_count,
             duration_seconds=total_duration,
             postmortems_captured=len(chain.postmortems),
         )
@@ -274,8 +333,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             results=tuple(results),
             success_count=success_count,
             failure_count=failure_count,
+            externally_satisfied_count=externally_satisfied_count,
             blocked_count=blocked_count,
-            skipped_count=blocked_count,
+            skipped_count=skipped_count,
             stages=tuple(stages),
             total_messages=execution_counters.get("messages_count", 0),
             total_duration_seconds=total_duration,

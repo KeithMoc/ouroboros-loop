@@ -57,6 +57,27 @@ _POSTMORTEM_MAX_TRACE_CHARS = 1500
 PostmortemStatus = Literal["pass", "fail", "partial"]
 
 
+def _ensure_tuple_or_none(value: Any) -> tuple[Any, ...]:
+    """Convert a value to a tuple, handling strings specially to avoid char-tuples.
+
+    Args:
+        value: The value to convert to a tuple.
+
+    Returns:
+        - Empty tuple if value is None
+        - tuple(value) if value is already a list or tuple
+        - (value,) if value is a string (wraps the whole string)
+        - (value,) otherwise
+    """
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    if isinstance(value, str):
+        return (value,)
+    return (value,)
+
+
 def _extract_public_api(file_path: str, workspace_root: str) -> list[str]:
     """Extract public API signatures from a source file.
 
@@ -416,7 +437,7 @@ def deserialize_level_contexts(data: list[dict[str, Any]]) -> list[LevelContext]
                 conflicts = tuple(
                     FileConflict(
                         file_path=fc.get("file_path", ""),
-                        ac_indices=tuple(fc.get("ac_indices", ())),
+                        ac_indices=_ensure_tuple_or_none(fc.get("ac_indices", ())),
                         resolved=fc.get("resolved", False),
                         resolution_description=fc.get("resolution_description", ""),
                     )
@@ -426,8 +447,8 @@ def deserialize_level_contexts(data: list[dict[str, Any]]) -> list[LevelContext]
                     level_number=rd.get("level_number", 0),
                     conflicts_detected=conflicts,
                     review_summary=rd.get("review_summary", ""),
-                    fixes_applied=tuple(rd.get("fixes_applied", ())),
-                    warnings_for_next_level=tuple(rd.get("warnings_for_next_level", ())),
+                    fixes_applied=_ensure_tuple_or_none(rd.get("fixes_applied", ())),
+                    warnings_for_next_level=_ensure_tuple_or_none(rd.get("warnings_for_next_level", ())),
                     duration_seconds=rd.get("duration_seconds", 0.0),
                     session_id=rd.get("session_id"),
                 )
@@ -446,8 +467,8 @@ def deserialize_level_contexts(data: list[dict[str, Any]]) -> list[LevelContext]
                         ac_index=ac.get("ac_index", 0),
                         ac_content=ac.get("ac_content", ""),
                         success=ac.get("success", False),
-                        tools_used=tuple(ac.get("tools_used", ())),
-                        files_modified=tuple(ac.get("files_modified", ())),
+                        tools_used=_ensure_tuple_or_none(ac.get("tools_used", ())),
+                        files_modified=_ensure_tuple_or_none(ac.get("files_modified", ())),
                         key_output=ac.get("key_output", ""),
                         public_api=ac.get("public_api", ""),
                     )
@@ -708,8 +729,8 @@ def _deserialize_postmortem(d: dict[str, Any]) -> ACPostmortem:
         ac_index=summary_dict.get("ac_index", 0),
         ac_content=summary_dict.get("ac_content", ""),
         success=summary_dict.get("success", False),
-        tools_used=tuple(summary_dict.get("tools_used", ())),
-        files_modified=tuple(summary_dict.get("files_modified", ())),
+        tools_used=_ensure_tuple_or_none(summary_dict.get("tools_used", ())),
+        files_modified=_ensure_tuple_or_none(summary_dict.get("files_modified", ())),
         key_output=summary_dict.get("key_output", ""),
         public_api=summary_dict.get("public_api", ""),
     )
@@ -728,9 +749,9 @@ def _deserialize_postmortem(d: dict[str, Any]) -> ACPostmortem:
         summary=summary,
         diff_summary=d.get("diff_summary", ""),
         tool_trace_digest=d.get("tool_trace_digest", ""),
-        gotchas=tuple(d.get("gotchas", ())),
-        qa_suggestions=tuple(d.get("qa_suggestions", ())),
-        invariants_established=tuple(d.get("invariants_established", ())),
+        gotchas=_ensure_tuple_or_none(d.get("gotchas", ())),
+        qa_suggestions=_ensure_tuple_or_none(d.get("qa_suggestions", ())),
+        invariants_established=_ensure_tuple_or_none(d.get("invariants_established", ())),
         retry_attempts=d.get("retry_attempts", 0),
         status=status_value,  # type: ignore[arg-type]
         duration_seconds=d.get("duration_seconds", 0.0),
