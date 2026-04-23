@@ -23,6 +23,7 @@ import asyncio
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
@@ -225,9 +226,43 @@ async def get_pending_cancellations() -> frozenset[str]:
 # =============================================================================
 
 
+# Max bytes of CLAUDE.md content injected into the system prompt. Bounds
+# prompt growth on projects with very large guidance files while still
+# covering typical project CLAUDE.md sizes.
+_MAX_CLAUDE_MD_CHARS = 10_000
+
+
+def _load_claude_md_snapshot(workspace_root: str | None) -> str:
+    """Read CLAUDE.md from the workspace root and return a bounded snapshot.
+
+    Returns an empty string when the file is absent, unreadable, or the
+    workspace root is None. Callers concatenate unconditionally.
+
+    Snapshot semantics: callers are expected to read this exactly once per
+    execution and reuse the string across all ACs in that run — this keeps
+    the system prefix stable for prompt-cache hits and avoids mid-run drift
+    if the user edits CLAUDE.md while the loop is running.
+    """
+    if not workspace_root:
+        return ""
+    try:
+        candidate = Path(workspace_root) / "CLAUDE.md"
+        if not candidate.is_file():
+            return ""
+        content = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(content) > _MAX_CLAUDE_MD_CHARS:
+        content = content[:_MAX_CLAUDE_MD_CHARS].rstrip() + "\n\n…(truncated)"
+    return content
+
+
 def build_system_prompt(
     seed: Seed,
     strategy: ExecutionStrategy | None = None,
+    *,
+    include_claude_md: bool = False,
+    workspace_root: str | None = None,
 ) -> str:
     """Build system prompt from seed specification.
 
@@ -235,6 +270,12 @@ def build_system_prompt(
         seed: Seed to extract system prompt from.
         strategy: Execution strategy for prompt customization.
             If None, uses strategy from seed.task_type.
+        include_claude_md: When True, read CLAUDE.md from ``workspace_root``
+            and prepend a "## Project Guidance" section to the prompt.
+            Default False so existing parallel-mode callers produce a
+            byte-identical prompt to pre-feature behavior.
+        workspace_root: Directory to resolve CLAUDE.md against when
+            ``include_claude_md`` is True. Ignored otherwise.
 
     Returns:
         System prompt string.
@@ -278,7 +319,18 @@ IMPORTANT: You are extending existing code, NOT creating a new project.
     ac_tracking = get_ac_tracking_prompt()
     strategy_fragment = strategy.get_system_prompt_fragment()
 
-    return f"""{strategy_fragment}
+    claude_md_section = ""
+    if include_claude_md:
+        snapshot = _load_claude_md_snapshot(workspace_root)
+        if snapshot:
+            claude_md_section = (
+                "## Project Guidance (CLAUDE.md)\n"
+                "The following is the project's CLAUDE.md, pinned at run start.\n"
+                "Treat it as authoritative unless overridden by Goal or Constraints.\n\n"
+                f"{snapshot}\n\n"
+            )
+
+    return f"""{claude_md_section}{strategy_fragment}
 
 ## Goal
 {seed.goal}
