@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -23,6 +24,7 @@ from ouroboros.orchestrator.parallel_executor_models import (
 from ouroboros.orchestrator.serial_executor import (
     SerialCompoundingExecutor,
     linearize_execution_plan,
+    write_chain_artifact,
 )
 
 
@@ -374,3 +376,215 @@ class TestSerialCompoundingExecutor:
         # AC 3 must see references to AC 1 and AC 2 (chain grows).
         assert "AC a" in captured_overrides[2]
         assert "AC b" in captured_overrides[2]
+
+
+class TestChainArtifact:
+    """AC-1 (Q6.1): End-of-run postmortem chain serialization.
+
+    [[INVARIANT: end-of-run chain artifact exists in docs/brainstorm/chain-*.md]]
+    [[INVARIANT: OUROBOROS_CHAIN_ARTIFACT_DIR env var controls artifact location]]
+    """
+
+    @pytest.mark.asyncio
+    async def test_artifact_written_after_successful_2ac_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A successful 2-AC run writes a chain artifact with expected markdown structure."""
+        seed = _make_seed("Implement user model", "Implement user endpoint")
+        executor = _make_executor()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            return _ok_result(
+                ac_index,
+                str(kwargs["ac_content"]),
+                final_message=f"AC {ac_index + 1} complete",
+                files_written=(f"src/module_{ac_index}.py",),
+            )
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        artifact_dir = str(tmp_path / "chain_out")
+        plan = _make_plan((0,), (1,))
+
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", artifact_dir)
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_chain_test",
+            execution_id="exec_chain_test",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+        )
+
+        out_dir = Path(artifact_dir)
+        artifacts = list(out_dir.glob("chain-sess_chain_test-*.md"))
+        assert len(artifacts) == 1, f"Expected 1 artifact, got: {artifacts}"
+
+        content = artifacts[0].read_text(encoding="utf-8")
+        # File header
+        assert "# Postmortem Chain" in content
+        assert "sess_chain_test" in content
+        # Two AC sections with correct status
+        assert "## AC 1 [pass]" in content
+        assert "## AC 2 [pass]" in content
+        # Required fields from AC spec
+        assert "Files modified:" in content
+        assert "Gotchas:" in content
+        assert "Public API changes:" in content
+
+    @pytest.mark.asyncio
+    async def test_artifact_written_on_failure_fail_fast(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Artifact is written even when fail_fast halts mid-chain after a failure."""
+        seed = _make_seed("AC 1 fails", "AC 2 never runs")
+        executor = _make_executor()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            if ac_index == 0:
+                return _fail_result(0, str(kwargs["ac_content"]), error="kaboom")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        artifact_dir = str(tmp_path / "chain_fail")
+        plan = _make_plan((0,), (1,))
+
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", artifact_dir)
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_fail_test",
+            execution_id="exec_fail_test",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        # Run did indeed fail
+        assert result.failure_count == 1
+
+        # Artifact still written despite failure
+        out_dir = Path(artifact_dir)
+        artifacts = list(out_dir.glob("chain-sess_fail_test-*.md"))
+        assert len(artifacts) == 1, f"Expected 1 artifact even on failure, got: {artifacts}"
+
+        content = artifacts[0].read_text(encoding="utf-8")
+        # Failed AC section present
+        assert "## AC 1 [fail]" in content
+        # Gotcha from the failed AC surfaces in the artifact
+        assert "kaboom" in content
+
+    def test_write_chain_artifact_creates_nested_dir_and_file(
+        self, tmp_path: Path
+    ) -> None:
+        """write_chain_artifact creates parent directories and returns a valid path."""
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Build the thing",
+            success=True,
+            files_modified=("src/thing.py",),
+        )
+        pm = ACPostmortem(
+            summary=summary,
+            status="pass",
+            gotchas=("watch out for X",),
+        )
+        chain = PostmortemChain(postmortems=(pm,))
+
+        # Use deeply-nested dir that doesn't yet exist.
+        nested_dir = tmp_path / "a" / "b" / "c"
+        path = write_chain_artifact(
+            chain,
+            session_id="s1",
+            execution_id="e1",
+            artifact_dir=str(nested_dir),
+        )
+
+        assert path.exists()
+        assert path.suffix == ".md"
+        assert path.name.startswith("chain-s1-")
+
+        content = path.read_text(encoding="utf-8")
+        assert "## AC 1 [pass]" in content
+        assert "Build the thing" in content
+        assert "src/thing.py" in content
+        assert "watch out for X" in content
+
+    def test_env_var_overrides_artifact_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OUROBOROS_CHAIN_ARTIFACT_DIR redirects artifact output."""
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        custom_dir = tmp_path / "custom_dir"
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(custom_dir))
+
+        summary = ACContextSummary(ac_index=0, ac_content="AC text", success=True)
+        pm = ACPostmortem(summary=summary, status="pass")
+        chain = PostmortemChain(postmortems=(pm,))
+
+        path = write_chain_artifact(chain, session_id="s2", execution_id="e2")
+
+        # Path is inside the custom_dir
+        assert str(custom_dir) in str(path)
+        assert path.exists()
+
+    def test_explicit_artifact_dir_beats_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Explicit artifact_dir argument takes precedence over the env var."""
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        env_dir = tmp_path / "from_env"
+        explicit_dir = tmp_path / "explicit"
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(env_dir))
+
+        summary = ACContextSummary(ac_index=0, ac_content="AC text", success=True)
+        pm = ACPostmortem(summary=summary, status="pass")
+        chain = PostmortemChain(postmortems=(pm,))
+
+        path = write_chain_artifact(
+            chain,
+            session_id="s3",
+            execution_id="e3",
+            artifact_dir=str(explicit_dir),
+        )
+
+        assert str(explicit_dir) in str(path)
+        assert str(env_dir) not in str(path)
+        assert path.exists()
+
+    def test_artifact_for_empty_chain_has_no_ac_sections(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty chain produces a valid header with no AC entries."""
+        from ouroboros.orchestrator.level_context import PostmortemChain
+
+        chain = PostmortemChain()  # no postmortems
+        path = write_chain_artifact(
+            chain,
+            session_id="s4",
+            execution_id="e4",
+            artifact_dir=str(tmp_path),
+        )
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        assert "# Postmortem Chain" in content
+        assert "## AC" not in content  # no AC sections for empty chain

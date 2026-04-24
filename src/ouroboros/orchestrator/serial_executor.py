@@ -27,7 +27,9 @@ Out of scope for phase 1 (follow-up milestones):
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ouroboros.orchestrator.events import create_ac_postmortem_captured_event
@@ -37,6 +39,7 @@ from ouroboros.orchestrator.level_context import (
     PostmortemStatus,
     build_postmortem_chain_prompt,
     extract_level_context,
+    serialize_postmortem_chain,
 )
 from ouroboros.orchestrator.parallel_executor import (
     ParallelACExecutor,
@@ -59,6 +62,142 @@ if TYPE_CHECKING:
     from ouroboros.orchestrator.mcp_config import MCPToolDefinition
 
 log = get_logger(__name__)
+
+# Default directory for chain artifact output. Override with OUROBOROS_CHAIN_ARTIFACT_DIR.
+_DEFAULT_CHAIN_ARTIFACT_DIR = "docs/brainstorm"
+
+
+def _render_chain_as_markdown(
+    chain: PostmortemChain,
+    session_id: str,
+    execution_id: str,
+) -> str:
+    """Render a PostmortemChain as a human-readable markdown artifact.
+
+    Uses ``serialize_postmortem_chain`` as the single data source so there
+    is no second serialization path. Format per AC:
+
+        ## AC <n> [<status>]
+        - Files modified: ...
+        - Gotchas: ...
+        - Public API changes: ...
+
+    Args:
+        chain: The postmortem chain to render.
+        session_id: Session ID for the header.
+        execution_id: Execution ID for the header.
+
+    Returns:
+        Markdown string with one section per AC.
+    """
+    now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines: list[str] = [
+        "# Postmortem Chain",
+        "",
+        f"**Session:** `{session_id}`  ",
+        f"**Execution:** `{execution_id}`  ",
+        f"**Written:** {now_str}  ",
+        f"**ACs:** {len(chain.postmortems)}",
+        "",
+    ]
+
+    serialized = serialize_postmortem_chain(chain)
+    for entry in serialized:
+        summary = entry.get("summary") or {}
+        ac_index = summary.get("ac_index", 0)
+        ac_content = summary.get("ac_content", "")
+        status = entry.get("status", "pass")
+        files_modified = summary.get("files_modified") or []
+        public_api = summary.get("public_api") or ""
+        gotchas = entry.get("gotchas") or []
+        invariants = entry.get("invariants_established") or []
+        duration = entry.get("duration_seconds", 0.0)
+        retry_attempts = entry.get("retry_attempts", 0)
+
+        lines.append(f"## AC {ac_index + 1} [{status}]")
+        lines.append("")
+        lines.append(f"**Task:** {ac_content}")
+        if duration:
+            lines.append(f"**Duration:** {duration:.1f}s")
+        if retry_attempts:
+            lines.append(f"**Retries:** {retry_attempts}")
+
+        if files_modified:
+            files_str = ", ".join(str(f) for f in files_modified)
+            lines.append(f"- Files modified: {files_str}")
+        else:
+            lines.append("- Files modified: (none recorded)")
+
+        if gotchas:
+            gotchas_str = "; ".join(str(g) for g in gotchas)
+            lines.append(f"- Gotchas: {gotchas_str}")
+        else:
+            lines.append("- Gotchas: (none)")
+
+        if public_api:
+            lines.append(f"- Public API changes: {public_api}")
+        else:
+            lines.append("- Public API changes: (none recorded)")
+
+        if invariants:
+            inv_str = "; ".join(str(i) for i in invariants)
+            lines.append(f"- Invariants established: {inv_str}")
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def write_chain_artifact(
+    chain: PostmortemChain,
+    session_id: str,
+    execution_id: str,
+    *,
+    artifact_dir: str | None = None,
+) -> Path:
+    """Write the PostmortemChain to a markdown artifact file.
+
+    The output directory defaults to ``docs/brainstorm`` but can be
+    overridden via the ``OUROBOROS_CHAIN_ARTIFACT_DIR`` environment variable
+    or the ``artifact_dir`` argument (explicit arg takes precedence over env var).
+
+    The directory is created defensively (``parents=True, exist_ok=True``) so
+    callers do not need to pre-create it.
+
+    This function is intentionally synchronous — it is called after the
+    serial loop completes and must not introduce async complexity.
+
+    Args:
+        chain: The chain to serialize.
+        session_id: Session id used in the filename.
+        execution_id: Execution id used in the file header.
+        artifact_dir: Override directory. Falls back to env var, then default.
+
+    Returns:
+        Path of the written artifact file.
+    """
+    if artifact_dir is None:
+        artifact_dir = os.environ.get(
+            "OUROBOROS_CHAIN_ARTIFACT_DIR", _DEFAULT_CHAIN_ARTIFACT_DIR
+        )
+
+    out_dir = Path(artifact_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    filename = f"chain-{session_id}-{timestamp}.md"
+    artifact_path = out_dir / filename
+
+    content = _render_chain_as_markdown(chain, session_id, execution_id)
+    artifact_path.write_text(content, encoding="utf-8")
+
+    log.info(
+        "serial_executor.chain_artifact.written",
+        path=str(artifact_path),
+        session_id=session_id,
+        postmortems=len(chain.postmortems),
+    )
+    return artifact_path
 
 
 def linearize_execution_plan(execution_plan: "StagedExecutionPlan") -> tuple[int, ...]:
@@ -329,6 +468,23 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             postmortems_captured=len(chain.postmortems),
         )
 
+        # AC-1 (Q6.1): Write end-of-run chain artifact. Always produced — even
+        # for failed/partial runs — so crashed runs leave an inspectable chain.
+        # Failures here are logged but never propagate to the caller.
+        if chain.postmortems:
+            try:
+                write_chain_artifact(
+                    chain,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                )
+            except Exception as artifact_exc:  # noqa: BLE001
+                log.warning(
+                    "serial_executor.chain_artifact.write_failed",
+                    session_id=session_id,
+                    error=str(artifact_exc),
+                )
+
         return ParallelExecutionResult(
             results=tuple(results),
             success_count=success_count,
@@ -411,4 +567,5 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 __all__ = [
     "SerialCompoundingExecutor",
     "linearize_execution_plan",
+    "write_chain_artifact",
 ]
