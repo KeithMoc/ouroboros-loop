@@ -45,6 +45,10 @@ from ouroboros.orchestrator.level_context import (
     extract_level_context,
     serialize_postmortem_chain,
 )
+from ouroboros.persistence.checkpoint import (
+    CheckpointData,
+    CompoundingCheckpointState,
+)
 from ouroboros.orchestrator.parallel_executor import (
     ParallelACExecutor,
     _STALL_SENTINEL,
@@ -375,6 +379,73 @@ def write_chain_artifact(
     return artifact_path
 
 
+def _write_compounding_checkpoint(
+    store: Any,
+    *,
+    seed_id: str,
+    session_id: str,
+    ac_index: int,
+    chain: PostmortemChain,
+) -> None:
+    """Write a per-AC compounding checkpoint after successful completion.
+
+    Serializes the current postmortem chain into a
+    :class:`~ouroboros.persistence.checkpoint.CompoundingCheckpointState`
+    and persists it via ``store.write``.  Failures are caught and logged so
+    a checkpoint write error never propagates to the caller.
+
+    This function is synchronous — it is called inside the serial loop
+    after each successful AC and must not introduce async complexity.
+
+    Args:
+        store: :class:`~ouroboros.persistence.checkpoint.CheckpointStore`
+            instance (or any object with a ``write`` method that accepts
+            a :class:`~ouroboros.persistence.checkpoint.CheckpointData`).
+        seed_id: Seed identifier used as the checkpoint key.
+        session_id: Session identifier — included in log context only.
+        ac_index: 0-based index of the *just-completed* successful AC.
+        chain: Current postmortem chain (already includes the postmortem
+            for ``ac_index``).
+
+    [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+    [[INVARIANT: CompoundingCheckpointState.last_completed_ac_index equals the 0-based AC index]]
+    """
+    try:
+        serialized_chain = serialize_postmortem_chain(chain)
+        state = CompoundingCheckpointState(
+            last_completed_ac_index=ac_index,
+            postmortem_chain=serialized_chain,
+        )
+        checkpoint = CheckpointData.create(
+            seed_id=seed_id,
+            phase="execution",
+            state=state.to_dict(),
+        )
+        result = store.write(checkpoint)
+        if result.is_err:
+            log.warning(
+                "serial_executor.checkpoint.write_failed",
+                session_id=session_id,
+                ac_index=ac_index,
+                error=str(result.error),
+            )
+        else:
+            log.info(
+                "serial_executor.checkpoint.written",
+                session_id=session_id,
+                ac_index=ac_index,
+                seed_id=seed_id,
+                postmortems=len(chain.postmortems),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "serial_executor.checkpoint.unexpected_error",
+            session_id=session_id,
+            ac_index=ac_index,
+            error=str(exc),
+        )
+
+
 def linearize_execution_plan(execution_plan: "StagedExecutionPlan") -> tuple[int, ...]:
     """Flatten a staged execution plan into a total AC order.
 
@@ -641,6 +712,18 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 
             chain = chain.append(postmortem)
 
+            # Q6.2: Write per-AC checkpoint after successful completion.
+            # Checkpoints are ONLY written on success — failed ACs do NOT advance
+            # the checkpoint cursor, so a resume will retry the failing AC.
+            if result.success and self._checkpoint_store is not None:
+                _write_compounding_checkpoint(
+                    store=self._checkpoint_store,
+                    seed_id=seed.metadata.seed_id,
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    chain=chain,
+                )
+
             await self._safe_emit_event(
                 create_ac_postmortem_captured_event(
                     session_id=session_id,
@@ -845,4 +928,5 @@ __all__ = [
     "linearize_execution_plan",
     "verify_invariants",
     "write_chain_artifact",
+    "_write_compounding_checkpoint",
 ]

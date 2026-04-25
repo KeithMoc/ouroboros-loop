@@ -1147,3 +1147,344 @@ class TestInvariantVerifier:
             f"Invariant with score 0.45 must appear when threshold is 0.4; "
             f"established section was:\n{established_section[:500]}"
         )
+
+
+class TestCheckpointWriting:
+    """AC-2 (Q6.2): Per-AC checkpoint writing integration tests.
+
+    Verifies that SerialCompoundingExecutor writes a checkpoint to the
+    CheckpointStore after each successfully completed AC, and does NOT
+    write a checkpoint when an AC fails.
+
+    Compounding context (from prior ACs):
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — checkpoints complement this artifact
+      by enabling resume without losing prior ACs' work.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — the checkpoint payload carries the
+      full serialized PostmortemChain, which now includes sub_postmortems.
+    - AC-3 established [[INVARIANT: verify_invariants is called
+      inline-blocking before chain advance]] — verified invariants are
+      present in the chain that gets checkpointed.
+
+    [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+    [[INVARIANT: CompoundingCheckpointState.last_completed_ac_index equals the 0-based AC index]]
+    [[INVARIANT: checkpoint payload mode is always the literal "compounding"]]
+    """
+
+    def _make_executor_with_mock_store(self) -> tuple[SerialCompoundingExecutor, MagicMock]:
+        """Build an executor with a mock CheckpointStore injected."""
+        event_store, _ = _make_replaying_event_store()
+
+        mock_store = MagicMock()
+        # write() should return a successful Result-like object.
+        from ouroboros.core.types import Result
+        mock_store.write.return_value = Result.ok(None)
+
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=mock_store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, mock_store
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_written_after_each_successful_ac(self) -> None:
+        """CheckpointStore.write is called once per successful AC.
+
+        In a 2-AC run where both succeed, write() must be called twice:
+        once with last_completed_ac_index=0 and once with =1.
+
+        Compounding ref: the checkpoint serializes the PostmortemChain which
+        by AC-2 now includes sub_postmortems (B-prime) in its serialized form.
+
+        [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        seed = _make_seed("AC 1 — build model", "AC 2 — build endpoint")
+        executor, mock_store = self._make_executor_with_mock_store()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_ckpt_success",
+            execution_id="exec_ckpt_success",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+        )
+
+        assert result.success_count == 2
+        # write() must have been called exactly twice.
+        assert mock_store.write.call_count == 2, (
+            f"Expected 2 checkpoint writes, got {mock_store.write.call_count}"
+        )
+
+        # Extract CheckpointData arguments from each write() call.
+        call_args = [call.args[0] for call in mock_store.write.call_args_list]
+
+        # First call: AC 0 completed → last_completed_ac_index should be 0.
+        ckpt0 = call_args[0]
+        state0 = CompoundingCheckpointState.from_dict(ckpt0.state)
+        assert state0.last_completed_ac_index == 0, (
+            f"First checkpoint should have last_completed_ac_index=0, got {state0.last_completed_ac_index}"
+        )
+        assert state0.mode == "compounding"
+        assert isinstance(state0.postmortem_chain, list)
+        assert len(state0.postmortem_chain) == 1  # only AC 0 in chain after AC 0 completes
+
+        # Second call: AC 1 completed → last_completed_ac_index should be 1.
+        ckpt1 = call_args[1]
+        state1 = CompoundingCheckpointState.from_dict(ckpt1.state)
+        assert state1.last_completed_ac_index == 1, (
+            f"Second checkpoint should have last_completed_ac_index=1, got {state1.last_completed_ac_index}"
+        )
+        assert len(state1.postmortem_chain) == 2  # both ACs in chain
+
+        # Checkpoint phase must be "execution".
+        assert ckpt0.phase == "execution"
+        assert ckpt1.phase == "execution"
+
+        # seed_id must match the seed's metadata.
+        assert ckpt0.seed_id == seed.metadata.seed_id
+        assert ckpt1.seed_id == seed.metadata.seed_id
+
+    @pytest.mark.asyncio
+    async def test_no_checkpoint_written_on_ac_failure(self) -> None:
+        """CheckpointStore.write is NOT called when an AC fails.
+
+        AC 0 fails → no checkpoint. AC 1 is blocked (fail_fast=True) →
+        no checkpoint. Total write() calls: 0.
+
+        Compounding ref: this guards the Q6.2 resume semantics established
+        in the brainstorm doc — a failed AC does not advance the cursor,
+        ensuring resume restarts from that AC, not the one after.
+
+        [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+        """
+        seed = _make_seed("AC 1 fails", "AC 2 never runs")
+        executor, mock_store = self._make_executor_with_mock_store()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            if ac_index == 0:
+                return _fail_result(0, str(kwargs["ac_content"]), error="timeout")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_ckpt_fail",
+            execution_id="exec_ckpt_fail",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        assert result.failure_count == 1
+        assert result.blocked_count == 1
+        # No checkpoints written — the failing AC does not advance the cursor.
+        assert mock_store.write.call_count == 0, (
+            f"Expected 0 checkpoint writes on failure, got {mock_store.write.call_count}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_written_for_successful_acs_skip_failed_in_fail_forward(
+        self,
+    ) -> None:
+        """In fail-forward mode, only successful ACs trigger a checkpoint write.
+
+        AC 0 fails (no checkpoint), AC 1 succeeds (checkpoint with index=1).
+        Total write() calls: 1.
+
+        Compounding ref: uses fail_fast=False which was tested in AC-2's
+        sub-postmortem tests (test_fail_forward_continues_past_failure).
+
+        [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        seed = _make_seed("AC 0 fails", "AC 1 succeeds")
+        executor, mock_store = self._make_executor_with_mock_store()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            if ac_index == 0:
+                return _fail_result(0, str(kwargs["ac_content"]), error="oops")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_ckpt_fwd",
+            execution_id="exec_ckpt_fwd",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=False,
+        )
+
+        assert result.failure_count == 1
+        assert result.success_count == 1
+        # Exactly 1 checkpoint written — only for the successful AC 1.
+        assert mock_store.write.call_count == 1, (
+            f"Expected 1 checkpoint write, got {mock_store.write.call_count}"
+        )
+
+        written_ckpt = mock_store.write.call_args.args[0]
+        state = CompoundingCheckpointState.from_dict(written_ckpt.state)
+        # The successful AC was index 1 → cursor points to 1.
+        assert state.last_completed_ac_index == 1
+
+    @pytest.mark.asyncio
+    async def test_no_checkpoint_written_when_store_is_none(self) -> None:
+        """When no CheckpointStore is provided, the executor runs without error.
+
+        This is the default path for callers that do not opt-in to checkpointing.
+        The executor must not crash and must still produce correct results.
+
+        [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+        """
+        seed = _make_seed("AC 1", "AC 2")
+        # Use the default executor from _make_executor() which has no store.
+        executor = _make_executor()
+        assert executor._checkpoint_store is None
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_no_store",
+            execution_id="exec_no_store",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+        )
+        # Run succeeds normally even without a store.
+        assert result.success_count == 2
+        assert result.failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_write_error_does_not_propagate(self) -> None:
+        """A failing CheckpointStore.write() call must not abort the run.
+
+        The executor catches write errors and logs a warning; the AC loop
+        must still complete normally.
+
+        [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+        """
+        from ouroboros.core.errors import PersistenceError
+        from ouroboros.core.types import Result
+
+        seed = _make_seed("AC 1", "AC 2")
+        executor, mock_store = self._make_executor_with_mock_store()
+        # Make write() return an error result.
+        mock_store.write.return_value = Result.err(
+            PersistenceError(message="disk full", operation="write", details={})
+        )
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_ckpt_err",
+            execution_id="exec_ckpt_err",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+        )
+        # The run still succeeds despite checkpoint errors.
+        assert result.success_count == 2
+        assert result.failure_count == 0
+
+    def test_write_compounding_checkpoint_payload_structure(
+        self, tmp_path: Path
+    ) -> None:
+        """_write_compounding_checkpoint produces the expected CheckpointData payload.
+
+        Uses a real CheckpointStore pointed at tmp_path to exercise the full
+        write → read → validate path.
+
+        Compounding ref: the checkpoint serializes the PostmortemChain which
+        now (since AC-2, B-prime) includes sub_postmortems in its serialized
+        output, and (since AC-3, C-plus) may include verified Invariant objects.
+
+        [[INVARIANT: CompoundingCheckpointState.mode is always the literal "compounding"]]
+        [[INVARIANT: CompoundingCheckpointState.last_completed_ac_index equals the 0-based AC index]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import (
+            CheckpointStore,
+            CompoundingCheckpointState,
+        )
+
+        # Build a minimal one-AC chain.
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Build the auth module",
+            success=True,
+            files_modified=("src/auth.py",),
+        )
+        pm = ACPostmortem(
+            summary=summary,
+            status="pass",
+            gotchas=("remember to hash passwords",),
+        )
+        chain = PostmortemChain(postmortems=(pm,))
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id="seed_test_ckpt",
+            session_id="sess_payload_test",
+            ac_index=0,
+            chain=chain,
+        )
+
+        # Read back the checkpoint and validate.
+        load_result = store.load("seed_test_ckpt")
+        assert load_result.is_ok, f"Load failed: {load_result.error}"
+
+        ckpt = load_result.value
+        assert ckpt.phase == "execution"
+        assert ckpt.seed_id == "seed_test_ckpt"
+
+        state = CompoundingCheckpointState.from_dict(ckpt.state)
+        assert state.mode == "compounding"
+        assert state.last_completed_ac_index == 0
+        assert isinstance(state.postmortem_chain, list)
+        assert len(state.postmortem_chain) == 1
+
+        # The postmortem chain entry should reference the AC content.
+        entry = state.postmortem_chain[0]
+        summary_data = entry.get("summary", {})
+        assert summary_data.get("ac_content") == "Build the auth module"
