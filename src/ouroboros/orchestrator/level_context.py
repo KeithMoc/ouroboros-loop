@@ -513,12 +513,17 @@ class Invariant:
             across ACs. Bumped on each re-declaration; used to rank invariants.
         first_seen_ac_id: The AC id string where this invariant was first
             established. Empty string when the source AC has no id.
+        is_contradicted: True when a literal NOT-prefix contradiction was
+            detected during ``merge_invariants``.  A contradicted invariant
+            gets ``reliability=0.0`` and is excluded from trusted invariant
+            summaries.  See :meth:`PostmortemChain.merge_invariants`.
     """
 
     text: str
     reliability: float = 1.0
     occurrences: int = 1
     first_seen_ac_id: str = ""
+    is_contradicted: bool = False
 
     def __str__(self) -> str:  # noqa: D105
         return self.text
@@ -539,9 +544,32 @@ def _deserialize_invariant(item: Any) -> "Invariant":
             reliability=float(item.get("reliability", 1.0)),
             occurrences=int(item.get("occurrences", 1)),
             first_seen_ac_id=item.get("first_seen_ac_id", ""),
+            is_contradicted=bool(item.get("is_contradicted", False)),
         )
     # Fallback: coerce unknown types to string
     return Invariant(text=str(item))
+
+
+def _contradiction_counterpart_key(key: str) -> str | None:
+    """Return the normalized key that would contradict ``key``, or None.
+
+    A contradiction pair consists of a claim and its literal NOT-prefix
+    negation (case-insensitive, whitespace-collapsed):
+
+    - ``"x holds"`` ↔ ``"not x holds"``
+    - ``"not auth required"`` ↔ ``"auth required"``
+
+    Only the "NOT " (four-character) prefix is recognized as the negation
+    marker.  Returns the counterpart key string if the pair exists; returns
+    ``None`` when no counterpart can be formed.
+
+    [[INVARIANT: NOT-prefix contradiction uses four-char "not " sentinel only]]
+    """
+    _NOT_PREFIX = "not "
+    if key.startswith(_NOT_PREFIX):
+        base = key[len(_NOT_PREFIX):]
+        return base if base else None
+    return _NOT_PREFIX + key
 
 
 @dataclass(frozen=True, slots=True)
@@ -693,8 +721,14 @@ class PostmortemChain:
         Algorithm (per invariant in ``new``):
 
         1. **Normalize** the text: lower-case + collapsed whitespace for lookup.
-        2. **Match** against the chain's cumulative invariants (same key).
-        3. **Re-declaration** (match found): bump ``occurrences`` by 1, blend the
+        2. **Contradiction check** (NOT-prefix): if the normalized key and an
+           existing key are literal NOT-prefix negations of each other (e.g.
+           ``"auth required"`` vs ``"not auth required"``), the new invariant
+           is marked ``is_contradicted=True`` and receives ``reliability=0.0``.
+           A warning is logged.  The contradicted invariant is still included in
+           the returned tuple so it is visible in the chain for inspection.
+        3. **Match** against the chain's cumulative invariants (same key).
+        4. **Re-declaration** (match found): bump ``occurrences`` by 1, blend the
            reliability score as a weighted mean::
 
                (prior.reliability × prior.occurrences + new_reliability) / new_occurrences
@@ -702,7 +736,7 @@ class PostmortemChain:
            The *canonical text* is preserved from the first-seen invariant so
            the rendered output stays stable across re-declarations with minor
            wording variations.
-        4. **New** (no match): insert as
+        5. **New** (no match, no contradiction): insert as
            ``Invariant(text, reliability, 1, source_ac_id)``.
 
         Deduplication within ``new`` itself (same normalized key appearing
@@ -721,9 +755,12 @@ class PostmortemChain:
             ``new``, in the order they appeared.  Re-declared invariants carry
             updated occurrence counts and blended reliability scores; new ones
             carry ``occurrences=1`` and ``first_seen_ac_id=source_ac_id``.
+            Contradicted invariants carry ``is_contradicted=True`` and
+            ``reliability=0.0``.
 
         [[INVARIANT: PostmortemChain.merge_invariants bumps occurrences and averages reliability on re-declaration]]
         [[INVARIANT: first_seen_ac_id is set on new invariants and preserved on re-declarations]]
+        [[INVARIANT: NOT-prefix contradictions set is_contradicted=True and reliability=0.0 on the new invariant]]
         """
         # Build lookup from accumulated history; last occurrence wins so that
         # previously-merged invariants (with bumped counts) serve as the base.
@@ -747,7 +784,33 @@ class PostmortemChain:
                 continue
             seen_keys.add(key)
 
-            if key in existing:
+            # --- NOT-prefix contradiction detection (AC-2 / B-prime extension) ---
+            # Check if the new claim contradicts an already-established invariant.
+            # A contradiction exists when the new key and an existing key are
+            # literal NOT-prefix negations of each other (e.g. "auth required"
+            # vs "not auth required").  Contradicted invariants are marked with
+            # is_contradicted=True and receive reliability=0.0 to signal that
+            # the pair cannot both be trusted.
+            counterpart_key = _contradiction_counterpart_key(key)
+            is_contradicted = counterpart_key is not None and counterpart_key in existing
+
+            if is_contradicted:
+                log.warning(
+                    "invariant.contradiction_detected",
+                    new_key=key,
+                    counterpart_key=counterpart_key,
+                    source_ac_id=source_ac_id,
+                )
+                result.append(
+                    Invariant(
+                        text=text,
+                        reliability=0.0,
+                        occurrences=1,
+                        first_seen_ac_id=source_ac_id,
+                        is_contradicted=True,
+                    )
+                )
+            elif key in existing:
                 prior = existing[key]
                 new_occ = prior.occurrences + 1
                 # Weighted mean: weight by prior occurrence count.

@@ -1429,6 +1429,193 @@ class TestMergeInvariants:
         assert b_inv.occurrences == 2
 
 
+class TestMergeInvariantsContradiction:
+    """Tests for NOT-prefix contradiction detection in merge_invariants.
+
+    AC-2 (B-prime extension): when a new invariant is a literal NOT-prefix
+    negation of an already-established one (or vice versa), the new invariant
+    is marked ``is_contradicted=True`` and receives ``reliability=0.0``.
+
+    [[INVARIANT: NOT-prefix contradictions set is_contradicted=True and reliability=0.0 on the new invariant]]
+    [[INVARIANT: non-contradicted invariants retain is_contradicted=False by default]]
+    """
+
+    # --- basic contradiction: existing "X", new "NOT X" ---
+
+    def test_not_prefix_contradicts_existing_claim(self) -> None:
+        """'NOT auth required' contradicts prior 'auth required' claim."""
+        prior = Invariant(
+            text="auth required", reliability=0.9, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants(
+            [("NOT auth required", 1.0)], source_ac_id="ac_2"
+        )
+        assert len(result) == 1
+        inv = result[0]
+        assert inv.is_contradicted is True
+        assert inv.reliability == 0.0
+
+    def test_not_prefix_contradicts_existing_claim_case_insensitive(self) -> None:
+        """Contradiction detection is case-insensitive."""
+        prior = Invariant(
+            text="Cache Is Warm", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants(
+            [("not cache is warm", 0.8)], source_ac_id="ac_2"
+        )
+        assert len(result) == 1
+        assert result[0].is_contradicted is True
+        assert result[0].reliability == 0.0
+
+    # --- symmetric case: existing "NOT X", new "X" ---
+
+    def test_base_claim_contradicts_existing_not_prefixed(self) -> None:
+        """'auth required' contradicts prior 'not auth required'."""
+        prior = Invariant(
+            text="not auth required", reliability=0.7, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants(
+            [("auth required", 0.9)], source_ac_id="ac_2"
+        )
+        assert len(result) == 1
+        inv = result[0]
+        assert inv.is_contradicted is True
+        assert inv.reliability == 0.0
+
+    # --- text preservation on contradicted invariants ---
+
+    def test_contradicted_invariant_preserves_new_text(self) -> None:
+        """The contradicted invariant's text is the new (incoming) text, not the prior's."""
+        prior = Invariant(text="X holds", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("NOT X holds", 0.8)], source_ac_id="ac_2")
+        assert result[0].text == "NOT X holds"
+
+    def test_contradicted_invariant_source_ac_id_is_current_ac(self) -> None:
+        """The contradicted invariant's first_seen_ac_id is the declaring AC."""
+        prior = Invariant(text="Y is set", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("NOT Y is set", 0.9)], source_ac_id="ac_3")
+        assert result[0].first_seen_ac_id == "ac_3"
+
+    def test_contradicted_invariant_occurrences_is_one(self) -> None:
+        """A contradicted invariant is always a new entry (occurrences=1)."""
+        prior = Invariant(text="Z is enabled", reliability=1.0, occurrences=2, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("NOT Z is enabled", 0.9)], source_ac_id="ac_4")
+        assert result[0].occurrences == 1
+
+    # --- non-contradicting cases remain unaffected ---
+
+    def test_non_contradicting_new_invariant_is_not_marked(self) -> None:
+        """A new invariant that doesn't contradict anything gets is_contradicted=False."""
+        chain = PostmortemChain()
+        result = chain.merge_invariants([("X holds", 0.9)], source_ac_id="ac_1")
+        assert len(result) == 1
+        assert result[0].is_contradicted is False
+
+    def test_redeclaration_does_not_set_contradiction_flag(self) -> None:
+        """A re-declaration (same key) is NOT treated as contradiction."""
+        prior = Invariant(text="auth required", reliability=0.8, occurrences=1, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("auth required", 1.0)], source_ac_id="ac_2")
+        assert result[0].is_contradicted is False
+        assert result[0].occurrences == 2
+
+    def test_unrelated_not_claim_not_flagged_as_contradiction(self) -> None:
+        """'not Y' does not contradict 'X' when no 'Y' exists in the chain."""
+        prior = Invariant(text="X holds", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("NOT Y holds", 0.8)], source_ac_id="ac_2")
+        assert result[0].is_contradicted is False
+
+    # --- mixed batch: contradicted + clean in same call ---
+
+    def test_mixed_batch_contradicted_and_clean(self) -> None:
+        """A batch with one contradiction and one clean invariant handles both correctly."""
+        prior = Invariant(text="feature is on", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants(
+            [("NOT feature is on", 0.9), ("new fact", 0.8)],
+            source_ac_id="ac_2",
+        )
+        assert len(result) == 2
+        # First: the contradiction
+        assert result[0].is_contradicted is True
+        assert result[0].reliability == 0.0
+        # Second: the clean new invariant
+        assert result[1].is_contradicted is False
+        assert abs(result[1].reliability - 0.8) < 1e-9
+
+    # --- serialization round-trip ---
+
+    def test_is_contradicted_round_trips_through_serialize_deserialize(self) -> None:
+        """is_contradicted=True survives a serialize/deserialize round-trip."""
+        prior = Invariant(text="Q is safe", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("NOT Q is safe", 0.9)], source_ac_id="ac_2")
+        summary = ACContextSummary(ac_index=1, ac_content="AC 2", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=result)
+        chain2 = chain.append(pm)
+
+        # Round-trip
+        data = serialize_postmortem_chain(chain2)
+        chain3 = deserialize_postmortem_chain(data)
+
+        last_pm = chain3.postmortems[-1]
+        assert len(last_pm.invariants_established) == 1
+        inv = last_pm.invariants_established[0]
+        assert inv.is_contradicted is True
+        assert inv.reliability == 0.0
+
+    def test_is_contradicted_false_default_round_trips(self) -> None:
+        """is_contradicted=False (default) also survives round-trip (no field → False)."""
+        chain = PostmortemChain()
+        result = chain.merge_invariants([("normal claim", 0.9)], source_ac_id="ac_1")
+        summary = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=result)
+        chain2 = PostmortemChain(postmortems=(pm,))
+
+        data = serialize_postmortem_chain(chain2)
+        chain3 = deserialize_postmortem_chain(data)
+        inv = chain3.postmortems[0].invariants_established[0]
+        assert inv.is_contradicted is False
+
+    # --- _contradiction_counterpart_key helper ---
+
+    def test_helper_returns_negation_for_plain_key(self) -> None:
+        """Plain key → counterpart is 'not ' + key."""
+        from ouroboros.orchestrator.level_context import _contradiction_counterpart_key
+
+        assert _contradiction_counterpart_key("auth required") == "not auth required"
+
+    def test_helper_strips_not_prefix_for_negated_key(self) -> None:
+        """'not X' key → counterpart is 'X' (stripped)."""
+        from ouroboros.orchestrator.level_context import _contradiction_counterpart_key
+
+        assert _contradiction_counterpart_key("not auth required") == "auth required"
+
+    def test_helper_bare_not_returns_none(self) -> None:
+        """'not ' alone (empty base after stripping) returns None."""
+        from ouroboros.orchestrator.level_context import _contradiction_counterpart_key
+
+        assert _contradiction_counterpart_key("not ") is None
+        assert _contradiction_counterpart_key("not") == "not not"  # "not" doesn't start with "not "
+
+
 class TestBuildPostmortemChainPrompt:
     def test_honors_env_k_full(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OUROBOROS_POSTMORTEM_FULL_K", "0")
