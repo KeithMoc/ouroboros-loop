@@ -310,12 +310,13 @@ async def _run_orchestrator(
     max_decomposition_depth: int | None = None,
     skip_completed: str | None = None,
     mode: str | None = None,
+    compounding_resume_session_id: str | None = None,
 ) -> None:
     """Run workflow via orchestrator mode.
 
     Args:
         seed_file: Path to seed YAML file.
-        resume_session: Optional session ID to resume.
+        resume_session: Optional session ID to resume (orchestrator-level).
         mcp_config: Optional path to MCP config file.
         mcp_tool_prefix: Prefix for MCP tool names.
         debug: Show verbose logs and agent thinking.
@@ -326,6 +327,10 @@ async def _run_orchestrator(
         skip_completed: Optional path to a marker file for already-satisfied ACs.
         mode: Execution mode override ("parallel" | "compounding"). When set,
             takes precedence over the ``parallel`` flag.
+        compounding_resume_session_id: When set alongside ``mode="compounding"``,
+            passed through to ``execute_serial`` as ``resume_session_id`` so
+            checkpoint-based resume kicks in.  Mutually exclusive with
+            ``skip_completed``.
     """
     from ouroboros.core.seed import Seed
     from ouroboros.orchestrator import OrchestratorRunner, create_agent_runtime
@@ -363,6 +368,11 @@ async def _run_orchestrator(
         print_info(f"Max parallel workers: {resolved_max_parallel_workers}")
         if externally_satisfied_acs:
             print_info(f"Externally satisfied ACs: {len(externally_satisfied_acs)}")
+        if compounding_resume_session_id:
+            print_info(
+                f"Compounding resume: will load checkpoint for session "
+                f"{compounding_resume_session_id}"
+            )
 
     # Initialize MCP manager if config provided
     mcp_manager = None
@@ -429,7 +439,8 @@ async def _run_orchestrator(
 
     # Execute
     try:
-        if resume_session:
+        if resume_session and not compounding_resume_session_id:
+            # Orchestrator-level session resume (non-compounding path).
             if debug:
                 print_info(f"Resuming session: {resume_session}")
             result = await runner.resume_session(resume_session, seed)
@@ -437,10 +448,16 @@ async def _run_orchestrator(
             if debug:
                 print_info("Starting new orchestrator execution...")
             if mode == "compounding":
-                print_info(
-                    "Compounding mode: ACs run strictly serially; each AC "
-                    "sees a postmortem of every prior AC"
-                )
+                if compounding_resume_session_id:
+                    print_info(
+                        f"Compounding resume: continuing from checkpoint "
+                        f"(session {compounding_resume_session_id})"
+                    )
+                else:
+                    print_info(
+                        "Compounding mode: ACs run strictly serially; each AC "
+                        "sees a postmortem of every prior AC"
+                    )
             elif parallel:
                 print_info("Parallel mode: independent ACs will run concurrently")
             else:
@@ -454,6 +471,8 @@ async def _run_orchestrator(
             }
             if externally_satisfied_acs:
                 execute_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
+            if compounding_resume_session_id is not None:
+                execute_kwargs["resume_session_id"] = compounding_resume_session_id
             result = await runner.execute_seed(**execute_kwargs)
 
         # Handle result
@@ -684,6 +703,24 @@ def workflow(
 
     execution_mode = "compounding" if compounding else None
 
+    # When --compounding and --resume are combined, the resume ID is used for
+    # checkpoint-based compounding resume (passed as resume_session_id to
+    # execute_serial).  This is mutually exclusive with plain orchestrator
+    # session resume: --compounding --resume never calls runner.resume_session().
+    compounding_resume: str | None = resume_session if compounding else None
+    # For the orchestrator-level session resume path, only use resume_session
+    # when NOT in compounding mode (compounding handles its own checkpoint resume).
+    orchestrator_resume: str | None = resume_session if not compounding else None
+
+    # Mutual exclusivity: --compounding --resume + --skip-completed don't mix.
+    # Checkpoint resume already handles AC-skipping; warn and ignore --skip-completed.
+    if compounding_resume and skip_completed:
+        print_warning(
+            "--skip-completed is ignored when using --compounding --resume "
+            "(checkpoint resume already handles AC skipping)."
+        )
+        skip_completed = None
+
     if orchestrator or resume_session:
         # Orchestrator mode
         if resume_session and not orchestrator:
@@ -695,7 +732,7 @@ def workflow(
             asyncio.run(
                 _run_orchestrator(
                     seed_file,
-                    resume_session,
+                    orchestrator_resume,
                     mcp_config,
                     mcp_tool_prefix,
                     debug,
@@ -705,6 +742,7 @@ def workflow(
                     max_decomposition_depth=max_decomposition_depth,
                     skip_completed=skip_completed,
                     mode=execution_mode,
+                    compounding_resume_session_id=compounding_resume,
                 )
             )
         except (ValueError, NotImplementedError) as e:

@@ -1520,6 +1520,7 @@ class OrchestratorRunner:
         parallel: bool = True,
         externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
         mode: str | None = None,
+        resume_session_id: str | None = None,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute seed via Claude Agent.
 
@@ -1539,6 +1540,9 @@ class OrchestratorRunner:
             mode: Execution mode. One of "parallel" (default), or
                 "compounding" (serial per-AC loop with postmortem chain).
                 When None, derived from ``parallel``.
+            resume_session_id: When ``mode`` is "compounding", pass this ID
+                to ``execute_serial`` so it can load a saved checkpoint and
+                skip already-completed ACs.  Ignored for other modes.
 
         Returns:
             Result containing OrchestratorResult on success.
@@ -1555,6 +1559,8 @@ class OrchestratorRunner:
         }
         if externally_satisfied_acs:
             execute_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
+        if resume_session_id is not None:
+            execute_kwargs["resume_session_id"] = resume_session_id
 
         return await self.execute_precreated_session(**execute_kwargs)
 
@@ -1609,8 +1615,21 @@ class OrchestratorRunner:
         parallel: bool = True,
         externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
         mode: str | None = None,
+        resume_session_id: str | None = None,
     ) -> Result[OrchestratorResult, OrchestratorError]:
-        """Execute a seed using an already-persisted orchestrator session."""
+        """Execute a seed using an already-persisted orchestrator session.
+
+        Args:
+            seed: Seed specification to execute.
+            tracker: Pre-created session tracker from :meth:`prepare_session`.
+            parallel: Legacy parallel flag (see :meth:`execute_seed`).
+            externally_satisfied_acs: ACs already satisfied externally.
+            mode: Execution mode ("parallel" | "compounding").
+            resume_session_id: When ``mode`` is "compounding", forwarded to
+                :meth:`SerialCompoundingExecutor.execute_serial` as
+                ``resume_session_id`` so checkpoint-based resume works.
+                Ignored for non-compounding modes.
+        """
         exec_id = tracker.execution_id
         start_time = datetime.now(UTC)
 
@@ -2239,15 +2258,20 @@ class OrchestratorRunner:
             )
 
         if mode == "compounding":
+            _serial_kwargs: dict[str, Any] = {
+                "seed": seed,
+                "execution_plan": execution_plan,
+                "session_id": tracker.session_id,
+                "execution_id": exec_id,
+                "tools": merged_tools,
+                "tool_catalog": tool_catalog.tools,
+                "system_prompt": system_prompt,
+                "externally_satisfied_acs": externally_satisfied_acs,
+            }
+            if resume_session_id is not None:
+                _serial_kwargs["resume_session_id"] = resume_session_id
             parallel_result = await parallel_executor.execute_serial(  # type: ignore[attr-defined]
-                seed=seed,
-                execution_plan=execution_plan,
-                session_id=tracker.session_id,
-                execution_id=exec_id,
-                tools=merged_tools,
-                tool_catalog=tool_catalog.tools,
-                system_prompt=system_prompt,
-                externally_satisfied_acs=externally_satisfied_acs,
+                **_serial_kwargs
             )
         else:
             parallel_result = await parallel_executor.execute_parallel(
