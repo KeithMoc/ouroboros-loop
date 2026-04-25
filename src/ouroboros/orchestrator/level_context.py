@@ -61,6 +61,11 @@ _POSTMORTEM_DIGEST_CONTENT_CHARS = 60
 _POSTMORTEM_MAX_DIFF_CHARS = 2000
 # Max chars retained in tool_trace_digest (guards against pathological traces).
 _POSTMORTEM_MAX_TRACE_CHARS = 1500
+# Default minimum reliability score for invariants to appear in the prompt chain.
+# Below-threshold invariants are captured and stored in the serialized chain
+# but are hidden from downstream ACs' prompt context.
+# Override with OUROBOROS_INVARIANT_MIN_RELIABILITY env var.
+POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY = 0.7
 
 PostmortemStatus = Literal["pass", "fail", "partial"]
 
@@ -627,8 +632,16 @@ class ACPostmortem:
 
         return " | ".join(parts)
 
-    def to_full_text(self) -> str:
-        """Render the full postmortem for the in-prompt 'recent' window."""
+    def to_full_text(self, *, min_reliability: float = 0.0) -> str:
+        """Render the full postmortem for the in-prompt 'recent' window.
+
+        Args:
+            min_reliability: Reliability gate applied to per-AC invariants in
+                the "Invariants established" sub-section.  Contradicted
+                invariants (``is_contradicted=True``) are always excluded.
+                Defaults to 0.0 (no filtering) when called standalone; callers
+                should pass the chain-level threshold for consistent behaviour.
+        """
         s = self.summary
         lines: list[str] = [
             f"### AC {s.ac_index + 1} [{self.status}]"
@@ -652,9 +665,15 @@ class ACPostmortem:
             lines.append(
                 f"**Tool trace:** {self.tool_trace_digest[:_POSTMORTEM_MAX_TRACE_CHARS]}"
             )
-        if self.invariants_established:
+        # Apply reliability gate to per-AC invariants in the full-form render.
+        visible_invs = tuple(
+            inv
+            for inv in self.invariants_established
+            if not inv.is_contradicted and inv.reliability >= min_reliability
+        )
+        if visible_invs:
             lines.append("**Invariants established:**")
-            lines.extend(f"- {inv.text}" for inv in self.invariants_established)
+            lines.extend(f"- {inv.text}" for inv in visible_invs)
         if self.gotchas:
             lines.append("**Gotchas:**")
             lines.extend(f"- {g}" for g in self.gotchas)
@@ -840,6 +859,7 @@ class PostmortemChain:
         *,
         k_full: int = POSTMORTEM_DEFAULT_K_FULL,
         token_budget: int = POSTMORTEM_DEFAULT_TOKEN_BUDGET,
+        min_reliability: float | None = None,
     ) -> str:
         """Render the chain as a markdown section for user-turn injection.
 
@@ -850,12 +870,39 @@ class PostmortemChain:
                 rendered text exceeds ``token_budget * 4`` characters, oldest
                 digest lines are progressively dropped. Full forms and the
                 invariants block are always preserved.
+            min_reliability: Reliability gate for the "Established Invariants"
+                block. Only invariants whose ``reliability`` score is at or
+                above this threshold are rendered; contradicted invariants
+                (``is_contradicted=True``) are always excluded regardless of
+                score. When ``None`` (default), the value is resolved from
+                the ``OUROBOROS_INVARIANT_MIN_RELIABILITY`` env var, falling
+                back to :data:`POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY`
+                (0.7). Pass ``0.0`` explicitly to show all non-contradicted
+                invariants.
 
         Returns:
             The formatted section, or an empty string if the chain is empty.
+
+        [[INVARIANT: to_prompt_text render gate uses OUROBOROS_INVARIANT_MIN_RELIABILITY env var (default 0.7)]]
+        [[INVARIANT: contradicted invariants are always excluded from to_prompt_text regardless of min_reliability]]
         """
         if not self.postmortems:
             return ""
+
+        # --- Resolve min_reliability threshold (arg > env var > built-in default) ---
+        if min_reliability is None:
+            raw = os.environ.get("OUROBOROS_INVARIANT_MIN_RELIABILITY", "").strip()
+            try:
+                min_reliability = (
+                    float(raw) if raw else POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY
+                )
+            except ValueError:
+                log.warning(
+                    "postmortem_chain.invalid_min_reliability_env",
+                    raw_value=raw,
+                    fallback=POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY,
+                )
+                min_reliability = POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY
 
         char_budget = max(0, token_budget) * _POSTMORTEM_CHARS_PER_TOKEN
 
@@ -868,7 +915,24 @@ class PostmortemChain:
             digest_entries = self.postmortems[:split]
             full_entries = self.postmortems[split:]
 
-        invariants = self.cumulative_invariants()
+        all_invariants = self.cumulative_invariants()
+        # Apply render gate: filter contradicted invariants and those below the
+        # reliability threshold.  Contradicted invariants (reliability=0.0) are
+        # always excluded; the threshold check also catches them but the explicit
+        # ``is_contradicted`` guard makes intent clear.
+        invariants = tuple(
+            inv
+            for inv in all_invariants
+            if not inv.is_contradicted and inv.reliability >= min_reliability
+        )
+        hidden_count = len(all_invariants) - len(invariants)
+        if hidden_count > 0:
+            log.debug(
+                "postmortem_chain.invariants.render_gate_filtered",
+                hidden_count=hidden_count,
+                total_count=len(all_invariants),
+                min_reliability=min_reliability,
+            )
 
         def _render(digests: tuple[ACPostmortem, ...]) -> str:
             sections: list[str] = ["## Prior AC Postmortems (Compounding Context)"]
@@ -880,7 +944,12 @@ class PostmortemChain:
                 sections.extend(f"- {pm.to_digest()}" for pm in digests)
             if full_entries:
                 sections.append("### Recent ACs (full postmortems)")
-                sections.extend(pm.to_full_text() for pm in full_entries)
+                # Pass min_reliability so individual full-form sections apply the
+                # same gate as the cumulative invariants block above.
+                sections.extend(
+                    pm.to_full_text(min_reliability=min_reliability)
+                    for pm in full_entries
+                )
             return "\n".join(sections)
 
         text = _render(digest_entries)

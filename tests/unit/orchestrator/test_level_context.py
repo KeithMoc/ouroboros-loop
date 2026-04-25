@@ -14,6 +14,7 @@ from ouroboros.orchestrator.level_context import (
     ACPostmortem,
     Invariant,
     LevelContext,
+    POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY,
     POSTMORTEM_DEFAULT_K_FULL,
     POSTMORTEM_DEFAULT_TOKEN_BUDGET,
     PostmortemChain,
@@ -1888,3 +1889,233 @@ class TestBuildSystemPromptInvariantSection:
         prompt_default = build_system_prompt(seed)  # type: ignore[arg-type]
         prompt_explicit_false = build_system_prompt(seed, include_invariant_instructions=False)  # type: ignore[arg-type]
         assert prompt_default == prompt_explicit_false
+
+
+# ---------------------------------------------------------------------------
+# AC-3 (Q3 render gate) — reliability-threshold filter in to_prompt_text()
+# ---------------------------------------------------------------------------
+
+
+def _mk_pm_with_reliability(
+    idx: int,
+    inv_text: str,
+    reliability: float,
+    *,
+    is_contradicted: bool = False,
+) -> ACPostmortem:
+    """Helper: ACPostmortem with one explicit Invariant at the given reliability."""
+    summary = ACContextSummary(
+        ac_index=idx,
+        ac_content=f"AC {idx + 1} task",
+        success=True,
+    )
+    inv = Invariant(
+        text=inv_text,
+        reliability=reliability,
+        occurrences=1,
+        first_seen_ac_id=f"ac_{idx}",
+        is_contradicted=is_contradicted,
+    )
+    return ACPostmortem(summary=summary, invariants_established=(inv,))
+
+
+class TestRenderGate:
+    """Tests for the reliability-threshold render gate in to_prompt_text().
+
+    Verifies that OUROBOROS_INVARIANT_MIN_RELIABILITY controls which invariants
+    appear in the rendered prompt chain, while leaving the serialized chain data
+    untouched.
+
+    [[INVARIANT: to_prompt_text render gate filters below-threshold invariants from prompt]]
+    [[INVARIANT: OUROBOROS_INVARIANT_MIN_RELIABILITY env var controls render threshold (default 0.7)]]
+    """
+
+    def test_high_reliability_invariant_passes_gate(self) -> None:
+        """Invariant with reliability >= threshold appears in rendered prompt."""
+        chain = PostmortemChain(
+            postmortems=(_mk_pm_with_reliability(0, "HIGH_TRUST invariant", 0.95),)
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "HIGH_TRUST invariant" in text
+
+    def test_low_reliability_invariant_filtered_from_prompt(self) -> None:
+        """Invariant with reliability < threshold is hidden from rendered prompt.
+
+        Building on AC-1 (chain artifact) and AC-2 (flattening): this is the
+        render gate that prevents low-confidence facts from polluting future AC prompts.
+        The invariant is stored in the chain but not rendered.
+        """
+        chain = PostmortemChain(
+            postmortems=(_mk_pm_with_reliability(0, "LOW_TRUST invariant", 0.3),)
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "LOW_TRUST invariant" not in text
+
+    def test_invariant_exactly_at_threshold_is_included(self) -> None:
+        """Invariant with reliability == threshold is included (>= comparison)."""
+        chain = PostmortemChain(
+            postmortems=(_mk_pm_with_reliability(0, "EXACT_THRESHOLD invariant", 0.7),)
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "EXACT_THRESHOLD invariant" in text
+
+    def test_just_below_threshold_is_excluded(self) -> None:
+        """Invariant at 0.699 (just below 0.7) is filtered out."""
+        chain = PostmortemChain(
+            postmortems=(_mk_pm_with_reliability(0, "ALMOST invariant", 0.699),)
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "ALMOST invariant" not in text
+
+    def test_contradicted_invariant_always_filtered(self) -> None:
+        """Contradicted invariants (is_contradicted=True) never appear even if caller
+        passes min_reliability=0.0.
+
+        AC-2 established that contradicted invariants get reliability=0.0 and
+        is_contradicted=True. The render gate must exclude them regardless.
+        """
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(
+                    0, "CONTRADICTED fact", 0.0, is_contradicted=True
+                ),
+            )
+        )
+        # Even with min_reliability=0.0 (show all), contradicted ones stay hidden.
+        text = chain.to_prompt_text(min_reliability=0.0)
+        assert "CONTRADICTED fact" not in text
+
+    def test_zero_min_reliability_shows_all_non_contradicted(self) -> None:
+        """min_reliability=0.0 renders all non-contradicted invariants regardless of score."""
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "VERY_LOW score", 0.01),
+                _mk_pm_with_reliability(1, "HIGH score", 0.99),
+            )
+        )
+        text = chain.to_prompt_text(min_reliability=0.0)
+        assert "VERY_LOW score" in text
+        assert "HIGH score" in text
+
+    def test_mixed_reliabilities_only_high_shown(self) -> None:
+        """Chain with mixed-reliability invariants renders only the trusted ones."""
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "TRUSTED invariant", 0.9),
+                _mk_pm_with_reliability(1, "UNTRUSTED invariant", 0.4),
+                _mk_pm_with_reliability(2, "BORDERLINE invariant", 0.7),
+            )
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "TRUSTED invariant" in text
+        assert "BORDERLINE invariant" in text
+        assert "UNTRUSTED invariant" not in text
+
+    def test_env_var_controls_default_threshold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OUROBOROS_INVARIANT_MIN_RELIABILITY env var controls the default threshold.
+
+        When min_reliability is not explicitly passed, to_prompt_text() reads
+        the env var. This is the primary configuration point for operators.
+        """
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "MEDIUM_TRUST inv", 0.6),
+                _mk_pm_with_reliability(1, "HIGH_TRUST inv", 0.9),
+            )
+        )
+        # With strict threshold (0.8): only HIGH_TRUST passes.
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "0.8")
+        text_strict = chain.to_prompt_text()
+        assert "HIGH_TRUST inv" in text_strict
+        assert "MEDIUM_TRUST inv" not in text_strict
+
+        # With lenient threshold (0.5): both pass.
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "0.5")
+        text_lenient = chain.to_prompt_text()
+        assert "HIGH_TRUST inv" in text_lenient
+        assert "MEDIUM_TRUST inv" in text_lenient
+
+    def test_env_var_unset_uses_default_threshold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When env var is unset, default threshold (0.7) is applied.
+
+        Confirms POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY=0.7 is the
+        actual default used when the env var is absent.
+        """
+        monkeypatch.delenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", raising=False)
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "BELOW_DEFAULT inv", 0.5),
+                _mk_pm_with_reliability(1, "ABOVE_DEFAULT inv", 0.8),
+            )
+        )
+        text = chain.to_prompt_text()
+        assert "ABOVE_DEFAULT inv" in text
+        assert "BELOW_DEFAULT inv" not in text
+        # Verify the default constant is what we expect.
+        assert POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY == 0.7
+
+    def test_invalid_env_var_falls_back_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-numeric env var value falls back to default threshold silently."""
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "not-a-float")
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "HIGH_TRUST fallback", 0.9),
+                _mk_pm_with_reliability(1, "LOW_TRUST fallback", 0.1),
+            )
+        )
+        # Should use default 0.7: HIGH passes, LOW filtered.
+        text = chain.to_prompt_text()
+        assert "HIGH_TRUST fallback" in text
+        assert "LOW_TRUST fallback" not in text
+
+    def test_build_postmortem_chain_prompt_respects_env_var(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """build_postmortem_chain_prompt() honors OUROBOROS_INVARIANT_MIN_RELIABILITY
+        via to_prompt_text()'s internal env var resolution.
+
+        This confirms the full call path from the serial executor (which calls
+        build_postmortem_chain_prompt) through to the render gate works end-to-end.
+        """
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "EXECUTIVE_TRUTH inv", 0.85),
+                _mk_pm_with_reliability(1, "WEAK_CLAIM inv", 0.2),
+            )
+        )
+        # Set threshold to 0.8: WEAK_CLAIM is hidden.
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "0.8")
+        text = build_postmortem_chain_prompt(chain)
+        assert "EXECUTIVE_TRUTH inv" in text
+        assert "WEAK_CLAIM inv" not in text
+
+    def test_serialized_chain_preserves_below_threshold_invariants(self) -> None:
+        """Low-reliability invariants hidden from prompt are still in the serialized chain.
+
+        The render gate only affects prompt output; the serialized chain is the
+        full record (important for audit and resume semantics from AC-1/AC-2).
+        """
+        low_inv = Invariant(
+            text="BELOW_THRESHOLD claim",
+            reliability=0.3,
+            occurrences=1,
+            first_seen_ac_id="ac_0",
+        )
+        summary = ACContextSummary(ac_index=0, ac_content="Test AC", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=(low_inv,))
+        chain = PostmortemChain(postmortems=(pm,))
+
+        # The serialized data retains the invariant.
+        data = serialize_postmortem_chain(chain)
+        assert len(data) == 1
+        assert len(data[0]["invariants_established"]) == 1
+        assert data[0]["invariants_established"][0]["text"] == "BELOW_THRESHOLD claim"
+        assert abs(data[0]["invariants_established"][0]["reliability"] - 0.3) < 1e-9
+
+        # The rendered prompt hides it (threshold=0.7).
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "BELOW_THRESHOLD claim" not in text
