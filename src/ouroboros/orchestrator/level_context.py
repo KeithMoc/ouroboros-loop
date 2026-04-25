@@ -661,17 +661,116 @@ class PostmortemChain:
         """Deduplicated invariants across all ACs, in insertion order.
 
         Deduplication is by normalized text (lower-cased, collapsed whitespace).
-        When the same text appears more than once, the first-seen ``Invariant``
-        object is kept. Full ``merge_invariants`` logic (occurrence bumping,
-        reliability averaging, contradiction detection) is added in AC-3.
+        The **last** occurrence of each key is used so that
+        :meth:`merge_invariants` results — which carry up-to-date occurrence
+        counts and blended reliability scores — take precedence over earlier,
+        lower-count versions.
+
+        Insertion order is preserved: the first time a key is seen determines
+        its position in the returned tuple; subsequent re-declarations only
+        update the stored :class:`Invariant` object.
         """
+        order: list[str] = []
         seen: dict[str, Invariant] = {}
         for pm in self.postmortems:
             for inv in pm.invariants_established:
                 key = " ".join(inv.text.lower().split())
                 if key not in seen:
-                    seen[key] = inv
-        return tuple(seen.values())
+                    order.append(key)
+                seen[key] = inv  # last wins — most recent count / reliability
+        return tuple(seen[k] for k in order)
+
+    def merge_invariants(
+        self,
+        new: "list[tuple[str, float]]",
+        source_ac_id: str,
+    ) -> "tuple[Invariant, ...]":
+        """Merge new invariant claims into the running chain's cumulative set.
+
+        Called after each AC completes to produce the ``invariants_established``
+        tuple for the new :class:`ACPostmortem` being appended to the chain.
+
+        Algorithm (per invariant in ``new``):
+
+        1. **Normalize** the text: lower-case + collapsed whitespace for lookup.
+        2. **Match** against the chain's cumulative invariants (same key).
+        3. **Re-declaration** (match found): bump ``occurrences`` by 1, blend the
+           reliability score as a weighted mean::
+
+               (prior.reliability × prior.occurrences + new_reliability) / new_occurrences
+
+           The *canonical text* is preserved from the first-seen invariant so
+           the rendered output stays stable across re-declarations with minor
+           wording variations.
+        4. **New** (no match): insert as
+           ``Invariant(text, reliability, 1, source_ac_id)``.
+
+        Deduplication within ``new`` itself (same normalized key appearing
+        twice in one AC) keeps only the first occurrence.
+
+        Args:
+            new: Pairs of ``(text, reliability_score)`` produced by the Haiku
+                verifier (Q3 / C-plus).  Pass an empty list when no invariants
+                were extracted or the verifier returned nothing.
+            source_ac_id: AC id string used as ``first_seen_ac_id`` for
+                genuinely new invariants.  Pass an empty string when the
+                calling AC has no id.
+
+        Returns:
+            A tuple of :class:`Invariant` objects, one per unique entry in
+            ``new``, in the order they appeared.  Re-declared invariants carry
+            updated occurrence counts and blended reliability scores; new ones
+            carry ``occurrences=1`` and ``first_seen_ac_id=source_ac_id``.
+
+        [[INVARIANT: PostmortemChain.merge_invariants bumps occurrences and averages reliability on re-declaration]]
+        [[INVARIANT: first_seen_ac_id is set on new invariants and preserved on re-declarations]]
+        """
+        # Build lookup from accumulated history; last occurrence wins so that
+        # previously-merged invariants (with bumped counts) serve as the base.
+        existing: dict[str, Invariant] = {}
+        for pm in self.postmortems:
+            for inv in pm.invariants_established:
+                key = " ".join(inv.text.lower().split())
+                existing[key] = inv
+
+        result: list[Invariant] = []
+        seen_keys: set[str] = set()
+
+        for text, reliability in new:
+            # Apply 200-char cap — mirrors extract_invariant_tags behaviour.
+            text = text[:_MAX_INVARIANT_TEXT_CHARS]
+            key = " ".join(text.lower().split())
+            if not key:
+                continue
+            if key in seen_keys:
+                # Duplicate within this AC's ``new`` list — skip.
+                continue
+            seen_keys.add(key)
+
+            if key in existing:
+                prior = existing[key]
+                new_occ = prior.occurrences + 1
+                # Weighted mean: weight by prior occurrence count.
+                blended = (prior.reliability * prior.occurrences + reliability) / new_occ
+                result.append(
+                    Invariant(
+                        text=prior.text,  # canonical text from first occurrence
+                        reliability=round(blended, 6),
+                        occurrences=new_occ,
+                        first_seen_ac_id=prior.first_seen_ac_id,
+                    )
+                )
+            else:
+                result.append(
+                    Invariant(
+                        text=text,
+                        reliability=reliability,
+                        occurrences=1,
+                        first_seen_ac_id=source_ac_id,
+                    )
+                )
+
+        return tuple(result)
 
     def to_prompt_text(
         self,

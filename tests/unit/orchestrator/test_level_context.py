@@ -1188,6 +1188,247 @@ class TestPostmortemSerialization:
             inv.text = "y"  # type: ignore[misc]
 
 
+# ---------------------------------------------------------------------------
+# Q3 (C-plus) — PostmortemChain.merge_invariants tests
+# ---------------------------------------------------------------------------
+
+
+def _make_pm_with_invariant(
+    idx: int,
+    inv: Invariant,
+) -> ACPostmortem:
+    """Helper: ACPostmortem with a single explicit Invariant object."""
+    summary = ACContextSummary(ac_index=idx, ac_content=f"AC {idx + 1}", success=True)
+    return ACPostmortem(summary=summary, invariants_established=(inv,))
+
+
+class TestMergeInvariants:
+    """Tests for PostmortemChain.merge_invariants(new, source_ac_id).
+
+    Each AC's postmortem carries its ``merge_invariants`` result as
+    ``invariants_established``.  ``cumulative_invariants()`` picks the
+    *last* occurrence per key so updated counts/reliabilities surface.
+
+    [[INVARIANT: merge_invariants is called once per AC to produce invariants_established]]
+    [[INVARIANT: cumulative_invariants returns last-seen Invariant per normalized key]]
+    """
+
+    # --- new invariant insertion ---
+
+    def test_new_invariant_inserted_with_source_tracking(self) -> None:
+        """A brand-new invariant gets occurrences=1 and first_seen_ac_id set."""
+        chain = PostmortemChain()
+        result = chain.merge_invariants([("AUTH required", 0.9)], source_ac_id="ac_1")
+        assert len(result) == 1
+        inv = result[0]
+        assert inv.text == "AUTH required"
+        assert abs(inv.reliability - 0.9) < 1e-9
+        assert inv.occurrences == 1
+        assert inv.first_seen_ac_id == "ac_1"
+
+    def test_multiple_new_invariants_all_inserted(self) -> None:
+        """Multiple distinct new invariants are all inserted as occurrences=1."""
+        chain = PostmortemChain()
+        result = chain.merge_invariants(
+            [("A holds", 0.8), ("B holds", 0.9)],
+            source_ac_id="ac_1",
+        )
+        assert len(result) == 2
+        assert result[0].text == "A holds"
+        assert result[1].text == "B holds"
+
+    # --- re-declaration: occurrence bumping ---
+
+    def test_redeclared_invariant_bumps_occurrence(self) -> None:
+        """Re-declaring an existing invariant bumps its occurrence count by 1."""
+        prior = Invariant(
+            text="AUTH required", reliability=0.8, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("AUTH required", 1.0)], source_ac_id="ac_2")
+        assert len(result) == 1
+        assert result[0].occurrences == 2
+
+    def test_three_declarations_produce_occurrences_three(self) -> None:
+        """Three declarations across three ACs produce occurrences=3 in AC-3."""
+        chain = PostmortemChain()
+
+        # AC 1: first declaration
+        inv1 = chain.merge_invariants([("K holds", 1.0)], source_ac_id="ac_1")
+        chain = chain.append(_make_pm_with_invariant(0, inv1[0]))
+
+        # AC 2: re-declaration
+        inv2 = chain.merge_invariants([("K holds", 0.8)], source_ac_id="ac_2")
+        chain = chain.append(_make_pm_with_invariant(1, inv2[0]))
+
+        # AC 3: re-declaration again
+        inv3 = chain.merge_invariants([("K holds", 0.9)], source_ac_id="ac_3")
+        assert len(inv3) == 1
+        assert inv3[0].occurrences == 3
+
+    # --- re-declaration: reliability averaging ---
+
+    def test_redeclared_invariant_averages_reliability(self) -> None:
+        """Reliability blended as weighted mean on re-declaration."""
+        prior = Invariant(
+            text="Cache is warm", reliability=0.8, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("Cache is warm", 1.0)], source_ac_id="ac_2")
+        inv = result[0]
+        # Weighted mean: (0.8 * 1 + 1.0) / 2 = 0.9
+        assert abs(inv.reliability - 0.9) < 1e-6
+
+    def test_reliability_weighted_by_occurrences(self) -> None:
+        """Prior occurrence count weights the reliability blend correctly."""
+        # occurrences=2, reliability=0.6 after two prior declarations
+        prior = Invariant(
+            text="X is stable", reliability=0.6, occurrences=2, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("X is stable", 1.0)], source_ac_id="ac_3")
+        inv = result[0]
+        # Weighted mean: (0.6 * 2 + 1.0) / 3 = 2.2 / 3 ≈ 0.7333...
+        expected = (0.6 * 2 + 1.0) / 3
+        assert abs(inv.reliability - expected) < 1e-5
+
+    # --- canonical text and first_seen_ac_id preservation ---
+
+    def test_canonical_text_preserved_from_first_occurrence(self) -> None:
+        """Re-declaration with different casing preserves the original canonical text."""
+        prior = Invariant(
+            text="Cache Is Warm", reliability=0.8, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("cache is warm", 0.9)], source_ac_id="ac_2")
+        assert len(result) == 1
+        assert result[0].text == "Cache Is Warm"  # original casing preserved
+
+    def test_first_seen_ac_id_not_updated_on_redeclaration(self) -> None:
+        """first_seen_ac_id stays at the original AC, not the re-declaring AC."""
+        prior = Invariant(
+            text="X holds", reliability=0.7, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("X holds", 0.9)], source_ac_id="ac_5")
+        assert result[0].first_seen_ac_id == "ac_1"  # not "ac_5"
+
+    # --- deduplication within new ---
+
+    def test_empty_new_list_returns_empty_tuple(self) -> None:
+        """Empty new list returns an empty tuple."""
+        chain = PostmortemChain(postmortems=(_mk_pm(0, invariants=("existing",)),))
+        result = chain.merge_invariants([], source_ac_id="ac_2")
+        assert result == ()
+
+    def test_duplicates_within_new_keep_first(self) -> None:
+        """Duplicate entries within ``new`` deduplicate to the first occurrence."""
+        chain = PostmortemChain()
+        result = chain.merge_invariants(
+            [("dup claim", 0.9), ("dup claim", 0.5)],
+            source_ac_id="ac_1",
+        )
+        assert len(result) == 1
+        assert abs(result[0].reliability - 0.9) < 1e-9  # first occurrence wins
+
+    # --- normalization ---
+
+    def test_normalization_matches_case_variant(self) -> None:
+        """Upper-cased re-declaration matches lower-cased existing invariant."""
+        prior = Invariant(
+            text="x is true", reliability=0.8, occurrences=1, first_seen_ac_id="ac_1"
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants([("X IS TRUE", 1.0)], source_ac_id="ac_2")
+        assert len(result) == 1
+        assert result[0].occurrences == 2
+
+    def test_normalization_collapses_whitespace(self) -> None:
+        """Extra whitespace in re-declaration text is collapsed before matching."""
+        prior = Invariant(
+            text="auth header required",
+            reliability=0.8,
+            occurrences=1,
+            first_seen_ac_id="ac_1",
+        )
+        chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
+
+        result = chain.merge_invariants(
+            [("auth   header   required", 0.9)], source_ac_id="ac_2"
+        )
+        assert len(result) == 1
+        assert result[0].occurrences == 2
+
+    # --- text truncation ---
+
+    def test_text_truncated_at_200_chars(self) -> None:
+        """Invariant text longer than 200 chars is silently truncated."""
+        chain = PostmortemChain()
+        long_text = "x" * 250
+        result = chain.merge_invariants([(long_text, 0.9)], source_ac_id="ac_1")
+        assert len(result) == 1
+        from ouroboros.orchestrator.level_context import _MAX_INVARIANT_TEXT_CHARS
+
+        assert len(result[0].text) == _MAX_INVARIANT_TEXT_CHARS
+
+    def test_whitespace_only_text_skipped(self) -> None:
+        """Invariants with empty/whitespace-only text are silently skipped."""
+        chain = PostmortemChain()
+        result = chain.merge_invariants([("   ", 0.9)], source_ac_id="ac_1")
+        assert result == ()
+
+    # --- integration with cumulative_invariants ---
+
+    def test_cumulative_invariants_reflects_bumped_counts(self) -> None:
+        """cumulative_invariants returns the last-seen Invariant (with bumped count)."""
+        chain = PostmortemChain()
+
+        # AC 1: new invariant
+        inv1 = chain.merge_invariants([("J is constant", 0.7)], source_ac_id="ac_1")
+        chain = chain.append(_make_pm_with_invariant(0, inv1[0]))
+
+        # AC 2: re-declare — occurrences should be 2 in chain's view
+        inv2 = chain.merge_invariants([("J is constant", 0.9)], source_ac_id="ac_2")
+        chain = chain.append(_make_pm_with_invariant(1, inv2[0]))
+
+        cumulative = chain.cumulative_invariants()
+        assert len(cumulative) == 1
+        assert cumulative[0].occurrences == 2  # last wins
+
+    def test_cumulative_invariants_insertion_order_preserved(self) -> None:
+        """Invariants appear in the order first seen, even with later re-declarations."""
+        chain = PostmortemChain()
+
+        # AC 1: declares A and B
+        inv_ac1 = chain.merge_invariants(
+            [("A", 0.9), ("B", 0.8)], source_ac_id="ac_1"
+        )
+        summary1 = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm1 = ACPostmortem(summary=summary1, invariants_established=inv_ac1)
+        chain = chain.append(pm1)
+
+        # AC 2: re-declares B, adds C
+        inv_ac2 = chain.merge_invariants(
+            [("B", 0.9), ("C", 0.85)], source_ac_id="ac_2"
+        )
+        summary2 = ACContextSummary(ac_index=1, ac_content="AC 2", success=True)
+        pm2 = ACPostmortem(summary=summary2, invariants_established=inv_ac2)
+        chain = chain.append(pm2)
+
+        cumulative = chain.cumulative_invariants()
+        # Order: A (first in ac_1), B (second in ac_1), C (first in ac_2)
+        assert [inv.text for inv in cumulative] == ["A", "B", "C"]
+        # B should have occurrences=2 from the ac_2 merge
+        b_inv = next(inv for inv in cumulative if inv.text == "B")
+        assert b_inv.occurrences == 2
+
+
 class TestBuildPostmortemChainPrompt:
     def test_honors_env_k_full(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OUROBOROS_POSTMORTEM_FULL_K", "0")
