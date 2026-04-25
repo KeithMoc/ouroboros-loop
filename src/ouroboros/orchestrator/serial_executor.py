@@ -141,8 +141,12 @@ def _render_chain_as_markdown(
             lines.append("- Public API changes: (none recorded)")
 
         if invariants:
-            inv_str = "; ".join(str(i) for i in invariants)
-            lines.append(f"- Invariants established: {inv_str}")
+            # Invariants are serialized as dicts via dataclasses.asdict(); extract text.
+            inv_texts = [
+                i.get("text", str(i)) if isinstance(i, dict) else str(i)
+                for i in invariants
+            ]
+            lines.append(f"- Invariants established: {'; '.join(inv_texts)}")
 
         lines.append("")
 

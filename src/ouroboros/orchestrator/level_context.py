@@ -493,6 +493,50 @@ def deserialize_level_contexts(data: list[dict[str, Any]]) -> list[LevelContext]
 
 
 @dataclass(frozen=True, slots=True)
+class Invariant:
+    """A fact established by an AC that compounds into future ACs.
+
+    Attributes:
+        text: The invariant claim (≤200 chars).
+        reliability: Score 0.0–1.0 from the Haiku verifier (default 1.0 until
+            the verifier runs; set to 1.0 for manually-emitted tags that have
+            not yet been verified).
+        occurrences: How many times this invariant has been (re-)declared
+            across ACs. Bumped on each re-declaration; used to rank invariants.
+        first_seen_ac_id: The AC id string where this invariant was first
+            established. Empty string when the source AC has no id.
+    """
+
+    text: str
+    reliability: float = 1.0
+    occurrences: int = 1
+    first_seen_ac_id: str = ""
+
+    def __str__(self) -> str:  # noqa: D105
+        return self.text
+
+
+def _deserialize_invariant(item: Any) -> "Invariant":
+    """Reconstruct an Invariant from a serialized form.
+
+    Handles two formats for backward compatibility:
+    - Legacy string: ``"AUTH_HEADER required"`` → ``Invariant(text=...)``
+    - New dict: ``{"text": "...", "reliability": 0.9, ...}``
+    """
+    if isinstance(item, str):
+        return Invariant(text=item)
+    if isinstance(item, dict):
+        return Invariant(
+            text=item.get("text", ""),
+            reliability=float(item.get("reliability", 1.0)),
+            occurrences=int(item.get("occurrences", 1)),
+            first_seen_ac_id=item.get("first_seen_ac_id", ""),
+        )
+    # Fallback: coerce unknown types to string
+    return Invariant(text=str(item))
+
+
+@dataclass(frozen=True, slots=True)
 class ACPostmortem:
     """Per-AC postmortem carried forward as compounding context.
 
@@ -511,7 +555,7 @@ class ACPostmortem:
     tool_trace_digest: str = ""
     gotchas: tuple[str, ...] = field(default_factory=tuple)
     qa_suggestions: tuple[str, ...] = field(default_factory=tuple)
-    invariants_established: tuple[str, ...] = field(default_factory=tuple)
+    invariants_established: tuple[Invariant, ...] = field(default_factory=tuple)
     retry_attempts: int = 0
     status: PostmortemStatus = "pass"
     duration_seconds: float = 0.0
@@ -540,10 +584,10 @@ class ACPostmortem:
         if self.status != "pass" and self.gotchas:
             parts.append(f"gotcha: {self.gotchas[0]}")
         elif self.invariants_established:
-            inv_head = "; ".join(self.invariants_established[:2])
+            inv_head = "; ".join(inv.text for inv in self.invariants_established[:2])
             extra_inv = len(self.invariants_established) - 2
-            inv = inv_head + (f" (+{extra_inv} more)" if extra_inv > 0 else "")
-            parts.append(f"invariants: {inv}")
+            inv_str = inv_head + (f" (+{extra_inv} more)" if extra_inv > 0 else "")
+            parts.append(f"invariants: {inv_str}")
 
         return " | ".join(parts)
 
@@ -574,7 +618,7 @@ class ACPostmortem:
             )
         if self.invariants_established:
             lines.append("**Invariants established:**")
-            lines.extend(f"- {inv}" for inv in self.invariants_established)
+            lines.extend(f"- {inv.text}" for inv in self.invariants_established)
         if self.gotchas:
             lines.append("**Gotchas:**")
             lines.extend(f"- {g}" for g in self.gotchas)
@@ -605,14 +649,21 @@ class PostmortemChain:
         """Return a new chain with ``postmortem`` appended (immutable)."""
         return PostmortemChain(postmortems=self.postmortems + (postmortem,))
 
-    def cumulative_invariants(self) -> tuple[str, ...]:
-        """Deduplicated invariants across all ACs, in insertion order."""
-        seen: dict[str, None] = {}
+    def cumulative_invariants(self) -> tuple[Invariant, ...]:
+        """Deduplicated invariants across all ACs, in insertion order.
+
+        Deduplication is by normalized text (lower-cased, collapsed whitespace).
+        When the same text appears more than once, the first-seen ``Invariant``
+        object is kept. Full ``merge_invariants`` logic (occurrence bumping,
+        reliability averaging, contradiction detection) is added in AC-3.
+        """
+        seen: dict[str, Invariant] = {}
         for pm in self.postmortems:
             for inv in pm.invariants_established:
-                if inv not in seen:
-                    seen[inv] = None
-        return tuple(seen)
+                key = " ".join(inv.text.lower().split())
+                if key not in seen:
+                    seen[key] = inv
+        return tuple(seen.values())
 
     def to_prompt_text(
         self,
@@ -653,7 +704,7 @@ class PostmortemChain:
             sections: list[str] = ["## Prior AC Postmortems (Compounding Context)"]
             if invariants:
                 sections.append("### Established Invariants (cumulative)")
-                sections.extend(f"- {inv}" for inv in invariants)
+                sections.extend(f"- {inv.text}" for inv in invariants)
             if digests:
                 sections.append("### Earlier ACs (digests)")
                 sections.extend(f"- {pm.to_digest()}" for pm in digests)
@@ -751,7 +802,10 @@ def _deserialize_postmortem(d: dict[str, Any]) -> ACPostmortem:
         tool_trace_digest=d.get("tool_trace_digest", ""),
         gotchas=_ensure_tuple_or_none(d.get("gotchas", ())),
         qa_suggestions=_ensure_tuple_or_none(d.get("qa_suggestions", ())),
-        invariants_established=_ensure_tuple_or_none(d.get("invariants_established", ())),
+        invariants_established=tuple(
+            _deserialize_invariant(item)
+            for item in (d.get("invariants_established") or ())
+        ),
         retry_attempts=d.get("retry_attempts", 0),
         status=status_value,  # type: ignore[arg-type]
         duration_seconds=d.get("duration_seconds", 0.0),
@@ -778,6 +832,7 @@ def deserialize_postmortem_chain(data: list[dict[str, Any]]) -> PostmortemChain:
 __all__ = [
     "ACContextSummary",
     "ACPostmortem",
+    "Invariant",
     "LevelContext",
     "POSTMORTEM_DEFAULT_K_FULL",
     "POSTMORTEM_DEFAULT_TOKEN_BUDGET",

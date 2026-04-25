@@ -11,6 +11,7 @@ from ouroboros.orchestrator.level_context import (
     _MAX_FILES_FOR_API,
     ACContextSummary,
     ACPostmortem,
+    Invariant,
     LevelContext,
     POSTMORTEM_DEFAULT_K_FULL,
     POSTMORTEM_DEFAULT_TOKEN_BUDGET,
@@ -825,6 +826,8 @@ def _mk_pm(
     retry_attempts: int = 0,
     duration: float = 0.0,
 ) -> ACPostmortem:
+    """Helper to create an ACPostmortem; ``invariants`` accepts plain strings
+    and auto-wraps each as ``Invariant(text=...)`` for test convenience."""
     summary = ACContextSummary(
         ac_index=idx,
         ac_content=content or f"AC {idx + 1} task description",
@@ -832,13 +835,14 @@ def _mk_pm(
         tools_used=tools,
         files_modified=files,
     )
+    inv_objects: tuple[Invariant, ...] = tuple(Invariant(text=i) for i in invariants)
     return ACPostmortem(
         summary=summary,
         diff_summary=diff_summary,
         tool_trace_digest=tool_trace_digest,
         gotchas=gotchas,
         qa_suggestions=qa_suggestions,
-        invariants_established=invariants,
+        invariants_established=inv_objects,
         retry_attempts=retry_attempts,
         status=status,  # type: ignore[arg-type]
         duration_seconds=duration,
@@ -947,7 +951,10 @@ class TestPostmortemChain:
                 _mk_pm(2, invariants=("A", "D")),
             )
         )
-        assert chain.cumulative_invariants() == ("A", "B", "C", "D")
+        result = chain.cumulative_invariants()
+        # Should return tuple[Invariant, ...] deduplicated by text in insertion order.
+        assert len(result) == 4
+        assert [inv.text for inv in result] == ["A", "B", "C", "D"]
 
     def test_recent_rendered_full_older_rendered_digest(self) -> None:
         pms = tuple(
@@ -1064,7 +1071,8 @@ class TestPostmortemSerialization:
         assert a.summary.ac_index == 0
         assert a.summary.ac_content == "Add auth"
         assert a.summary.files_modified == ("auth.py", "middleware.py")
-        assert a.invariants_established == ("AUTH_HEADER required",)
+        assert len(a.invariants_established) == 1
+        assert a.invariants_established[0].text == "AUTH_HEADER required"
         assert a.diff_summary == " auth.py | 42 +++"
         assert a.duration_seconds == 1.5
         assert a.status == "pass"
@@ -1101,6 +1109,81 @@ class TestPostmortemSerialization:
         # or coerced to defaults — behavior-tolerant assertion.
         assert len(chain.postmortems) >= 1
         assert chain.postmortems[0].summary.ac_content == "ok"
+
+    def test_invariant_round_trip_preserves_scores(self) -> None:
+        """Invariant objects with reliability/occurrence scores survive
+        serialize → deserialize without loss.
+
+        [[INVARIANT: invariants_established is now tuple[Invariant, ...] not tuple[str, ...]]]
+        """
+        inv = Invariant(
+            text="AUTH_HEADER required",
+            reliability=0.85,
+            occurrences=2,
+            first_seen_ac_id="ac_1",
+        )
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Add auth",
+            success=True,
+            files_modified=("auth.py",),
+        )
+        pm = ACPostmortem(
+            summary=summary,
+            invariants_established=(inv,),
+        )
+        original = PostmortemChain(postmortems=(pm,))
+
+        # Serialize → deserialize round-trip.
+        data = serialize_postmortem_chain(original)
+        restored = deserialize_postmortem_chain(data)
+
+        assert len(restored.postmortems) == 1
+        restored_pm = restored.postmortems[0]
+        assert len(restored_pm.invariants_established) == 1
+        restored_inv = restored_pm.invariants_established[0]
+
+        assert restored_inv.text == "AUTH_HEADER required"
+        assert abs(restored_inv.reliability - 0.85) < 1e-9
+        assert restored_inv.occurrences == 2
+        assert restored_inv.first_seen_ac_id == "ac_1"
+
+    def test_invariant_backward_compat_legacy_string_deserialize(self) -> None:
+        """Old serialized chains that stored invariants_established as plain strings
+        (before the Invariant dataclass was introduced) must still deserialize
+        without error, wrapping each string as Invariant(text=...).
+
+        [[INVARIANT: OUROBOROS_INVARIANT_MIN_RELIABILITY defaults 0.7; below-threshold hidden but stored]]
+        """
+        legacy_data = [
+            {
+                "summary": {"ac_index": 0, "ac_content": "Add auth", "success": True},
+                "invariants_established": ["AUTH_HEADER required", "JWT expiry=15m"],
+            }
+        ]
+        chain = deserialize_postmortem_chain(legacy_data)
+        assert len(chain.postmortems) == 1
+        pm = chain.postmortems[0]
+        assert len(pm.invariants_established) == 2
+        # Legacy strings should be wrapped with default reliability=1.0.
+        assert pm.invariants_established[0].text == "AUTH_HEADER required"
+        assert pm.invariants_established[0].reliability == 1.0
+        assert pm.invariants_established[1].text == "JWT expiry=15m"
+
+    def test_invariant_dataclass_defaults(self) -> None:
+        """Invariant can be constructed with just text; other fields have sensible defaults."""
+        inv = Invariant(text="foo bar")
+        assert inv.reliability == 1.0
+        assert inv.occurrences == 1
+        assert inv.first_seen_ac_id == ""
+        # __str__ returns the text.
+        assert str(inv) == "foo bar"
+
+    def test_invariant_frozen(self) -> None:
+        """Invariant is a frozen dataclass."""
+        inv = Invariant(text="x")
+        with pytest.raises((AttributeError, Exception)):
+            inv.text = "y"  # type: ignore[misc]
 
 
 class TestBuildPostmortemChainPrompt:

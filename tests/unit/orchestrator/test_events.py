@@ -19,6 +19,7 @@ from ouroboros.orchestrator.events import (
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
     ACPostmortem,
+    Invariant,
 )
 from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
 from ouroboros.orchestrator.policy import (
@@ -339,7 +340,7 @@ class TestPostmortemCapturedEvent:
         return ACPostmortem(
             summary=summary,
             diff_summary=" src/auth.py | 42 +++",
-            invariants_established=("AUTH_HEADER required",),
+            invariants_established=(Invariant(text="AUTH_HEADER required"),),
             status=status,  # type: ignore[arg-type]
             duration_seconds=1.5,
         )
@@ -378,7 +379,8 @@ class TestPostmortemCapturedEvent:
         assert len(chain.postmortems) == 1
         pm = chain.postmortems[0]
         assert pm.summary.ac_content == "Add JWT auth"
-        assert pm.invariants_established == ("AUTH_HEADER required",)
+        assert len(pm.invariants_established) == 1
+        assert pm.invariants_established[0].text == "AUTH_HEADER required"
         assert pm.diff_summary == " src/auth.py | 42 +++"
         assert pm.status == "pass"
 
