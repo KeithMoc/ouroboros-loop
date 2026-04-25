@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from ouroboros.observability.logging import get_logger
@@ -860,6 +860,7 @@ class PostmortemChain:
         k_full: int = POSTMORTEM_DEFAULT_K_FULL,
         token_budget: int = POSTMORTEM_DEFAULT_TOKEN_BUDGET,
         min_reliability: float | None = None,
+        on_truncated: Callable[[int, int, int, int, int], None] | None = None,
     ) -> str:
         """Render the chain as a markdown section for user-turn injection.
 
@@ -879,6 +880,13 @@ class PostmortemChain:
                 back to :data:`POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY`
                 (0.7). Pass ``0.0`` explicitly to show all non-contradicted
                 invariants.
+            on_truncated: Optional callback invoked when the rendered text
+                still exceeds the character budget after dropping all digest
+                entries.  Called with positional args:
+                ``(dropped_count, char_budget, rendered_chars,
+                full_forms_preserved, cumulative_invariants_preserved)``.
+                Used by :func:`build_postmortem_chain_prompt` to emit
+                the Q7 ``"execution.postmortem_chain.truncated"`` event.
 
         Returns:
             The formatted section, or an empty string if the chain is empty.
@@ -963,13 +971,26 @@ class PostmortemChain:
             text = _render(tuple(remaining))
 
         if len(text) > char_budget:
+            dropped_count = len(digest_entries) - len(remaining)
             log.warning(
                 "postmortem_chain.over_budget",
                 rendered_chars=len(text),
                 char_budget=char_budget,
+                dropped_count=dropped_count,
                 full_count=len(full_entries),
                 invariants_count=len(invariants),
             )
+            # Q7: Notify caller so a structured event can be emitted alongside
+            # this log line.  Callback is intentionally synchronous — callers
+            # that need async event emission collect the info and emit afterward.
+            if on_truncated is not None:
+                on_truncated(
+                    dropped_count,
+                    char_budget,
+                    len(text),
+                    len(full_entries),
+                    len(invariants),
+                )
         return text
 
 
@@ -978,6 +999,7 @@ def build_postmortem_chain_prompt(
     *,
     k_full: int | None = None,
     token_budget: int | None = None,
+    on_truncated: Callable[[int, int, int, int, int], None] | None = None,
 ) -> str:
     """Build the "Prior AC Postmortems" section for the user-turn prompt.
 
@@ -985,6 +1007,18 @@ def build_postmortem_chain_prompt(
     ``OUROBOROS_POSTMORTEM_FULL_K`` and ``OUROBOROS_POSTMORTEM_TOKEN_BUDGET``
     env overrides when arguments are not supplied. Returns an empty string for
     an empty chain so callers can concatenate unconditionally.
+
+    Args:
+        chain: Postmortem chain to render.
+        k_full: Override for number of most-recent full-form entries.
+            Defaults to ``OUROBOROS_POSTMORTEM_FULL_K`` env var or
+            :data:`POSTMORTEM_DEFAULT_K_FULL`.
+        token_budget: Override for token budget. Defaults to
+            ``OUROBOROS_POSTMORTEM_TOKEN_BUDGET`` env var or
+            :data:`POSTMORTEM_DEFAULT_TOKEN_BUDGET`.
+        on_truncated: Optional callback forwarded to
+            :meth:`PostmortemChain.to_prompt_text` for Q7 truncation event
+            emission. See that method's docstring for callback signature.
     """
     if k_full is None:
         env_k = os.environ.get("OUROBOROS_POSTMORTEM_FULL_K")
@@ -1000,7 +1034,11 @@ def build_postmortem_chain_prompt(
             )
         except ValueError:
             token_budget = POSTMORTEM_DEFAULT_TOKEN_BUDGET
-    return chain.to_prompt_text(k_full=k_full, token_budget=token_budget)
+    return chain.to_prompt_text(
+        k_full=k_full,
+        token_budget=token_budget,
+        on_truncated=on_truncated,
+    )
 
 
 def serialize_postmortem_chain(chain: PostmortemChain) -> list[dict[str, Any]]:

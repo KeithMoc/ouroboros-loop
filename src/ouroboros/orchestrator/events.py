@@ -663,6 +663,60 @@ def create_ac_postmortem_captured_event(
     )
 
 
+def create_postmortem_chain_truncated_event(
+    session_id: str,
+    execution_id: str,
+    *,
+    dropped_count: int,
+    char_budget: int,
+    rendered_chars: int,
+    full_forms_preserved: int,
+    cumulative_invariants_preserved: int,
+) -> BaseEvent:
+    """Create postmortem chain truncated event (Q7).
+
+    Emitted alongside ``log.warning("postmortem_chain.over_budget", ...)``
+    in :meth:`PostmortemChain.to_prompt_text` when the rendered chain
+    still exceeds the character budget after dropping all digest entries.
+    Coexists with the log line — does not replace it.
+
+    The event type ``"execution.postmortem_chain.truncated"`` is queryable
+    via ``ouroboros_query_events``, enabling after-the-fact debugging of
+    "why did AC-12 seem to forget AC-3's gotcha?" scenarios.
+
+    Args:
+        session_id: Parent session id.
+        execution_id: Parent execution id.
+        dropped_count: Number of digest-form postmortems dropped to fit the budget.
+        char_budget: Character budget in effect (``token_budget * 4``).
+        rendered_chars: Actual character count of the rendered text after dropping.
+        full_forms_preserved: Number of full-form postmortem entries preserved.
+        cumulative_invariants_preserved: Number of invariants rendered in the
+            "Established Invariants" section (above-threshold only).
+
+    Returns:
+        BaseEvent for the truncation.
+
+    [[INVARIANT: Truncation event emitted alongside log.warning, not replacing it]]
+    [[INVARIANT: event type is execution.postmortem_chain.truncated]]
+    """
+    return BaseEvent(
+        type="execution.postmortem_chain.truncated",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data={
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "dropped_count": dropped_count,
+            "char_budget": char_budget,
+            "rendered_chars": rendered_chars,
+            "full_forms_preserved": full_forms_preserved,
+            "cumulative_invariants_preserved": cumulative_invariants_preserved,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 def _chain_of_one(postmortem: ACPostmortem):
     """Wrap a single postmortem in a PostmortemChain for serialization reuse.
 
@@ -715,6 +769,7 @@ def create_execution_terminal_event(
 
 __all__ = [
     "create_ac_postmortem_captured_event",
+    "create_postmortem_chain_truncated_event",
     "create_ac_stall_detected_event",
     "create_drift_measured_event",
     "create_execution_terminal_event",

@@ -33,7 +33,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ouroboros.orchestrator.events import create_ac_postmortem_captured_event
+from ouroboros.orchestrator.events import (
+    create_ac_postmortem_captured_event,
+    create_postmortem_chain_truncated_event,
+)
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
     ACPostmortem,
@@ -758,7 +761,39 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 continue
 
             # Compose the compounding-context section from the current chain.
-            context_section = build_postmortem_chain_prompt(chain)
+            # Q7: Capture truncation info synchronously; emit event afterward.
+            _truncation_info: list[dict] = []
+
+            def _on_truncated(
+                dropped: int,
+                budget: int,
+                rendered: int,
+                full_forms: int,
+                invariants_ct: int,
+            ) -> None:
+                _truncation_info.append(
+                    {
+                        "dropped_count": dropped,
+                        "char_budget": budget,
+                        "rendered_chars": rendered,
+                        "full_forms_preserved": full_forms,
+                        "cumulative_invariants_preserved": invariants_ct,
+                    }
+                )
+
+            context_section = build_postmortem_chain_prompt(
+                chain, on_truncated=_on_truncated
+            )
+
+            # Emit Q7 truncation event if the chain was over budget.
+            for _trunc in _truncation_info:
+                await self._safe_emit_event(
+                    create_postmortem_chain_truncated_event(
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        **_trunc,
+                    )
+                )
 
             ac_content = seed.acceptance_criteria[ac_index]
 
@@ -1082,4 +1117,5 @@ __all__ = [
     "write_chain_artifact",
     "_load_compounding_checkpoint",
     "_write_compounding_checkpoint",
+    "create_postmortem_chain_truncated_event",
 ]

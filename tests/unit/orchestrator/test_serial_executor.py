@@ -1933,3 +1933,385 @@ class TestCheckpointResume:
             f"Both ACs should run from scratch; executed: {executed_indices}"
         )
         assert result.success_count == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_3ac_chain_skips_first_two_executes_third(
+        self, tmp_path: Path
+    ) -> None:
+        """In a 3-AC run, resuming with last_completed_ac_index=1 skips AC 0 and AC 1.
+
+        Setup: write a checkpoint for AC 1 (last_completed_ac_index=1) with a 2-AC chain.
+        Run execute_serial with resume_session_id set.
+        Expect: ACs 0 and 1 are skipped; only AC 2 is executed.
+        AC 2's context_override must include postmortems for AC 0 AND AC 1 from the chain.
+
+        Compounding reference: this builds on the AC-skipping logic established in
+        Sub-AC 1 (checkpoint loading) and verifies that the *chain forwarding* works
+        correctly for multi-AC resume — not just 2-AC runs. The postmortem chain
+        established by AC-1 (Q6.1) includes serialize_postmortem_chain round-trip
+        (verified in AC-2 B-prime tests), and the invariants field (AC-3 C-plus).
+
+        [[INVARIANT: deserialized chain reflects all postmortems from the prior run up to last_completed_ac_index]]
+        [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+
+        seed = _make_seed("AC 0 done", "AC 1 done", "AC 2 to execute")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Write a checkpoint for a 2-AC completed run (ACs 0 and 1 done).
+        summary_ac0 = ACContextSummary(
+            ac_index=0,
+            ac_content="AC 0 done",
+            success=True,
+            files_modified=("src/ac0.py",),
+        )
+        summary_ac1 = ACContextSummary(
+            ac_index=1,
+            ac_content="AC 1 done",
+            success=True,
+            files_modified=("src/ac1.py",),
+        )
+        pm_ac0 = ACPostmortem(
+            summary=summary_ac0,
+            status="pass",
+            gotchas=("ac0 specific gotcha",),
+        )
+        pm_ac1 = ACPostmortem(
+            summary=summary_ac1,
+            status="pass",
+            gotchas=("ac1 specific gotcha",),
+        )
+        prior_chain = PostmortemChain(postmortems=(pm_ac0, pm_ac1))
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_session_3ac",
+            ac_index=1,  # last_completed = AC 1 (0-based)
+            chain=prior_chain,
+        )
+
+        executed_indices: list[int] = []
+        captured_overrides: list[str] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,), (2,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="new_session_3ac",
+            execution_id="exec_3ac_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_3ac",
+        )
+
+        # ACs 0 and 1 must NOT have been executed.
+        assert 0 not in executed_indices, (
+            f"AC 0 should be skipped; executed: {executed_indices}"
+        )
+        assert 1 not in executed_indices, (
+            f"AC 1 should be skipped; executed: {executed_indices}"
+        )
+        # Only AC 2 was executed.
+        assert executed_indices == [2], f"Only AC 2 should run; executed: {executed_indices}"
+
+        # AC 2's context_override must include both AC 0 and AC 1 postmortems.
+        assert len(captured_overrides) == 1
+        ac2_override = captured_overrides[0]
+        assert "AC 0 done" in ac2_override, "AC 2 context must include AC 0's postmortem"
+        assert "AC 1 done" in ac2_override, "AC 2 context must include AC 1's postmortem"
+        assert "ac0 specific gotcha" in ac2_override, "AC 0 gotcha must be in AC 2 context"
+        assert "ac1 specific gotcha" in ac2_override, "AC 1 gotcha must be in AC 2 context"
+
+        # Result has 3 entries: AC 0 (SATISFIED_EXTERNALLY), AC 1 (SATISFIED_EXTERNALLY),
+        # AC 2 (SUCCEEDED).
+        assert len(result.results) == 3
+        assert result.success_count >= 1  # At least AC 2 succeeded
+
+
+class TestTruncationEvent:
+    """AC-4 (Q7): Postmortem chain truncation event.
+
+    Verifies that the Q7 structured event is emitted alongside log.warning
+    when the rendered postmortem chain overflows the character budget.
+    Coexists with the log line — does not replace it.
+
+    Compounding context (from prior ACs):
+    - AC-1: [[INVARIANT: end-of-run chain artifact exists in docs/brainstorm/chain-*.md]]
+      — artifact and truncation events both serve observability purposes.
+    - AC-2: [[INVARIANT: ACPostmortem.sub_postmortems preserves structure in serialized chain]]
+      — sub-postmortem data survives the chain even when digests are truncated.
+    - AC-3: [[INVARIANT: verify_invariants is called inline-blocking before chain advance]]
+      — verified invariants are part of the chain that may be truncated.
+    - Sub-AC 1: [[INVARIANT: deserialized chain is injected before the AC loop
+      so resumed ACs see prior postmortems]] — truncation may affect resumed chains.
+
+    [[INVARIANT: Truncation event emitted alongside log.warning, not replacing it]]
+    [[INVARIANT: event type is execution.postmortem_chain.truncated]]
+    [[INVARIANT: no truncation event emitted when chain fits within budget]]
+    """
+
+    def test_truncation_event_factory_fields(self) -> None:
+        """create_postmortem_chain_truncated_event produces the expected event structure.
+
+        Verifies the event type, aggregate_type, and all required data fields.
+        No executor needed — tests the factory directly.
+
+        [[INVARIANT: event type is execution.postmortem_chain.truncated]]
+        """
+        from ouroboros.orchestrator.events import create_postmortem_chain_truncated_event
+
+        event = create_postmortem_chain_truncated_event(
+            session_id="sess_trunc",
+            execution_id="exec_trunc",
+            dropped_count=3,
+            char_budget=10000,
+            rendered_chars=12500,
+            full_forms_preserved=2,
+            cumulative_invariants_preserved=1,
+        )
+
+        assert event.type == "execution.postmortem_chain.truncated"
+        assert event.aggregate_type == "execution"
+        assert event.aggregate_id == "exec_trunc"
+        assert event.data["session_id"] == "sess_trunc"
+        assert event.data["execution_id"] == "exec_trunc"
+        assert event.data["dropped_count"] == 3
+        assert event.data["char_budget"] == 10000
+        assert event.data["rendered_chars"] == 12500
+        assert event.data["full_forms_preserved"] == 2
+        assert event.data["cumulative_invariants_preserved"] == 1
+        assert "timestamp" in event.data
+
+    def test_on_truncated_callback_invoked_when_over_budget(self) -> None:
+        """to_prompt_text calls on_truncated when chain exceeds char_budget.
+
+        Build a chain with many ACs and set a tiny token_budget so truncation
+        is guaranteed. Verify the callback is called with the correct counts.
+
+        Compounding ref: uses PostmortemChain.to_prompt_text which was built
+        in AC-2 and AC-3 (invariant render gate). The on_truncated callback
+        is the new Q7 hook in Sub-AC 2.
+
+        [[INVARIANT: Truncation event emitted alongside log.warning, not replacing it]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        # Build a chain with enough content to overflow a tiny budget.
+        def _make_pm(idx: int) -> ACPostmortem:
+            summary = ACContextSummary(
+                ac_index=idx,
+                ac_content=f"AC {idx} task — " + "x" * 300,  # force long content
+                success=True,
+                files_modified=(f"src/file_{idx}.py",),
+            )
+            return ACPostmortem(
+                summary=summary,
+                status="pass",
+                gotchas=(f"gotcha for AC {idx} " + "y" * 100,),
+            )
+
+        # 8 ACs gives enough text to overflow a tiny budget.
+        postmortems = tuple(_make_pm(i) for i in range(8))
+        chain = PostmortemChain(postmortems=postmortems)
+
+        truncation_calls: list[tuple] = []
+
+        def _capture(*args: int) -> None:
+            truncation_calls.append(args)
+
+        # Use a tiny budget (1 token = 4 chars) to guarantee overflow.
+        chain.to_prompt_text(
+            token_budget=1,
+            k_full=1,
+            on_truncated=_capture,
+        )
+
+        assert len(truncation_calls) == 1, (
+            f"Expected exactly 1 truncation callback, got {len(truncation_calls)}"
+        )
+        dropped_count, char_budget, rendered_chars, full_forms, invariants = truncation_calls[0]
+        assert dropped_count > 0, "At least one digest must have been dropped"
+        assert char_budget == 4, "1 token * 4 chars/token = 4"
+        assert rendered_chars > 4, "Rendered text must exceed budget"
+        assert full_forms == 1, "k_full=1 → 1 full-form entry"
+
+    def test_no_truncation_callback_when_chain_fits(self) -> None:
+        """on_truncated is NOT called when the chain fits within the budget.
+
+        [[INVARIANT: no truncation event emitted when chain fits within budget]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        summary = ACContextSummary(ac_index=0, ac_content="Short AC", success=True)
+        pm = ACPostmortem(summary=summary, status="pass")
+        chain = PostmortemChain(postmortems=(pm,))
+
+        truncation_calls: list[tuple] = []
+        chain.to_prompt_text(
+            token_budget=8000,  # large budget — should never truncate
+            on_truncated=lambda *a: truncation_calls.append(a),
+        )
+
+        assert truncation_calls == [], (
+            "on_truncated must NOT be called when chain fits within budget"
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncation_event_emitted_from_serial_executor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SerialCompoundingExecutor emits the truncation event when chain overflows.
+
+        Uses a tiny OUROBOROS_POSTMORTEM_TOKEN_BUDGET to force truncation.
+        Verifies that an "execution.postmortem_chain.truncated" event appears
+        in the event store after the run.
+
+        Compounding ref: this relies on the postmortem chain built by prior
+        successful ACs (AC-1 through AC-3 and Sub-AC 1). The event emission
+        uses the existing _safe_emit_event pattern from parallel_executor.py.
+
+        [[INVARIANT: Truncation event emitted alongside log.warning, not replacing it]]
+        [[INVARIANT: event type is execution.postmortem_chain.truncated]]
+        """
+        # Force a tiny token budget so even one prior AC causes truncation.
+        monkeypatch.setenv("OUROBOROS_POSTMORTEM_TOKEN_BUDGET", "1")
+
+        # Build a seed with 3 ACs; pre-load the chain with 5 dummy postmortems
+        # via checkpoint so AC 0 (the resuming AC) sees an oversize chain.
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        event_store, appended = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        # Pre-populate a big chain with 5 verbose postmortems.
+        def _big_pm(idx: int) -> ACPostmortem:
+            return ACPostmortem(
+                summary=ACContextSummary(
+                    ac_index=idx,
+                    ac_content=f"AC {idx} verbose task " + "word " * 80,
+                    success=True,
+                    files_modified=(f"src/file_{idx}.py",),
+                ),
+                status="pass",
+                gotchas=(f"gotcha for AC {idx} " + "detail " * 60,),
+            )
+
+        big_chain = PostmortemChain(postmortems=tuple(_big_pm(i) for i in range(5)))
+
+        seed = _make_seed(
+            "AC 0 already done",
+            "AC 1 already done",
+            "AC 2 already done",
+            "AC 3 already done",
+            "AC 4 already done",
+            "AC 5 to execute",
+        )
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_big_chain",
+            ac_index=4,
+            chain=big_chain,
+        )
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,), (2,), (3,), (4,), (5,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_trunc_event",
+            execution_id="exec_trunc_event",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            resume_session_id="prior_big_chain",
+        )
+
+        trunc_events = [
+            e for e in appended if e.type == "execution.postmortem_chain.truncated"
+        ]
+        assert len(trunc_events) >= 1, (
+            f"Expected at least 1 truncation event with token_budget=1; "
+            f"event types seen: {[e.type for e in appended]}"
+        )
+        ev = trunc_events[0]
+        assert ev.data["session_id"] == "sess_trunc_event"
+        assert ev.data["execution_id"] == "exec_trunc_event"
+        assert ev.data["dropped_count"] >= 0
+        assert ev.data["char_budget"] > 0
+
+    @pytest.mark.asyncio
+    async def test_no_truncation_event_when_chain_fits(self) -> None:
+        """No truncation event is emitted when the chain fits within the default budget.
+
+        A 2-AC run with a generous budget should produce zero truncation events.
+
+        [[INVARIANT: no truncation event emitted when chain fits within budget]]
+        """
+        seed = _make_seed("AC a", "AC b")
+        executor = _make_executor()
+        event_store: Any = executor._event_store
+        appended: list[Any] = event_store._appended
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_no_trunc",
+            execution_id="exec_no_trunc",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+        )
+
+        trunc_events = [
+            e for e in appended if e.type == "execution.postmortem_chain.truncated"
+        ]
+        assert trunc_events == [], (
+            f"Unexpected truncation events with default budget; got: {trunc_events}"
+        )
