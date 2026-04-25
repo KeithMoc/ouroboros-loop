@@ -588,3 +588,224 @@ class TestChainArtifact:
         content = path.read_text(encoding="utf-8")
         assert "# Postmortem Chain" in content
         assert "## AC" not in content  # no AC sections for empty chain
+
+
+class TestSubPostmortems:
+    """AC-2 (Q1, B-prime): Sub-postmortem preservation and flattening.
+
+    [[INVARIANT: ACPostmortem.sub_postmortems preserves structure in serialized chain]]
+    [[INVARIANT: to_prompt_text flattens sub-AC data; never emits nested entries]]
+    [[INVARIANT: parent digest fields are unions of its own plus sub-postmortem fields]]
+    """
+
+    def _make_result_with_subs(self) -> ACExecutionResult:
+        """Build a decomposed ACExecutionResult with two sub-results."""
+        sub0 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 0",
+            success=True,
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub0",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub_a.py"}},
+                ),
+            ),
+            final_message="sub0 done",
+        )
+        sub1 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 1",
+            success=True,
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub1",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub_b.py"}},
+                ),
+            ),
+            error=None,
+            final_message="sub1 done",
+        )
+        # Parent result with no own files, but two sub-results.
+        return ACExecutionResult(
+            ac_index=0,
+            ac_content="Parent AC",
+            success=True,
+            is_decomposed=True,
+            sub_results=(sub0, sub1),
+            final_message="parent done",
+        )
+
+    def test_sub_files_flattened_into_parent_summary(self) -> None:
+        """Sub-result files appear in the parent ACPostmortem.summary.files_modified."""
+        result = self._make_result_with_subs()
+        postmortem = SerialCompoundingExecutor._build_postmortem_from_result(
+            result, workspace_root=None
+        )
+        files = postmortem.summary.files_modified
+        assert "src/sub_a.py" in files, f"sub_a.py missing from {files}"
+        assert "src/sub_b.py" in files, f"sub_b.py missing from {files}"
+
+    def test_sub_gotchas_flattened_into_parent(self) -> None:
+        """Sub-result failure gotchas are merged into parent.gotchas."""
+        sub_fail = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub fail",
+            success=False,
+            error="sub-ac bombed",
+            outcome=ACExecutionOutcome.FAILED,
+        )
+        parent = ACExecutionResult(
+            ac_index=0,
+            ac_content="Parent AC",
+            success=False,
+            error="parent error",
+            is_decomposed=True,
+            sub_results=(sub_fail,),
+            outcome=ACExecutionOutcome.FAILED,
+        )
+        pm = SerialCompoundingExecutor._build_postmortem_from_result(
+            parent, workspace_root=None
+        )
+        assert "parent error" in pm.gotchas
+        assert "sub-ac bombed" in pm.gotchas
+
+    def test_sub_postmortems_stored_on_parent(self) -> None:
+        """sub_postmortems tuple is preserved on the parent ACPostmortem."""
+        result = self._make_result_with_subs()
+        pm = SerialCompoundingExecutor._build_postmortem_from_result(
+            result, workspace_root=None
+        )
+        assert len(pm.sub_postmortems) == 2
+        assert pm.sub_postmortems[0].summary.ac_content == "Sub-AC 0"
+        assert pm.sub_postmortems[1].summary.ac_content == "Sub-AC 1"
+
+    def test_no_sub_results_gives_empty_sub_postmortems(self) -> None:
+        """When there are no sub_results, sub_postmortems stays empty."""
+        result = ACExecutionResult(
+            ac_index=0,
+            ac_content="Normal AC",
+            success=True,
+            final_message="done",
+        )
+        pm = SerialCompoundingExecutor._build_postmortem_from_result(
+            result, workspace_root=None
+        )
+        assert pm.sub_postmortems == ()
+
+    def test_to_prompt_text_does_not_emit_nested_entries(self) -> None:
+        """to_prompt_text() flat view must NOT contain any nested sub-AC entries.
+
+        [[INVARIANT: to_prompt_text flattens sub-AC data; never emits nested entries]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        # Build a sub-postmortem.
+        sub_summary = ACContextSummary(
+            ac_index=0, ac_content="Sub-AC 3.1", success=True
+        )
+        sub_pm = ACPostmortem(summary=sub_summary, status="pass")
+
+        # Build a parent postmortem that references the sub-postmortem.
+        parent_summary = ACContextSummary(
+            ac_index=2, ac_content="Parent AC 3", success=True
+        )
+        parent_pm = ACPostmortem(
+            summary=parent_summary,
+            status="pass",
+            sub_postmortems=(sub_pm,),
+        )
+
+        chain = PostmortemChain(postmortems=(parent_pm,))
+        text = chain.to_prompt_text()
+
+        # Sub-AC entries must NOT appear in the rendered prompt.
+        assert "Sub-AC 3.1" not in text, (
+            "to_prompt_text() should NOT render nested sub-AC entries"
+        )
+        # Parent content should still appear.
+        assert "Parent AC 3" in text
+
+    def test_serialize_deserialize_round_trip_sub_postmortems(self) -> None:
+        """sub_postmortems survive a serialize → deserialize round-trip.
+
+        [[INVARIANT: ACPostmortem.sub_postmortems preserves structure in serialized chain]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+            deserialize_postmortem_chain,
+            serialize_postmortem_chain,
+        )
+
+        sub_summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Sub task A",
+            success=True,
+            files_modified=("src/sub_a.py",),
+        )
+        sub_pm = ACPostmortem(
+            summary=sub_summary,
+            status="pass",
+            gotchas=("watch sub gotcha",),
+        )
+
+        parent_summary = ACContextSummary(
+            ac_index=1,
+            ac_content="Parent task B",
+            success=True,
+            files_modified=("src/parent_b.py", "src/sub_a.py"),
+        )
+        parent_pm = ACPostmortem(
+            summary=parent_summary,
+            status="pass",
+            gotchas=("parent gotcha", "watch sub gotcha"),
+            sub_postmortems=(sub_pm,),
+        )
+
+        chain = PostmortemChain(postmortems=(parent_pm,))
+
+        # Serialize and deserialize.
+        serialized = serialize_postmortem_chain(chain)
+        restored_chain = deserialize_postmortem_chain(serialized)
+
+        assert len(restored_chain.postmortems) == 1
+        restored_pm = restored_chain.postmortems[0]
+
+        # sub_postmortems preserved.
+        assert len(restored_pm.sub_postmortems) == 1
+        restored_sub = restored_pm.sub_postmortems[0]
+        assert restored_sub.summary.ac_content == "Sub task A"
+        assert "src/sub_a.py" in restored_sub.summary.files_modified
+        assert "watch sub gotcha" in restored_sub.gotchas
+
+        # Parent fields also intact.
+        assert "parent gotcha" in restored_pm.gotchas
+        assert "src/parent_b.py" in restored_pm.summary.files_modified
+
+    def test_sub_files_appear_in_rendered_postmortem_chain_prompt(self) -> None:
+        """Files from sub-postmortems are visible in the chain prompt (flattened into parent).
+
+        [[INVARIANT: parent digest fields are unions of its own plus sub-postmortem fields]]
+        """
+        result = self._make_result_with_subs()
+        pm = SerialCompoundingExecutor._build_postmortem_from_result(
+            result, workspace_root=None
+        )
+
+        from ouroboros.orchestrator.level_context import PostmortemChain
+
+        chain = PostmortemChain(postmortems=(pm,))
+        text = chain.to_prompt_text()
+
+        # Sub-files must appear in the rendered chain text.
+        assert "src/sub_a.py" in text, "sub_a.py missing from chain prompt"
+        assert "src/sub_b.py" in text, "sub_b.py missing from chain prompt"

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from ouroboros.orchestrator.events import create_ac_postmortem_captured_event
 from ouroboros.orchestrator.level_context import (
+    ACContextSummary,
     ACPostmortem,
     PostmortemChain,
     PostmortemStatus,
@@ -529,8 +530,6 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         if level_ctx.completed_acs:
             summary = level_ctx.completed_acs[0]
         else:  # pragma: no cover — extract_level_context always returns one summary per input
-            from ouroboros.orchestrator.level_context import ACContextSummary
-
             summary = ACContextSummary(
                 ac_index=result.ac_index,
                 ac_content=result.ac_content,
@@ -554,6 +553,51 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         if not result.success and result.error:
             gotchas = (result.error,)
 
+        # B-prime: if the result has sub-results (decomposed AC), recursively build
+        # sub-postmortems and flatten their data into the parent postmortem.
+        sub_pms: tuple[ACPostmortem, ...] = ()
+        if result.sub_results:
+            sub_pms = tuple(
+                SerialCompoundingExecutor._build_postmortem_from_result(
+                    sub_result,
+                    workspace_root=workspace_root,
+                )
+                for sub_result in result.sub_results
+            )
+
+            # Flatten files_modified: union of parent + all sub-postmortems (order-preserving, dedup).
+            seen_files: dict[str, None] = dict.fromkeys(summary.files_modified)
+            for sub_pm in sub_pms:
+                for f in sub_pm.summary.files_modified:
+                    seen_files.setdefault(f, None)
+            flat_files: tuple[str, ...] = tuple(seen_files)
+
+            # Flatten gotchas: parent's + all sub-postmortems' gotchas.
+            flat_gotchas: tuple[str, ...] = gotchas + tuple(
+                g for sub_pm in sub_pms for g in sub_pm.gotchas
+            )
+
+            # Flatten public_api: join non-empty strings, order-preserving, dedup.
+            api_parts: list[str] = []
+            if summary.public_api:
+                api_parts.append(summary.public_api)
+            for sub_pm in sub_pms:
+                if sub_pm.summary.public_api and sub_pm.summary.public_api not in api_parts:
+                    api_parts.append(sub_pm.summary.public_api)
+            flat_public_api = "; ".join(api_parts)
+
+            # Replace summary with the flattened version (frozen dataclass — create new).
+            summary = ACContextSummary(
+                ac_index=summary.ac_index,
+                ac_content=summary.ac_content,
+                success=summary.success,
+                tools_used=summary.tools_used,
+                files_modified=flat_files,
+                key_output=summary.key_output,
+                public_api=flat_public_api,
+            )
+            gotchas = flat_gotchas
+
         return ACPostmortem(
             summary=summary,
             status=status,
@@ -561,6 +605,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             duration_seconds=result.duration_seconds,
             ac_native_session_id=result.session_id,
             gotchas=gotchas,
+            sub_postmortems=sub_pms,
         )
 
 
