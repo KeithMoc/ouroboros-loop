@@ -167,6 +167,92 @@ def _resolve_max_decomposition_depth(seed_data: dict[str, Any], cli_value: int |
     return DEFAULT_MAX_DECOMPOSITION_DEPTH
 
 
+def _load_seed_id_from_yaml(seed_file: Path) -> str | None:
+    """Extract the seed_id from a seed YAML file without full model parsing.
+
+    Used for early validation (e.g., checking checkpoint existence) before
+    the full :func:`Seed.from_dict` parse happens inside ``_run_orchestrator``.
+
+    Returns:
+        ``seed_id`` string when present, ``None`` on any error or if the field
+        is absent / empty.
+    """
+    try:
+        with open(seed_file) as _f:
+            _data = yaml.safe_load(_f)
+        return ((_data or {}).get("metadata") or {}).get("seed_id") or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _validate_compounding_resume_not_fresh_seed(
+    seed_id: str,
+    compounding_resume_session_id: str | None,
+    checkpoint_store: "Any | None" = None,
+) -> str | None:
+    """Return an error message if ``--compounding --resume`` targets a fresh seed.
+
+    Enforces the mutual exclusivity rule: if the user supplies
+    ``--compounding --resume <id>``, a compounding checkpoint for this
+    ``seed_id`` **must** already exist.  Using ``--resume`` with a brand-new
+    seed that has never been run in compounding mode is contradictory —
+    there is no prior chain to rehydrate.
+
+    Returns:
+        ``None`` when the combination is valid (no error), or a human-readable
+        error message string when the seed is "fresh" (no checkpoint found).
+
+    Skips validation (returns ``None``) when:
+
+    - ``compounding_resume_session_id`` is ``None`` — user is not resuming.
+    - The default checkpoint directory does not exist — fresh installation with
+      no prior runs; we fail-open so new users aren't blocked.
+    - ``checkpoint_store`` raises any exception — fail-open (don't block the run).
+
+    Args:
+        seed_id: Seed identifier to look up in the checkpoint store.
+        compounding_resume_session_id: The ``--resume`` value; ``None`` means
+            the user is not requesting a checkpoint resume.
+        checkpoint_store: Injected store for testing.  When ``None``, the
+            function constructs a :class:`~ouroboros.persistence.checkpoint.CheckpointStore`
+            backed by ``~/.ouroboros/data/checkpoints``.  Pass a mock store in
+            unit tests to avoid touching the real filesystem.
+
+    [[INVARIANT: _validate_compounding_resume_not_fresh_seed returns None when checkpoint dir absent]]
+    [[INVARIANT: --compounding --resume with no prior checkpoint raises an error not a silent fresh run]]
+    """
+    if compounding_resume_session_id is None:
+        return None  # Not resuming; nothing to check.
+
+    if checkpoint_store is None:
+        from ouroboros.persistence.checkpoint import CheckpointStore as _CS
+
+        default_path = Path.home() / ".ouroboros" / "data" / "checkpoints"
+        if not default_path.exists():
+            # Fresh environment — no checkpoints possible; skip validation
+            # so new users aren't blocked by the guard.
+            return None
+        try:
+            checkpoint_store = _CS(base_path=default_path)
+            checkpoint_store.initialize()
+        except Exception:  # noqa: BLE001
+            return None  # Can't set up store; fail open.
+
+    try:
+        load_result = checkpoint_store.load(seed_id)
+        if load_result.is_err:
+            return (
+                f"Cannot resume: no compounding checkpoint found for seed '{seed_id}'. "
+                "The seed has not been run in compounding mode before, or its "
+                "checkpoint has been deleted. "
+                "To start a fresh compounding run, omit --resume."
+            )
+    except Exception:  # noqa: BLE001
+        return None  # Store error; fail open.
+
+    return None  # Checkpoint found; valid to resume.
+
+
 def _load_skip_completed_markers(
     marker_path: str | None,
     *,
@@ -425,6 +511,21 @@ async def _run_orchestrator(
         backend=runtime_backend,
         cwd=Path(workspace.effective_cwd) if workspace else project_dir,
     )
+
+    # Set up checkpoint store for compounding mode so per-AC checkpoints are
+    # written and checkpoint-based resume works end-to-end from the CLI.
+    # Failures are silenced (best-effort) so a broken checkpoint path never
+    # prevents a fresh compounding run from starting.
+    _cli_checkpoint_store = None
+    if mode == "compounding":
+        try:
+            from ouroboros.persistence.checkpoint import CheckpointStore as _CheckpointStore
+
+            _cli_checkpoint_store = _CheckpointStore()  # default ~/.ouroboros/data/checkpoints
+            _cli_checkpoint_store.initialize()
+        except Exception:  # noqa: BLE001
+            _cli_checkpoint_store = None
+
     runner = OrchestratorRunner(
         adapter,
         event_store,
@@ -435,6 +536,7 @@ async def _run_orchestrator(
         task_workspace=workspace,
         max_decomposition_depth=resolved_max_decomposition_depth,
         max_parallel_workers=resolved_max_parallel_workers,
+        checkpoint_store=_cli_checkpoint_store,
     )
 
     # Execute
@@ -721,6 +823,19 @@ def workflow(
         )
         skip_completed = None
 
+    # (b) Mutual exclusivity: --compounding --resume must reference a seed that was
+    # already run.  Providing --resume with a fresh seed path (one that has no prior
+    # compounding checkpoint) is contradictory and will never produce correct results.
+    if compounding_resume:
+        _seed_id_for_validation = _load_seed_id_from_yaml(seed_file)
+        if _seed_id_for_validation:
+            _resume_error = _validate_compounding_resume_not_fresh_seed(
+                _seed_id_for_validation, compounding_resume
+            )
+            if _resume_error:
+                print_error(_resume_error)
+                raise typer.Exit(1)
+
     if orchestrator or resume_session:
         # Orchestrator mode
         if resume_session and not orchestrator:
@@ -778,4 +893,8 @@ def resume(
         print_info("Would resume most recent execution")
 
 
-__all__ = ["app"]
+__all__ = [
+    "app",
+    "_validate_compounding_resume_not_fresh_seed",
+    "_load_seed_id_from_yaml",
+]

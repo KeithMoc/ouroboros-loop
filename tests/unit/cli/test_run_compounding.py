@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
 
+import pytest
 import yaml
 from typer.testing import CliRunner
+
+if TYPE_CHECKING:
+    pass
 
 from ouroboros.cli.commands.run import app as run_app
 
@@ -99,9 +104,15 @@ class TestCompoundingResume:
         async def fake_run(*args, **kwargs):
             captured.update(kwargs)
 
-        with patch(
-            "ouroboros.cli.commands.run._run_orchestrator",
-            new=AsyncMock(side_effect=fake_run),
+        with (
+            patch(
+                "ouroboros.cli.commands.run._validate_compounding_resume_not_fresh_seed",
+                return_value=None,  # bypass fresh-seed guard for this wiring test
+            ),
+            patch(
+                "ouroboros.cli.commands.run._run_orchestrator",
+                new=AsyncMock(side_effect=fake_run),
+            ),
         ):
             result = runner.invoke(
                 run_app,
@@ -118,9 +129,15 @@ class TestCompoundingResume:
         async def fake_run(*args, **kwargs):
             captured.update(kwargs)
 
-        with patch(
-            "ouroboros.cli.commands.run._run_orchestrator",
-            new=AsyncMock(side_effect=fake_run),
+        with (
+            patch(
+                "ouroboros.cli.commands.run._validate_compounding_resume_not_fresh_seed",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.cli.commands.run._run_orchestrator",
+                new=AsyncMock(side_effect=fake_run),
+            ),
         ):
             runner.invoke(
                 run_app,
@@ -211,9 +228,15 @@ class TestCompoundingResume:
         async def fake_run(*args, **kwargs):
             captured.update(kwargs)
 
-        with patch(
-            "ouroboros.cli.commands.run._run_orchestrator",
-            new=AsyncMock(side_effect=fake_run),
+        with (
+            patch(
+                "ouroboros.cli.commands.run._validate_compounding_resume_not_fresh_seed",
+                return_value=None,  # bypass fresh-seed guard for this warning test
+            ),
+            patch(
+                "ouroboros.cli.commands.run._run_orchestrator",
+                new=AsyncMock(side_effect=fake_run),
+            ),
         ):
             result = runner.invoke(
                 run_app,
@@ -334,3 +357,234 @@ class TestCompoundingResume:
             f"resume_session_id not forwarded; captured: {captured}"
         )
         assert captured.get("mode") == "compounding"
+
+
+class TestCompoundingResumeFreshSeedValidation:
+    """Sub-AC 3 (b): Mutual exclusivity of --resume with fresh seed path.
+
+    Tests that --compounding --resume raises an appropriate error when the seed
+    has no prior compounding checkpoint ("fresh seed path" scenario).
+
+    Compounding context from prior ACs:
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — chain serialization round-trip works.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — checkpoint payloads include sub-postmortems.
+    - AC-3 established [[INVARIANT: Haiku verifier runs inline per AC before
+      chain advances]] — invariants in checkpoints are verified.
+    - Sub-ACs 1+2 established [[INVARIANT: checkpoints are only written after
+      AC success, never on failure]] — a missing checkpoint means the seed was
+      never successfully run in compounding mode.
+
+    [[INVARIANT: _validate_compounding_resume_not_fresh_seed returns None when checkpoint dir absent]]
+    [[INVARIANT: --compounding --resume with no prior checkpoint raises an error not a silent fresh run]]
+    """
+
+    # ------------------------------------------------------------------
+    # Unit tests: _validate_compounding_resume_not_fresh_seed function
+    # ------------------------------------------------------------------
+
+    def test_validate_returns_none_when_not_resuming(self) -> None:
+        """Validation always passes when compounding_resume_session_id is None.
+
+        If the user doesn't request --resume, the function must be a no-op
+        regardless of whether a checkpoint exists.
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+
+        # None = not resuming → always valid
+        assert _validate_compounding_resume_not_fresh_seed("any-seed-id", None) is None
+
+    def test_validate_returns_none_when_checkpoint_dir_absent(
+        self, tmp_path: Path, monkeypatch: "pytest.MonkeyPatch"
+    ) -> None:
+        """When the default checkpoint dir doesn't exist, validation is skipped.
+
+        This guards fresh installs and CI environments where no prior runs
+        have occurred.  Failing-open is safer than blocking new users.
+
+        [[INVARIANT: _validate_compounding_resume_not_fresh_seed returns None when checkpoint dir absent]]
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+
+        # Point HOME to tmp_path which has no .ouroboros directory.
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "any-seed-id", "orch_abc123"
+        )
+        assert result is None, (
+            "Validation must skip (return None) when checkpoint dir is absent"
+        )
+
+    def test_validate_returns_error_when_checkpoint_dir_exists_but_empty(
+        self, tmp_path: Path, monkeypatch: "pytest.MonkeyPatch"
+    ) -> None:
+        """When the checkpoint dir exists but has no checkpoint for the seed → error.
+
+        This is the 'fresh seed path' scenario: the user is trying to --resume
+        a seed that has never been run in compounding mode.
+
+        [[INVARIANT: --compounding --resume with no prior checkpoint raises an error not a silent fresh run]]
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ckpt_dir = tmp_path / ".ouroboros" / "data" / "checkpoints"
+        ckpt_dir.mkdir(parents=True)
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "unknown-seed-id", "orch_abc123"
+        )
+        assert result is not None, (
+            "Validation must return an error message for a fresh seed"
+        )
+        assert "cannot resume" in result.lower(), (
+            f"Error message should mention 'cannot resume'; got: {result!r}"
+        )
+
+    def test_validate_returns_none_when_checkpoint_found(
+        self, tmp_path: Path, monkeypatch: "pytest.MonkeyPatch"
+    ) -> None:
+        """When a valid checkpoint exists for the seed, validation passes.
+
+        This is the happy path: the user is resuming a real prior run.
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+        from ouroboros.orchestrator.level_context import PostmortemChain
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        ckpt_dir = tmp_path / ".ouroboros" / "data" / "checkpoints"
+        store = CheckpointStore(base_path=ckpt_dir)
+        store.initialize()
+
+        # Pre-write a checkpoint for the seed (simulating a successful prior run).
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id="known-seed-id",
+            session_id="prior-session",
+            ac_index=0,
+            chain=PostmortemChain(),
+        )
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "known-seed-id", "orch_abc123"
+        )
+        assert result is None, (
+            "Validation must pass (return None) when a checkpoint exists"
+        )
+
+    def test_validate_with_injectable_store_returns_error_on_missing(self) -> None:
+        """Injectable store returning error → validation returns error message.
+
+        Tests the function's injectable-store path (used in unit tests that
+        don't touch the real filesystem at all).
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+        from ouroboros.core.types import Result
+        from unittest.mock import MagicMock
+
+        mock_store = MagicMock()
+        mock_store.load.return_value = Result.err("no checkpoint found")
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "any-seed", "orch_123", mock_store
+        )
+        assert result is not None
+        assert "cannot resume" in result.lower()
+
+    def test_validate_with_injectable_store_returns_none_on_found(self) -> None:
+        """Injectable store returning success → validation passes.
+
+        Tests the function's happy path using an injectable store mock.
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+        from ouroboros.core.types import Result
+        from unittest.mock import MagicMock
+
+        mock_checkpoint = MagicMock()
+        mock_checkpoint.state = {
+            "mode": "compounding",
+            "last_completed_ac_index": 1,
+            "postmortem_chain": [],
+        }
+        mock_store = MagicMock()
+        mock_store.load.return_value = Result.ok(mock_checkpoint)
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "any-seed", "orch_123", mock_store
+        )
+        assert result is None
+
+    # ------------------------------------------------------------------
+    # CLI integration tests: wiring validation into the workflow command
+    # ------------------------------------------------------------------
+
+    def test_cli_exits_with_error_when_validation_returns_error(
+        self, tmp_path: Path
+    ) -> None:
+        """CLI exits non-zero when _validate_compounding_resume_not_fresh_seed returns an error.
+
+        Tests that the workflow command correctly propagates a validation error
+        to the process exit code and output.
+
+        [[INVARIANT: --compounding --resume with no prior checkpoint raises an error not a silent fresh run]]
+        """
+        seed_path = _write_seed(tmp_path)
+
+        with patch(
+            "ouroboros.cli.commands.run._validate_compounding_resume_not_fresh_seed",
+            return_value=(
+                "Cannot resume: no compounding checkpoint found for seed "
+                "'seed-compound-test'. The seed has not been run in compounding "
+                "mode before. To start a fresh run, omit --resume."
+            ),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding", "--resume", "orch_abc123"],
+            )
+
+        assert result.exit_code != 0, (
+            f"CLI should exit non-zero for fresh-seed resume; "
+            f"exit_code={result.exit_code}, output={result.output!r}"
+        )
+        assert "cannot resume" in result.output.lower(), (
+            f"Output must contain the error message; got: {result.output!r}"
+        )
+
+    def test_cli_proceeds_when_validation_returns_none(
+        self, tmp_path: Path
+    ) -> None:
+        """CLI proceeds to _run_orchestrator when validation returns None (valid).
+
+        When the seed has a valid checkpoint, the workflow continues normally.
+        """
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        with (
+            patch(
+                "ouroboros.cli.commands.run._validate_compounding_resume_not_fresh_seed",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.cli.commands.run._run_orchestrator",
+                new=AsyncMock(side_effect=fake_run),
+            ),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding", "--resume", "orch_abc123"],
+            )
+
+        assert result.exit_code == 0, (
+            f"CLI should succeed when validation passes; output={result.output!r}"
+        )
+        # Compounding resume session ID must be forwarded to _run_orchestrator.
+        assert captured.get("compounding_resume_session_id") == "orch_abc123"

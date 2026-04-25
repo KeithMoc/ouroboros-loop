@@ -2936,3 +2936,367 @@ class TestResumeCorrectness:
         # Overall second run result.
         assert len(result_2.results) == 3
         assert result_2.success_count >= 1  # At least AC 2 succeeded in run 2.
+
+
+class TestResumeEdgeCases:
+    """Sub-AC 3 (a)+(c): Resume correctness edge cases and graceful handling.
+
+    (a) Verifies that a partial checkpoint causes the executor to skip completed
+        ACs and make prior postmortems available to the resumed AC.
+
+    (c) Verifies that nonexistent or invalid session_ids are handled gracefully
+        (no exceptions raised; always falls back to fresh run).
+
+    Compounding context from prior ACs:
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — chain serialization round-trip is verified.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — sub-postmortems survive checkpoints.
+    - AC-3 established [[INVARIANT: Haiku verifier runs inline per AC before
+      chain advances]] — invariant objects survive checkpoint round-trips.
+    - Sub-ACs 1+2 established [[INVARIANT: _load_compounding_checkpoint returns
+      empty chain and -1 on failure]] and
+      [[INVARIANT: checkpoints are only written after AC success, never on failure]].
+
+    [[INVARIANT: resume with any invalid session_id runs fresh without raising an exception]]
+    [[INVARIANT: partial checkpoint causes skip-and-rehydrate, never a re-run of completed ACs]]
+    """
+
+    # ------------------------------------------------------------------
+    # (a) Partial checkpoint: skip + rehydrate
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_partial_checkpoint_rehydrates_chain_for_resumed_ac(
+        self, tmp_path: Path
+    ) -> None:
+        """Partial checkpoint (1 of 3 ACs done) rehydrates the chain for AC-2.
+
+        This is the core (a) assertion: after loading a partial checkpoint,
+        AC-2's context_override contains AC-1's postmortem data even though
+        AC-1 was not re-executed.  The chain is rehydrated, not reconstructed
+        from scratch.
+
+        Compounding reference: the checkpoint payload is written by
+        _write_compounding_checkpoint (Sub-AC 2) and the loaded chain is
+        deserialized from the same payload that contains:
+        - ACPostmortem.sub_postmortems (AC-2 B-prime)
+        - Invariant objects (AC-3 C-plus)
+
+        [[INVARIANT: partial checkpoint causes skip-and-rehydrate, never a re-run of completed ACs]]
+        [[INVARIANT: deserialized chain is injected before the AC loop so resumed ACs see prior postmortems]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            Invariant,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        seed = _make_seed(
+            "AC 0: build schema layer",
+            "AC 1: build service layer",
+            "AC 2: build API layer",
+        )
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        # Build a rich AC 0 postmortem with invariants + files.
+        pm_ac0 = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="AC 0: build schema layer",
+                success=True,
+                files_modified=("src/schema.py", "src/schema_types.py"),
+            ),
+            status="pass",
+            gotchas=("schema must be frozen dataclass",),
+            invariants_established=(
+                Invariant(
+                    text="all schema objects are frozen dataclasses",
+                    reliability=0.92,
+                    occurrences=1,
+                    first_seen_ac_id="ac_0",
+                ),
+            ),
+        )
+        prior_chain = PostmortemChain(postmortems=(pm_ac0,))
+
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_run",
+            ac_index=0,  # last_completed = AC 0 (0-based)
+            chain=prior_chain,
+        )
+
+        executed_indices: list[int] = []
+        captured_overrides: list[str] = []
+
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,), (2,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="resumed_run",
+            execution_id="exec_resumed",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_run",
+        )
+
+        # (a.1) AC 0 was NOT re-executed (skipped via checkpoint).
+        assert 0 not in executed_indices, (
+            f"AC 0 should be skipped (checkpoint). Executed: {executed_indices}"
+        )
+
+        # (a.2) ACs 1 and 2 were executed.
+        assert 1 in executed_indices, "AC 1 should execute after skip"
+        assert 2 in executed_indices, "AC 2 should execute after skip"
+
+        # (a.3) The first executed AC (AC 1) sees AC 0's postmortem.
+        # AC 1's override is captured_overrides[0] (since AC 0 was skipped).
+        ac1_context = captured_overrides[0]
+        assert "AC 0: build schema layer" in ac1_context, (
+            "Resumed AC 1 must see AC 0's postmortem from the rehydrated chain"
+        )
+        assert "schema must be frozen dataclass" in ac1_context, (
+            "Gotchas from the prior run must be in the rehydrated chain"
+        )
+        assert "src/schema.py" in ac1_context, (
+            "Files modified must be present in the rehydrated chain"
+        )
+
+        # (a.4) Result structure: 3 entries.
+        assert len(result.results) == 3
+        assert result.results[0].outcome == ACExecutionOutcome.SATISFIED_EXTERNALLY
+        assert result.results[1].success is True
+        assert result.results[2].success is True
+
+    # ------------------------------------------------------------------
+    # (c) Graceful handling of nonexistent / invalid session_ids
+    # ------------------------------------------------------------------
+
+    def test_load_checkpoint_with_empty_string_resume_session_id_returns_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """Empty string resume_session_id is handled gracefully.
+
+        The resume_session_id is only used for logging, so an empty string
+        does not affect checkpoint loading — it's keyed by seed_id.
+
+        [[INVARIANT: resume with any invalid session_id runs fresh without raising an exception]]
+        """
+        from ouroboros.orchestrator.serial_executor import _load_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "ckpts")
+        store.initialize()
+
+        chain, last_idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="any-seed",
+            session_id="new-sess",
+            resume_session_id="",  # empty string; treated as "no prior session"
+        )
+        assert last_idx == -1, "Empty resume_session_id must return -1"
+        assert len(chain.postmortems) == 0, "Empty resume_session_id must return empty chain"
+
+    def test_load_checkpoint_with_path_traversal_resume_session_id_returns_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """Session ID with path-traversal characters is handled gracefully.
+
+        The executor must not crash on adversarial session IDs; it should
+        simply return (empty_chain, -1) when no checkpoint is found.
+
+        [[INVARIANT: resume with any invalid session_id runs fresh without raising an exception]]
+        """
+        from ouroboros.orchestrator.serial_executor import _load_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "ckpts")
+        store.initialize()
+
+        chain, last_idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="any-seed",
+            session_id="new-sess",
+            resume_session_id="../../../etc/passwd",  # path traversal attempt
+        )
+        assert last_idx == -1
+        assert len(chain.postmortems) == 0
+
+    def test_load_checkpoint_with_corrupted_json_checkpoint_returns_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """Checkpoint with invalid JSON state (non-dict) is handled gracefully.
+
+        A badly-formed checkpoint should cause the executor to fall back to a
+        fresh run rather than crashing with a KeyError or TypeError.
+
+        Compounding reference: Sub-AC 1/2 established
+        [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+        """
+        from ouroboros.orchestrator.serial_executor import _load_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointData, CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "ckpts")
+        store.initialize()
+
+        # Write a checkpoint with a completely wrong state structure (not a dict
+        # that CompoundingCheckpointState.from_dict expects).
+        bad_checkpoint = CheckpointData.create(
+            seed_id="bad-structured-seed",
+            phase="execution",
+            state={"mode": "compounding"},  # missing required 'last_completed_ac_index'
+        )
+        store.write(bad_checkpoint)
+
+        chain, last_idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="bad-structured-seed",
+            session_id="new-sess",
+            resume_session_id="old-sess",
+        )
+        assert last_idx == -1, (
+            "Corrupted checkpoint must return last_idx=-1 (graceful fallback)"
+        )
+        assert len(chain.postmortems) == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_serial_with_nonexistent_resume_session_runs_fresh(
+        self, tmp_path: Path
+    ) -> None:
+        """execute_serial with a nonexistent resume_session_id runs all ACs fresh.
+
+        When the resume_session_id doesn't match any stored checkpoint (because
+        the session was never run), the executor must:
+        1. NOT raise an exception
+        2. Run all ACs from AC 0
+        3. Return success for all ACs
+
+        Compounding reference: [[INVARIANT: _load_compounding_checkpoint returns
+        empty chain and -1 on failure]] — the full executor pipeline must respect
+        this guarantee.
+
+        [[INVARIANT: resume with any invalid session_id runs fresh without raising an exception]]
+        """
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+        # Note: no checkpoint written for any seed_id.
+
+        seed = _make_seed("AC 0: fresh task", "AC 1: fresh task 2")
+
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        executed: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            executed.append(int(kwargs["ac_index"]))
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="new-session-xyz",
+            execution_id="exec-fresh-xyz",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="nonexistent-session-id-12345",  # no checkpoint
+        )
+
+        # Both ACs ran from scratch (checkpoint not found → graceful fresh start).
+        assert executed == [0, 1], (
+            f"Both ACs should run when checkpoint missing; executed: {executed}"
+        )
+        assert result.success_count == 2
+        assert result.failure_count == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_serial_no_exception_on_store_error(
+        self, tmp_path: Path
+    ) -> None:
+        """execute_serial handles CheckpointStore errors gracefully.
+
+        If the checkpoint store raises an unexpected exception during load,
+        the executor must not propagate the exception — it should fall back
+        to a fresh run.
+
+        [[INVARIANT: resume with any invalid session_id runs fresh without raising an exception]]
+        """
+        from unittest.mock import MagicMock
+
+        # Store that raises on every load call.
+        failing_store = MagicMock()
+        failing_store.load.side_effect = RuntimeError("disk read error")
+
+        seed = _make_seed("AC 0: test", "AC 1: test")
+
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=failing_store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        executed: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            executed.append(int(kwargs["ac_index"]))
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        # Must NOT raise; must run fresh.
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="new-session",
+            execution_id="exec-store-err",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="some-session-id",
+        )
+
+        assert executed == [0, 1], (
+            f"Fresh run must proceed when store raises; executed: {executed}"
+        )
+        assert result.success_count == 2
