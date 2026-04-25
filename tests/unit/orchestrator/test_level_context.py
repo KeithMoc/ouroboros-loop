@@ -9,6 +9,7 @@ from ouroboros.orchestrator.coordinator import CoordinatorReview, FileConflict
 from ouroboros.orchestrator.level_context import (
     _MAX_FILE_SIZE_BYTES,
     _MAX_FILES_FOR_API,
+    _MAX_INVARIANT_TEXT_CHARS,
     ACContextSummary,
     ACPostmortem,
     Invariant,
@@ -22,6 +23,7 @@ from ouroboros.orchestrator.level_context import (
     build_postmortem_chain_prompt,
     deserialize_level_contexts,
     deserialize_postmortem_chain,
+    extract_invariant_tags,
     extract_level_context,
     serialize_level_contexts,
     serialize_postmortem_chain,
@@ -1215,3 +1217,246 @@ class TestBuildPostmortemChainPrompt:
         # Should fall back to defaults without raising.
         text = build_postmortem_chain_prompt(chain)
         assert text  # non-empty for a non-empty chain
+
+
+# ---------------------------------------------------------------------------
+# Q3 (C-plus) — extract_invariant_tags parser tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractInvariantTags:
+    """Tests for extract_invariant_tags() — Q3 C-plus tag parser."""
+
+    # --- basic functionality ---
+
+    def test_single_tag_from_string(self) -> None:
+        """Single [[INVARIANT: ...]] tag is extracted from a plain string."""
+        result = extract_invariant_tags("Work done. [[INVARIANT: X is always true]]")
+        assert result == ["X is always true"]
+
+    def test_multiple_tags_from_string(self) -> None:
+        """Multiple tags are extracted in order of appearance."""
+        text = (
+            "[[INVARIANT: auth header is required]] some middle text "
+            "[[INVARIANT: JWT expiry is 15 minutes]]"
+        )
+        result = extract_invariant_tags(text)
+        assert result == ["auth header is required", "JWT expiry is 15 minutes"]
+
+    def test_tags_from_agent_messages(self) -> None:
+        """Tags extracted from AgentMessage.content fields."""
+        msgs = [
+            AgentMessage(type="assistant", content="Step 1 done. [[INVARIANT: schema version = 3]]"),
+            AgentMessage(type="assistant", content="Step 2: [[INVARIANT: migrations are idempotent]]"),
+        ]
+        result = extract_invariant_tags(msgs)
+        assert "schema version = 3" in result
+        assert "migrations are idempotent" in result
+        assert len(result) == 2
+
+    def test_empty_string_returns_empty_list(self) -> None:
+        """No tags → empty list."""
+        assert extract_invariant_tags("") == []
+
+    def test_empty_messages_returns_empty_list(self) -> None:
+        """Empty message list → empty list."""
+        assert extract_invariant_tags([]) == []
+
+    # --- whitespace handling ---
+
+    def test_leading_trailing_whitespace_stripped(self) -> None:
+        """Whitespace around tag text is stripped."""
+        result = extract_invariant_tags("[[INVARIANT:   spaces everywhere   ]]")
+        assert result == ["spaces everywhere"]
+
+    def test_internal_whitespace_preserved(self) -> None:
+        """Internal whitespace in tag text is preserved (only outer stripped)."""
+        result = extract_invariant_tags("[[INVARIANT: A   B]]")
+        assert result == ["A   B"]
+
+    # --- punctuation inside tags ---
+
+    def test_punctuation_in_tag_text(self) -> None:
+        """Periods, commas, colons, and hyphens inside tag text are accepted."""
+        text = "[[INVARIANT: config.py uses YAML, not JSON — keys are dash-separated]]"
+        result = extract_invariant_tags(text)
+        assert len(result) == 1
+        assert "config.py" in result[0]
+        assert "YAML" in result[0]
+        assert "dash-separated" in result[0]
+
+    def test_tag_with_numbers_and_equals(self) -> None:
+        """Numeric values and equals sign inside tags are accepted."""
+        result = extract_invariant_tags("[[INVARIANT: MAX_RETRIES = 3]]")
+        assert result == ["MAX_RETRIES = 3"]
+
+    # --- deduplication ---
+
+    def test_duplicate_tags_deduplicated(self) -> None:
+        """Identical tags are deduplicated; only first occurrence is kept."""
+        text = "[[INVARIANT: A]] [[INVARIANT: A]]"
+        assert extract_invariant_tags(text) == ["A"]
+
+    def test_case_insensitive_dedup(self) -> None:
+        """Deduplication is case-insensitive (normalized to lowercase for key)."""
+        text = "[[INVARIANT: Cache is warm]] [[INVARIANT: cache is warm]]"
+        result = extract_invariant_tags(text)
+        # First occurrence wins; second is dropped.
+        assert len(result) == 1
+        assert result[0] == "Cache is warm"
+
+    def test_different_tags_not_deduped(self) -> None:
+        """Two distinct tags are both returned."""
+        text = "[[INVARIANT: A is true]] [[INVARIANT: B is false]]"
+        result = extract_invariant_tags(text)
+        assert len(result) == 2
+
+    # --- truncation at 200 chars ---
+
+    def test_tag_truncated_at_200_chars(self) -> None:
+        """Tag text longer than 200 characters is silently truncated."""
+        long_text = "x" * 250
+        text = f"[[INVARIANT: {long_text}]]"
+        result = extract_invariant_tags(text)
+        assert len(result) == 1
+        assert len(result[0]) == _MAX_INVARIANT_TEXT_CHARS
+        assert result[0] == long_text[:_MAX_INVARIANT_TEXT_CHARS]
+
+    def test_tag_exactly_200_chars_not_truncated(self) -> None:
+        """Tag text exactly at the 200-char limit passes through unchanged."""
+        exact_text = "y" * _MAX_INVARIANT_TEXT_CHARS
+        text = f"[[INVARIANT: {exact_text}]]"
+        result = extract_invariant_tags(text)
+        assert result == [exact_text]
+
+    def test_tag_under_200_chars_not_truncated(self) -> None:
+        """Short tag text is not modified."""
+        short = "short claim"
+        result = extract_invariant_tags(f"[[INVARIANT: {short}]]")
+        assert result == [short]
+
+    # --- malformed / rejected inputs ---
+
+    def test_single_bracket_ignored(self) -> None:
+        """Single-bracket [INVARIANT: ...] format is NOT matched."""
+        assert extract_invariant_tags("[INVARIANT: only single bracket]") == []
+
+    def test_unclosed_double_bracket_ignored(self) -> None:
+        """Tag missing closing ]] is not matched."""
+        assert extract_invariant_tags("[[INVARIANT: missing close") == []
+
+    def test_missing_colon_ignored(self) -> None:
+        """Tag without colon separator is not matched."""
+        assert extract_invariant_tags("[[INVARIANT no colon here]]") == []
+
+    def test_empty_tag_content_ignored(self) -> None:
+        """[[INVARIANT: ]] with only whitespace inside is ignored."""
+        assert extract_invariant_tags("[[INVARIANT:   ]]") == []
+        assert extract_invariant_tags("[[INVARIANT:]]") == []
+
+    def test_nested_brackets_in_text_not_supported(self) -> None:
+        """Nested brackets inside tag text stop the match at the first ].
+
+        The regex [^\\]]+ stops at the first `]`, so nested brackets produce
+        a partial (potentially wrong) match.  This is the documented limitation.
+        """
+        # [[INVARIANT: x[y]z]] — the regex captures "x[y" (stops at first ])
+        # so the match ends at the first ], and "z" is not captured.
+        result = extract_invariant_tags("[[INVARIANT: x[y]z]]")
+        # Either empty (no match) OR partial capture "x[y" — either is acceptable;
+        # the important thing is it doesn't raise.
+        assert isinstance(result, list)
+
+    # --- case-insensitive tag keyword ---
+
+    def test_case_insensitive_keyword(self) -> None:
+        """[[invariant: ...]] and [[INVARIANT: ...]] both match."""
+        lower = extract_invariant_tags("[[invariant: lowercase keyword]]")
+        upper = extract_invariant_tags("[[INVARIANT: uppercase keyword]]")
+        mixed = extract_invariant_tags("[[Invariant: mixed keyword]]")
+        assert lower == ["lowercase keyword"]
+        assert upper == ["uppercase keyword"]
+        assert mixed == ["mixed keyword"]
+
+    # --- multi-message integration ---
+
+    def test_tags_from_multiple_messages_combined(self) -> None:
+        """Tags from multiple AgentMessages are combined into one list."""
+        msgs = [
+            AgentMessage(type="assistant", content="First: [[INVARIANT: one]]"),
+            AgentMessage(type="user", content="No tags here"),
+            AgentMessage(type="assistant", content="Third: [[INVARIANT: two]]"),
+        ]
+        result = extract_invariant_tags(msgs)
+        assert result == ["one", "two"]
+
+    def test_message_without_content_ok(self) -> None:
+        """Messages with empty content don't raise."""
+        msgs = [
+            AgentMessage(type="tool", content=""),
+            AgentMessage(type="assistant", content="[[INVARIANT: found]]"),
+        ]
+        result = extract_invariant_tags(msgs)
+        assert result == ["found"]
+
+
+# ---------------------------------------------------------------------------
+# build_system_prompt — invariant_instructions section
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSystemPromptInvariantSection:
+    """Tests for the include_invariant_instructions parameter in build_system_prompt."""
+
+    def _make_minimal_seed(self) -> object:
+        """Return a minimal Seed-like object for prompt building tests."""
+        from ouroboros.core.seed import OntologySchema, Seed, SeedMetadata
+
+        return Seed(
+            goal="Test goal",
+            acceptance_criteria=["AC 1"],
+            ontology_schema=OntologySchema(
+                name="TestSchema",
+                description="Test",
+                fields=(),
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.1),
+        )
+
+    def test_invariant_section_absent_by_default(self) -> None:
+        """build_system_prompt with default args does NOT include invariant section."""
+        from ouroboros.orchestrator.runner import build_system_prompt
+
+        seed = self._make_minimal_seed()
+        prompt = build_system_prompt(seed)  # type: ignore[arg-type]
+        assert "INVARIANT" not in prompt
+        assert "[[INVARIANT" not in prompt
+
+    def test_invariant_section_included_when_flag_true(self) -> None:
+        """include_invariant_instructions=True adds ## Invariant declarations."""
+        from ouroboros.orchestrator.runner import build_system_prompt
+
+        seed = self._make_minimal_seed()
+        prompt = build_system_prompt(seed, include_invariant_instructions=True)  # type: ignore[arg-type]
+        assert "## Invariant declarations" in prompt
+        assert "[[INVARIANT:" in prompt
+
+    def test_invariant_section_explains_format(self) -> None:
+        """The invariant section includes the tag format and rules."""
+        from ouroboros.orchestrator.runner import build_system_prompt
+
+        seed = self._make_minimal_seed()
+        prompt = build_system_prompt(seed, include_invariant_instructions=True)  # type: ignore[arg-type]
+        # Must explain the double-bracket format
+        assert "[[INVARIANT:" in prompt
+        # Must mention the 200-char limit
+        assert "200" in prompt
+
+    def test_parallel_mode_byte_identical_without_flag(self) -> None:
+        """Calling build_system_prompt without new flag produces identical output to before."""
+        from ouroboros.orchestrator.runner import build_system_prompt
+
+        seed = self._make_minimal_seed()
+        prompt_default = build_system_prompt(seed)  # type: ignore[arg-type]
+        prompt_explicit_false = build_system_prompt(seed, include_invariant_instructions=False)  # type: ignore[arg-type]
+        assert prompt_default == prompt_explicit_false

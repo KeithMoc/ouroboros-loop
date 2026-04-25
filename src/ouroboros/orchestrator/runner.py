@@ -271,6 +271,7 @@ def build_system_prompt(
     *,
     include_claude_md: bool = False,
     workspace_root: str | None = None,
+    include_invariant_instructions: bool = False,
 ) -> str:
     """Build system prompt from seed specification.
 
@@ -284,6 +285,11 @@ def build_system_prompt(
             byte-identical prompt to pre-feature behavior.
         workspace_root: Directory to resolve CLAUDE.md against when
             ``include_claude_md`` is True. Ignored otherwise.
+        include_invariant_instructions: When True, append an "## Invariant
+            declarations" section instructing the agent to emit
+            ``[[INVARIANT: ...]]`` tags for facts future ACs can rely on.
+            Default False so existing callers (parallel mode, tests) produce
+            a byte-identical prompt to pre-feature behavior.
 
     Returns:
         System prompt string.
@@ -339,6 +345,31 @@ IMPORTANT: You are extending existing code, NOT creating a new project.
                 f"{snapshot}\n\n"
             )
 
+    invariant_section = ""
+    if include_invariant_instructions:
+        invariant_section = """
+## Invariant declarations
+
+During your work you may identify facts that future acceptance criteria can rely
+on — for example, a new API contract, a schema constraint, or a verified
+invariant about the codebase state.  Record each such fact with the following
+tag, placed inline in your normal output text:
+
+    [[INVARIANT: <concise claim, ≤ 200 chars>]]
+
+Rules:
+- Use double square brackets exactly as shown; single brackets are ignored.
+- One claim per tag; multiple tags are allowed per AC.
+- Keep each claim ≤ 200 characters (longer text is silently truncated by the
+  parser).
+- Do NOT use nested square brackets inside the claim text.
+- Only emit tags for facts you have actually verified, not aspirations.
+- [[INVARIANT: NOT <prior claim>]] demotes a contradicted invariant.
+
+These tags are parsed and scored after your run; only high-reliability
+invariants (score ≥ 0.7) are injected into future ACs' prompts.
+"""
+
     return f"""{claude_md_section}{strategy_fragment}
 
 ## Goal
@@ -352,7 +383,7 @@ IMPORTANT: You are extending existing code, NOT creating a new project.
 
 {ac_tracking}
 
-{recovery_protocol}"""
+{recovery_protocol}{invariant_section}"""
 
 
 def build_task_prompt(

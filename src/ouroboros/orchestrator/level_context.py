@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import os
 import re
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from ouroboros.observability.logging import get_logger
@@ -39,6 +40,13 @@ _MAX_PUBLIC_API_CHARS = 500
 _MAX_FILE_SIZE_BYTES = 1_048_576
 # Maximum number of files to process for public API summary
 _MAX_FILES_FOR_API = 20
+
+# --- Invariant tag extraction (Q3 / C-plus) ---
+# Canonical regex for [[INVARIANT: <text>]] tags.  Double-bracket delimiter is
+# intentionally strict so any accidental single-bracket text is ignored.
+_INVARIANT_TAG_RE = re.compile(r"\[\[INVARIANT:\s*([^\]]+)\]\]", re.IGNORECASE)
+# Maximum characters per extracted invariant text (matches Q3 spec: ~200 chars).
+_MAX_INVARIANT_TEXT_CHARS = 200
 
 # --- Postmortem primitives (serial compounding execution) ---
 # Default number of most-recent postmortems rendered in full form.
@@ -829,6 +837,54 @@ def deserialize_postmortem_chain(data: list[dict[str, Any]]) -> PostmortemChain:
     return PostmortemChain(postmortems=tuple(postmortems))
 
 
+def extract_invariant_tags(messages: "Sequence[AgentMessage] | str") -> list[str]:
+    """Extract ``[[INVARIANT: ...]]`` tags from agent messages or a plain string.
+
+    Implements the Q3 (C-plus) tag-parsing step.  Tags are parsed with the
+    canonical regex ``\\[\\[INVARIANT:\\s*([^\\]]+)\\]\\]`` (case-insensitive),
+    whitespace-stripped, and capped at :data:`_MAX_INVARIANT_TEXT_CHARS` (200)
+    characters.  Duplicates are removed in insertion order (normalization:
+    lower-case + collapsed whitespace).
+
+    Args:
+        messages: Either a sequence of :class:`~ouroboros.orchestrator.adapter.AgentMessage`
+            objects — the ``content`` field of each is scanned — or a plain
+            string scanned directly.  Pass ``result.final_message`` to scan
+            only the last assistant turn; pass ``result.messages`` to scan
+            the full conversation.
+
+    Returns:
+        Deduplicated list of invariant text strings in the order first seen.
+        Returns an empty list when no valid tags are found.
+
+    Examples::
+
+        >>> extract_invariant_tags("Done. [[INVARIANT: X is always true]]")
+        ['X is always true']
+        >>> extract_invariant_tags("[[INVARIANT: A]] [[INVARIANT: A]]")
+        ['A']
+    """
+    if isinstance(messages, str):
+        text = messages
+    else:
+        text = "\n".join(m.content for m in messages)
+
+    results: list[str] = []
+    seen: set[str] = set()
+    for match in _INVARIANT_TAG_RE.finditer(text):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+        # Apply 200-char cap *before* deduplication so callers see the capped form.
+        raw = raw[:_MAX_INVARIANT_TEXT_CHARS]
+        # Normalize for deduplication: lower-case + collapsed whitespace.
+        key = " ".join(raw.lower().split())
+        if key not in seen:
+            seen.add(key)
+            results.append(raw)
+    return results
+
+
 __all__ = [
     "ACContextSummary",
     "ACPostmortem",
@@ -842,6 +898,7 @@ __all__ = [
     "build_postmortem_chain_prompt",
     "deserialize_level_contexts",
     "deserialize_postmortem_chain",
+    "extract_invariant_tags",
     "extract_level_context",
     "serialize_level_contexts",
     "serialize_postmortem_chain",
