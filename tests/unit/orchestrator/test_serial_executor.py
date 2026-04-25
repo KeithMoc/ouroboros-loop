@@ -2316,6 +2316,194 @@ class TestTruncationEvent:
             f"Unexpected truncation events with default budget; got: {trunc_events}"
         )
 
+    @pytest.mark.asyncio
+    async def test_oversize_chain_emits_exactly_one_event_per_ac_with_correct_counts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Oversize chain emits exactly one truncation event per executed AC with correct counts.
+
+        Uses a pre-loaded checkpoint with 4 verbose postmortems and a token budget
+        of 1 (char_budget=4) so the chain definitely overflows. Only one AC (AC 4)
+        is executed, so exactly one truncation event is expected.
+
+        Verifies all count fields:
+        - dropped_count > 0 (at least one digest was dropped)
+        - char_budget == token_budget * 4
+        - rendered_chars > char_budget (chain still exceeds budget after dropping)
+
+        Compounding reference (AC-1 through AC-3): the chain was written by
+        _write_compounding_checkpoint which serializes PostmortemChain including
+        sub_postmortems (AC-2, B-prime) and Invariant objects (AC-3, C-plus).
+
+        [[INVARIANT: exactly one truncation event per executed AC when chain overflows]]
+        [[INVARIANT: char_budget in truncation event equals token_budget * 4]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        token_budget = 1  # char_budget = 4
+        monkeypatch.setenv("OUROBOROS_POSTMORTEM_TOKEN_BUDGET", str(token_budget))
+
+        # Build a large chain with 4 verbose ACs (each far exceeds budget).
+        def _verbose_pm(idx: int) -> ACPostmortem:
+            return ACPostmortem(
+                summary=ACContextSummary(
+                    ac_index=idx,
+                    ac_content=f"Verbose task {idx}: " + "word " * 50,
+                    success=True,
+                    files_modified=(f"src/module_{idx}.py",),
+                ),
+                status="pass",
+                gotchas=(f"gotcha {idx}: " + "detail " * 40,),
+            )
+
+        big_chain = PostmortemChain(postmortems=tuple(_verbose_pm(i) for i in range(4)))
+
+        # Seed: 4 ACs pre-completed, 1 to execute.
+        seed = _make_seed("AC 0 done", "AC 1 done", "AC 2 done", "AC 3 done", "AC 4 to run")
+
+        store = CheckpointStore(base_path=tmp_path / "ckpts")
+        store.initialize()
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_verbose",
+            ac_index=3,
+            chain=big_chain,
+        )
+
+        event_store, appended = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,), (2,), (3,), (4,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_exact_count",
+            execution_id="exec_exact_count",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            resume_session_id="prior_verbose",
+        )
+
+        trunc_events = [
+            e for e in appended if e.type == "execution.postmortem_chain.truncated"
+        ]
+        # Exactly 1 AC executed → exactly 1 truncation event.
+        assert len(trunc_events) == 1, (
+            f"Expected exactly 1 truncation event (1 AC executed); "
+            f"got {len(trunc_events)}: {[e.data for e in trunc_events]}"
+        )
+        ev = trunc_events[0]
+
+        # Verify correct counts.
+        assert ev.data["dropped_count"] > 0, (
+            "dropped_count must be > 0 when chain still overflows after all digests dropped"
+        )
+        expected_budget = token_budget * 4
+        assert ev.data["char_budget"] == expected_budget, (
+            f"char_budget must equal token_budget * 4 = {expected_budget}; "
+            f"got {ev.data['char_budget']}"
+        )
+        assert ev.data["rendered_chars"] > ev.data["char_budget"], (
+            "rendered_chars must exceed char_budget (truncation sentinel)"
+        )
+        # Verify the event is keyed on the execution aggregate.
+        assert ev.aggregate_type == "execution"
+        assert ev.aggregate_id == "exec_exact_count"
+        assert ev.data["session_id"] == "sess_exact_count"
+        assert ev.data["execution_id"] == "exec_exact_count"
+
+    @pytest.mark.asyncio
+    async def test_truncation_event_roundtrip_through_real_event_store(
+        self, tmp_path: Path
+    ) -> None:
+        """Truncation event roundtrips through a real EventStore without data loss.
+
+        Appends a truncation event to a real SQLite-backed EventStore, replays
+        it by aggregate, and asserts that all numeric count fields and the
+        event metadata survive serialization intact.
+
+        This is the "event store roundtrip" required by Sub-AC 3 of the Q7
+        truncation event feature.  The test is intentionally divorced from the
+        serial executor so that it isolates the persistence layer.
+
+        Compounding reference: the EventStore is the same persistence layer used
+        by SerialCompoundingExecutor._safe_emit_event (which calls store.append()
+        after every truncation callback).  Prior ACs confirmed that the
+        postmortem chain serializes sub_postmortems (AC-2) and Invariant objects
+        (AC-3); those objects' parent events also go through this same store.
+
+        [[INVARIANT: event type is execution.postmortem_chain.truncated]]
+        [[INVARIANT: Truncation event uses aggregate_type execution, keyed on execution_id]]
+        """
+        from ouroboros.orchestrator.events import create_postmortem_chain_truncated_event
+        from ouroboros.persistence.event_store import EventStore
+
+        db_path = tmp_path / "trunc_rt_events.db"
+        store = EventStore(database_url=f"sqlite+aiosqlite:///{db_path}")
+        await store.initialize()
+
+        try:
+            # Create the event with known field values.
+            event = create_postmortem_chain_truncated_event(
+                session_id="sess_roundtrip",
+                execution_id="exec_roundtrip",
+                dropped_count=5,
+                char_budget=4000,
+                rendered_chars=6200,
+                full_forms_preserved=3,
+                cumulative_invariants_preserved=2,
+            )
+
+            # Append to the real store.
+            await store.append(event)
+
+            # Replay by aggregate_type + aggregate_id.
+            replayed = await store.replay("execution", "exec_roundtrip")
+
+            assert len(replayed) == 1, (
+                f"Expected exactly 1 replayed event; got {len(replayed)}"
+            )
+            rt = replayed[0]
+
+            # --- Event metadata ---
+            assert rt.type == "execution.postmortem_chain.truncated", (
+                f"Event type not preserved; got {rt.type!r}"
+            )
+            assert rt.aggregate_type == "execution"
+            assert rt.aggregate_id == "exec_roundtrip"
+
+            # --- Data payload ---
+            assert rt.data["session_id"] == "sess_roundtrip"
+            assert rt.data["execution_id"] == "exec_roundtrip"
+            assert rt.data["dropped_count"] == 5
+            assert rt.data["char_budget"] == 4000
+            assert rt.data["rendered_chars"] == 6200
+            assert rt.data["full_forms_preserved"] == 3
+            assert rt.data["cumulative_invariants_preserved"] == 2
+            assert "timestamp" in rt.data
+
+        finally:
+            await store.close()
+
 
 class TestResumeCorrectness:
     """Sub-AC 3: Resume correctness — rehydrated chain identity and AC skip/execute semantics.
