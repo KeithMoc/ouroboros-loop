@@ -555,7 +555,11 @@ class TestCommittedHistoryCapture:
         assert "1 file changed" in artifacts.artifact
 
         # Reference artifact echoes the raw captures for the QA judge to dig in.
-        assert "## git log --oneline -n 30" in artifacts.reference
+        # Pull _RECENT_LOG_LIMIT from the module so this assertion stays in
+        # sync with any future tweak to the constant.
+        from ouroboros.evaluation.verification_artifacts import _RECENT_LOG_LIMIT
+
+        assert f"## git log --oneline -n {_RECENT_LOG_LIMIT}" in artifacts.reference
         assert "## git show --stat HEAD" in artifacts.reference
 
         # Manifest persists raw history evidence for downstream tooling.

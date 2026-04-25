@@ -303,6 +303,12 @@ def _render_chain_as_markdown(
         if retry_attempts:
             lines.append(f"**Retries:** {retry_attempts}")
 
+        # Strict CommonMark requires a blank line before a bullet list when
+        # the preceding line is a paragraph (e.g. **Retries:** or **Task:**),
+        # otherwise the bullet is parsed as paragraph continuation and the
+        # rendered HTML loses the list semantics.
+        lines.append("")
+
         if files_modified:
             files_str = ", ".join(str(f) for f in files_modified)
             lines.append(f"- Files modified: {files_str}")
@@ -999,6 +1005,13 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         # and their postmortems are injected into the rolling chain immediately.
         chain = PostmortemChain()
         last_completed_ac_index: int = -1  # -1 means "nothing completed yet"
+        # Distinct from last_completed_ac_index: tracks the most recently
+        # persisted AC index across the loop body.  last_completed_ac_index is
+        # the resume baseline (immutable for the run); current_persisted_ac_index
+        # advances on each successful checkpoint write and is what gets passed
+        # to _write_partial_sub_ac_checkpoint so partial writes record the real
+        # boundary instead of regressing to the baseline.
+        current_persisted_ac_index: int = -1
         # Sub-AC resume: partial state for a failing decomposed AC.
         # Set when the checkpoint records a partially-completed decomposed AC.
         _partial_failing_ac_index: int | None = None
@@ -1011,6 +1024,8 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 session_id=session_id,
                 resume_session_id=resume_session_id,
             )
+            # Resuming: the persisted cursor starts at the resume baseline.
+            current_persisted_ac_index = last_completed_ac_index
             # Also load partial sub-AC state (separate load to avoid breaking
             # _load_compounding_checkpoint's return type contract).
             _partial_failing_ac_index, _partial_failing_ac_sub_pms = (
@@ -1411,6 +1426,14 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     ac_index=ac_index,
                     chain=chain,
                 )
+                # Track the persisted progress in-process so a later partial
+                # checkpoint (for a subsequent failing decomposed AC) records
+                # the correct boundary instead of regressing to the resume
+                # baseline.  Kept distinct from last_completed_ac_index so the
+                # monolithic resume adjudication trigger (which uses
+                # last_completed_ac_index as a resume baseline, not a moving
+                # cursor) keeps firing only for the actual failing AC.
+                current_persisted_ac_index = ac_index
             elif (
                 not result.success
                 and result.sub_results
@@ -1428,7 +1451,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     ac_index=ac_index,
                     sub_postmortems=postmortem.sub_postmortems,
                     base_chain=chain_before_append,
-                    last_completed_ac_index=last_completed_ac_index,
+                    last_completed_ac_index=current_persisted_ac_index,
                 )
 
             await self._safe_emit_event(

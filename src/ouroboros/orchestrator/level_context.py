@@ -603,7 +603,12 @@ class ACPostmortem:
     ac_native_session_id: str | None = None
     sub_postmortems: tuple["ACPostmortem", ...] = field(default_factory=tuple)
 
-    def to_digest(self, *, min_reliability: float = 0.0) -> str:
+    def to_digest(
+        self,
+        *,
+        min_reliability: float = 0.0,
+        contradicted_keys: "frozenset[str] | None" = None,
+    ) -> str:
         """Render a one-line digest for compressed display in the chain.
 
         Format: ``AC {n} [{status}]: {content} — files: a,b (+K more) | invariants: X, Y``
@@ -617,6 +622,12 @@ class ACPostmortem:
                 0.0 (no filtering) when called standalone; the chain caller
                 passes the chain-level threshold for consistency with
                 :meth:`to_full_text` and :meth:`PostmortemChain.to_prompt_text`.
+            contradicted_keys: Optional set of normalized invariant keys
+                contradicted *somewhere in the enclosing chain*.  Per-AC
+                ``invariants_established`` only knows about contradiction
+                state at the AC's own creation time; passing this set lets
+                the chain renderer hide invariants that were later
+                contradicted by a downstream AC.
         """
         s = self.summary
         content = s.ac_content[:_POSTMORTEM_DIGEST_CONTENT_CHARS].rstrip()
@@ -637,10 +648,15 @@ class ACPostmortem:
             # Older entries render via to_digest, so without this filter
             # below-threshold or contradicted invariants would leak back into
             # the chain context — defeating the render gate.
+            _contradicted = contradicted_keys or frozenset()
             visible_invs = tuple(
                 inv
                 for inv in self.invariants_established
-                if not inv.is_contradicted and inv.reliability >= min_reliability
+                if (
+                    not inv.is_contradicted
+                    and inv.reliability >= min_reliability
+                    and " ".join(inv.text.lower().split()) not in _contradicted
+                )
             )
             if visible_invs:
                 inv_head = "; ".join(inv.text for inv in visible_invs[:2])
@@ -650,7 +666,12 @@ class ACPostmortem:
 
         return " | ".join(parts)
 
-    def to_full_text(self, *, min_reliability: float = 0.0) -> str:
+    def to_full_text(
+        self,
+        *,
+        min_reliability: float = 0.0,
+        contradicted_keys: "frozenset[str] | None" = None,
+    ) -> str:
         """Render the full postmortem for the in-prompt 'recent' window.
 
         Args:
@@ -659,6 +680,12 @@ class ACPostmortem:
                 invariants (``is_contradicted=True``) are always excluded.
                 Defaults to 0.0 (no filtering) when called standalone; callers
                 should pass the chain-level threshold for consistent behaviour.
+            contradicted_keys: Optional set of normalized invariant keys
+                contradicted *somewhere in the enclosing chain*.  An entry's
+                ``is_contradicted`` flag only reflects state at the AC's
+                creation time; this set lets the chain renderer also suppress
+                invariants that were contradicted by a *later* AC, so the
+                trusted claim is hidden everywhere in the rendered output.
         """
         s = self.summary
         lines: list[str] = [
@@ -684,10 +711,18 @@ class ACPostmortem:
                 f"**Tool trace:** {self.tool_trace_digest[:_POSTMORTEM_MAX_TRACE_CHARS]}"
             )
         # Apply reliability gate to per-AC invariants in the full-form render.
+        # Also drop invariants whose normalized key is in the chain-level
+        # contradicted set so a downstream contradiction hides the (then-trusted)
+        # original claim everywhere — not just in the cumulative section.
+        _contradicted = contradicted_keys or frozenset()
         visible_invs = tuple(
             inv
             for inv in self.invariants_established
-            if not inv.is_contradicted and inv.reliability >= min_reliability
+            if (
+                not inv.is_contradicted
+                and inv.reliability >= min_reliability
+                and " ".join(inv.text.lower().split()) not in _contradicted
+            )
         )
         if visible_invs:
             lines.append("**Invariants established:**")
@@ -847,6 +882,28 @@ class PostmortemChain:
                         is_contradicted=True,
                     )
                 )
+                # Symmetric contradiction marking: the counterpart living on a
+                # prior postmortem cannot be mutated (frozen dataclass), so we
+                # emit a fresh contradicted Invariant under the COUNTERPART's
+                # key on this batch's result.  ``cumulative_invariants`` walks
+                # the chain with last-wins-by-key semantics, so the older
+                # trusted entry is overridden by this contradicted one and
+                # filtered at the render gate alongside its negation.  Without
+                # this, the prior claim continues to surface in downstream
+                # ACs' compounding context even though it is now provably
+                # contradicted.
+                if counterpart_key is not None and counterpart_key not in seen_keys:
+                    prior_counterpart = existing[counterpart_key]
+                    result.append(
+                        Invariant(
+                            text=prior_counterpart.text,
+                            reliability=0.0,
+                            occurrences=prior_counterpart.occurrences,
+                            first_seen_ac_id=prior_counterpart.first_seen_ac_id,
+                            is_contradicted=True,
+                        )
+                    )
+                    seen_keys.add(counterpart_key)
             elif key in existing:
                 prior = existing[key]
                 new_occ = prior.occurrences + 1
@@ -952,6 +1009,16 @@ class PostmortemChain:
             if not inv.is_contradicted and inv.reliability >= min_reliability
         )
         hidden_count = len(all_invariants) - len(invariants)
+        # Build the chain-level contradicted-keys set so per-AC renderers can
+        # also hide invariants contradicted by a downstream AC. Without this
+        # set, AC-N's ``to_full_text`` would still render a claim that AC-N+M
+        # later proved false (since the per-AC ``is_contradicted`` is fixed at
+        # the AC's creation time).
+        contradicted_keys: frozenset[str] = frozenset(
+            " ".join(inv.text.lower().split())
+            for inv in all_invariants
+            if inv.is_contradicted
+        )
         if hidden_count > 0:
             log.debug(
                 "postmortem_chain.invariants.render_gate_filtered",
@@ -968,14 +1035,20 @@ class PostmortemChain:
             if digests:
                 sections.append("### Earlier ACs (digests)")
                 sections.extend(
-                    f"- {pm.to_digest(min_reliability=min_reliability)}" for pm in digests
+                    f"- {pm.to_digest(min_reliability=min_reliability, contradicted_keys=contradicted_keys)}"
+                    for pm in digests
                 )
             if full_entries:
                 sections.append("### Recent ACs (full postmortems)")
-                # Pass min_reliability so individual full-form sections apply the
-                # same gate as the cumulative invariants block above.
+                # Pass min_reliability AND contradicted_keys so individual
+                # full-form sections apply the same gate as the cumulative
+                # invariants block above (including chain-level contradictions
+                # introduced after the AC's creation).
                 sections.extend(
-                    pm.to_full_text(min_reliability=min_reliability)
+                    pm.to_full_text(
+                        min_reliability=min_reliability,
+                        contradicted_keys=contradicted_keys,
+                    )
                     for pm in full_entries
                 )
             return "\n".join(sections)

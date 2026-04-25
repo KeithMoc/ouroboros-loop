@@ -150,26 +150,59 @@ class TestCompoundingResume:
     ) -> None:
         """--compounding --resume must NOT trigger orchestrator session resume path.
 
-        The ``resume_session`` positional kwarg sent to ``_run_orchestrator``
-        must be None so the function doesn't call ``runner.resume_session()``.
+        ``_run_orchestrator(seed_file, resume_session, ...)`` — the second
+        positional / ``resume_session`` keyword must be None so the function
+        doesn't call ``runner.resume_session()``.
+
+        Captures BOTH positional args and kwargs so a positional-style call
+        site can't bypass the assertion silently. Also stubs the fresh-seed
+        validator so an environment with a real ``~/.ouroboros`` directory
+        doesn't reject the call before ``_run_orchestrator`` is reached
+        (which would leave the captures empty and trivially pass the
+        ``None == None`` check).
         """
         seed_path = _write_seed(tmp_path)
         captured: dict = {}
+        called = []
 
         async def fake_run(*args, **kwargs):
+            called.append(True)
+            captured["positional"] = args
             captured.update(kwargs)
 
-        with patch(
-            "ouroboros.cli.commands.run._run_orchestrator",
-            new=AsyncMock(side_effect=fake_run),
+        with (
+            patch(
+                "ouroboros.cli.commands.run._run_orchestrator",
+                new=AsyncMock(side_effect=fake_run),
+            ),
+            # Bypass the real fresh-seed validator so the patched
+            # _run_orchestrator is always reached.
+            patch(
+                "ouroboros.cli.commands.run._validate_compounding_resume_not_fresh_seed",
+                return_value=None,
+            ),
         ):
             runner.invoke(
                 run_app,
                 ["workflow", str(seed_path), "--compounding", "--resume", "orch_abc123"],
             )
-        # resume_session (positional 2nd arg or keyword) must be None for compounding
-        # The first positional arg is seed_file; check keyword form.
-        assert captured.get("resume_session") is None
+
+        # Confirm _run_orchestrator was actually invoked — otherwise an
+        # empty `captured` dict would make the None check trivially pass.
+        assert called, "_run_orchestrator was never invoked; the test cannot verify resume_session"
+
+        positional = captured.get("positional", ())
+        # resume_session is the 2nd positional parameter; check both
+        # positional and kwarg forms so a positional-style call is also caught.
+        positional_resume = positional[1] if len(positional) >= 2 else None
+        kwarg_resume = captured.get("resume_session")
+        assert positional_resume is None, (
+            f"resume_session (positional[1]) must be None for --compounding, "
+            f"got {positional_resume!r}"
+        )
+        assert kwarg_resume is None, (
+            f"resume_session kwarg must be None for --compounding, got {kwarg_resume!r}"
+        )
 
     def test_resume_without_compounding_is_orchestrator_resume(
         self, tmp_path: Path
@@ -594,6 +627,86 @@ class TestCompoundingResumeFreshSeedValidation:
             "any-seed", "orch_123", mock_store
         )
         assert result is None
+
+    def test_validate_rejects_non_compounding_checkpoint(self) -> None:
+        """A checkpoint exists for the seed but isn't a compounding checkpoint.
+
+        Without inspecting state.mode, --resume would silently rehydrate a
+        non-compounding checkpoint (e.g. left by a different mode/version)
+        and produce nonsense.  The guard now requires
+        state["mode"] == "compounding".
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+        from ouroboros.core.types import Result
+        from unittest.mock import MagicMock
+
+        mock_checkpoint = MagicMock()
+        mock_checkpoint.state = {"mode": "parallel", "some_other": "data"}
+        mock_store = MagicMock()
+        mock_store.load.return_value = Result.ok(mock_checkpoint)
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "any-seed", "orch_123", mock_store
+        )
+        assert result is not None
+        assert "no compounding checkpoint" in result.lower()
+
+    def test_validate_rejects_checkpoint_with_missing_mode(self) -> None:
+        """Edge case: checkpoint state has no ``mode`` key at all → reject.
+
+        Defensive coverage in case a partially-written or corrupted state
+        dict lands in the store.
+        """
+        from ouroboros.cli.commands.run import _validate_compounding_resume_not_fresh_seed
+        from ouroboros.core.types import Result
+        from unittest.mock import MagicMock
+
+        mock_checkpoint = MagicMock()
+        mock_checkpoint.state = {"last_completed_ac_index": 0}  # mode key absent
+        mock_store = MagicMock()
+        mock_store.load.return_value = Result.ok(mock_checkpoint)
+
+        result = _validate_compounding_resume_not_fresh_seed(
+            "any-seed", "orch_123", mock_store
+        )
+        assert result is not None
+        assert "no compounding checkpoint" in result.lower()
+
+
+class TestLoadSeedIdFromYamlSizeGuard:
+    """The early-probe ``_load_seed_id_from_yaml`` must apply the same DoS
+    file-size guard as ``_load_seed_from_yaml``.  Otherwise an oversized seed
+    file could still be parsed via this code path during early validation,
+    bypassing the protection added to the main loader.
+    """
+
+    def test_oversized_seed_returns_none(self, tmp_path: Path) -> None:
+        from unittest.mock import patch as _patch
+
+        from ouroboros.cli.commands.run import _load_seed_id_from_yaml
+
+        seed_path = tmp_path / "fake.yaml"
+        seed_path.write_text("metadata:\n  seed_id: would-be-loaded\n")
+
+        # Patch the validator to report the file as oversize regardless of
+        # actual content, so the test doesn't have to write a real megabyte.
+        with _patch(
+            "ouroboros.cli.commands.run.InputValidator.validate_seed_file_size",
+            return_value=(False, "too big"),
+        ):
+            result = _load_seed_id_from_yaml(seed_path)
+
+        assert result is None, (
+            "Oversize seed must NOT yield a seed_id from the early probe; "
+            "the guard's DoS protection would otherwise be bypassable."
+        )
+
+    def test_size_valid_yaml_yields_seed_id(self, tmp_path: Path) -> None:
+        from ouroboros.cli.commands.run import _load_seed_id_from_yaml
+
+        seed_path = tmp_path / "ok.yaml"
+        seed_path.write_text("metadata:\n  seed_id: my-seed\n")
+        assert _load_seed_id_from_yaml(seed_path) == "my-seed"
 
     # ------------------------------------------------------------------
     # CLI integration tests: wiring validation into the workflow command

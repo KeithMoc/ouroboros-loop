@@ -458,7 +458,11 @@ def _render_reference(
         )
     if history.head_show_stat:
         lines.extend(["", "## git show --stat HEAD", history.head_show_stat])
-    if history.error and not history.available:
+    # Surface any history-capture error (log OR show capture failure), even when
+    # the other capture succeeded.  Partial-success cases would otherwise hide
+    # the error from the QA judge — which is exactly the visibility hole the
+    # whole capture path is meant to close.
+    if history.error:
         lines.extend(["", "## Committed History Error", history.error])
 
     for run in runs:

@@ -1633,7 +1633,13 @@ class TestMergeInvariantsContradiction:
     # --- basic contradiction: existing "X", new "NOT X" ---
 
     def test_not_prefix_contradicts_existing_claim(self) -> None:
-        """'NOT auth required' contradicts prior 'auth required' claim."""
+        """'NOT auth required' contradicts prior 'auth required' claim.
+
+        Returns BOTH the new contradicted invariant AND a contradicted
+        counterpart marker bearing the prior invariant's text — the chain's
+        cumulative_invariants() last-wins-by-key semantics then override the
+        previously-trusted entry so the original claim no longer surfaces.
+        """
         prior = Invariant(
             text="auth required", reliability=0.9, occurrences=1, first_seen_ac_id="ac_1"
         )
@@ -1642,10 +1648,16 @@ class TestMergeInvariantsContradiction:
         result = chain.merge_invariants(
             [("NOT auth required", 1.0)], source_ac_id="ac_2"
         )
-        assert len(result) == 1
-        inv = result[0]
-        assert inv.is_contradicted is True
-        assert inv.reliability == 0.0
+        # Two entries: the new contradicted, plus a counterpart marker.
+        assert len(result) == 2
+        new_inv, counterpart_marker = result
+        assert new_inv.text == "NOT auth required"
+        assert new_inv.is_contradicted is True
+        assert new_inv.reliability == 0.0
+        assert counterpart_marker.text == "auth required"
+        assert counterpart_marker.is_contradicted is True
+        assert counterpart_marker.reliability == 0.0
+        assert counterpart_marker.first_seen_ac_id == "ac_1"  # preserved from prior
 
     def test_not_prefix_contradicts_existing_claim_case_insensitive(self) -> None:
         """Contradiction detection is case-insensitive."""
@@ -1657,9 +1669,9 @@ class TestMergeInvariantsContradiction:
         result = chain.merge_invariants(
             [("not cache is warm", 0.8)], source_ac_id="ac_2"
         )
-        assert len(result) == 1
-        assert result[0].is_contradicted is True
-        assert result[0].reliability == 0.0
+        assert len(result) == 2
+        assert all(inv.is_contradicted for inv in result)
+        assert all(inv.reliability == 0.0 for inv in result)
 
     # --- symmetric case: existing "NOT X", new "X" ---
 
@@ -1673,10 +1685,13 @@ class TestMergeInvariantsContradiction:
         result = chain.merge_invariants(
             [("auth required", 0.9)], source_ac_id="ac_2"
         )
-        assert len(result) == 1
-        inv = result[0]
-        assert inv.is_contradicted is True
-        assert inv.reliability == 0.0
+        assert len(result) == 2
+        new_inv, counterpart_marker = result
+        assert new_inv.text == "auth required"
+        assert new_inv.is_contradicted is True
+        assert counterpart_marker.text == "not auth required"
+        assert counterpart_marker.is_contradicted is True
+        assert counterpart_marker.first_seen_ac_id == "ac_1"
 
     # --- text preservation on contradicted invariants ---
 
@@ -1733,7 +1748,12 @@ class TestMergeInvariantsContradiction:
     # --- mixed batch: contradicted + clean in same call ---
 
     def test_mixed_batch_contradicted_and_clean(self) -> None:
-        """A batch with one contradiction and one clean invariant handles both correctly."""
+        """A batch with one contradiction and one clean invariant handles both correctly.
+
+        After symmetric contradiction handling, the result has THREE entries:
+        the new contradicted, the counterpart marker (also contradicted), and
+        the clean new invariant.
+        """
         prior = Invariant(text="feature is on", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
         chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
 
@@ -1741,18 +1761,26 @@ class TestMergeInvariantsContradiction:
             [("NOT feature is on", 0.9), ("new fact", 0.8)],
             source_ac_id="ac_2",
         )
-        assert len(result) == 2
-        # First: the contradiction
+        assert len(result) == 3
+        # [0] the new contradicted invariant
+        assert result[0].text == "NOT feature is on"
         assert result[0].is_contradicted is True
         assert result[0].reliability == 0.0
-        # Second: the clean new invariant
-        assert result[1].is_contradicted is False
-        assert abs(result[1].reliability - 0.8) < 1e-9
+        # [1] counterpart marker overriding the prior trusted entry
+        assert result[1].text == "feature is on"
+        assert result[1].is_contradicted is True
+        assert result[1].reliability == 0.0
+        # [2] the clean new invariant
+        assert result[2].text == "new fact"
+        assert result[2].is_contradicted is False
+        assert abs(result[2].reliability - 0.8) < 1e-9
 
     # --- serialization round-trip ---
 
     def test_is_contradicted_round_trips_through_serialize_deserialize(self) -> None:
-        """is_contradicted=True survives a serialize/deserialize round-trip."""
+        """is_contradicted=True survives a serialize/deserialize round-trip
+        for BOTH the new entry and the counterpart marker.
+        """
         prior = Invariant(text="Q is safe", reliability=1.0, occurrences=1, first_seen_ac_id="ac_1")
         chain = PostmortemChain(postmortems=(_make_pm_with_invariant(0, prior),))
 
@@ -1766,10 +1794,10 @@ class TestMergeInvariantsContradiction:
         chain3 = deserialize_postmortem_chain(data)
 
         last_pm = chain3.postmortems[-1]
-        assert len(last_pm.invariants_established) == 1
-        inv = last_pm.invariants_established[0]
-        assert inv.is_contradicted is True
-        assert inv.reliability == 0.0
+        assert len(last_pm.invariants_established) == 2
+        for inv in last_pm.invariants_established:
+            assert inv.is_contradicted is True
+            assert inv.reliability == 0.0
 
     def test_is_contradicted_false_default_round_trips(self) -> None:
         """is_contradicted=False (default) also survives round-trip (no field → False)."""
@@ -2542,15 +2570,23 @@ class TestInvariantFullLifecycle:
         chain = chain.append(pm1)
 
         # AC-2: contradicts "auth required" with "not auth required".
+        # Symmetric contradiction handling: result has the new contradicted,
+        # the counterpart marker (also contradicted), and Y (clean) — three
+        # entries.
         inv_ac2 = chain.merge_invariants(
             [("not auth required", 0.85), ("Y is new", 0.75)],
             source_ac_id="ac_2",
         )
-        # The contradiction is marked, and Y is fresh.
+        assert len(inv_ac2) == 3
+        # [0] the new contradicted "not auth required"
         assert inv_ac2[0].is_contradicted is True
         assert inv_ac2[0].reliability == 0.0
-        assert inv_ac2[1].is_contradicted is False
-        assert inv_ac2[1].occurrences == 1
+        # [1] counterpart marker for "auth required" (also contradicted)
+        assert inv_ac2[1].text == "auth required"
+        assert inv_ac2[1].is_contradicted is True
+        # [2] Y is fresh, not contradicted
+        assert inv_ac2[2].is_contradicted is False
+        assert inv_ac2[2].occurrences == 1
 
         summary2 = ACContextSummary(ac_index=2, ac_content="Contradict auth, add Y", success=True)
         pm2 = ACPostmortem(summary=summary2, invariants_established=inv_ac2)
@@ -2558,13 +2594,15 @@ class TestInvariantFullLifecycle:
 
         # Render with threshold=0.7:
         # - "X is stable" (reliability=0.95) → visible
-        # - "auth required" (reliability=0.8, not contradicted) → still visible from ac_0
+        # - "auth required" (counterpart marker, contradicted) → HIDDEN
+        #   (cumulative_invariants() last-wins picks the contradicted entry)
         # - "not auth required" (is_contradicted=True) → HIDDEN
         # - "Y is new" (reliability=0.75) → visible
         text = chain.to_prompt_text(min_reliability=0.7)
         assert "X is stable" in text
         assert "Y is new" in text
         assert "not auth required" not in text
+        assert "auth required" not in text  # symmetric: prior trusted claim hidden too
 
     def test_three_ac_lifecycle_serializes_full_chain_including_contradicted(self) -> None:
         """The serialized chain retains all invariants (including contradicted ones).
@@ -2591,17 +2629,21 @@ class TestInvariantFullLifecycle:
         summary1 = ACContextSummary(ac_index=1, ac_content="AC 1", success=True)
         chain = chain.append(ACPostmortem(summary=summary1, invariants_established=inv_ac1))
 
-        # Serialize the full chain — contradicted invariant must be present.
+        # Serialize the full chain — both contradicted entries (the new one and
+        # the counterpart marker) must be present for full audit fidelity.
         data = serialize_postmortem_chain(chain)
         assert len(data) == 2
         inv_data = data[1]["invariants_established"]
-        assert len(inv_data) == 1
-        assert inv_data[0]["is_contradicted"] is True
-        assert abs(inv_data[0]["reliability"]) < 1e-9  # reliability=0.0
+        assert len(inv_data) == 2
+        for entry in inv_data:
+            assert entry["is_contradicted"] is True
+            assert abs(entry["reliability"]) < 1e-9  # reliability=0.0
 
-        # Rendered prompt excludes it.
+        # Rendered prompt excludes both — the negation AND the original claim,
+        # since both are now flagged contradicted by symmetric handling.
         text = chain.to_prompt_text(min_reliability=0.0)
         assert "not chain artifact written at run end" not in text
+        assert "chain artifact written at run end" not in text
 
     def test_occurrence_and_reliability_compounds_across_four_acs(self) -> None:
         """Occurrence count and blended reliability compound correctly over 4 ACs.

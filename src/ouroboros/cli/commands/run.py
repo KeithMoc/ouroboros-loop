@@ -176,11 +176,19 @@ def _load_seed_id_from_yaml(seed_file: Path) -> str | None:
     Used for early validation (e.g., checking checkpoint existence) before
     the full :func:`Seed.from_dict` parse happens inside ``_run_orchestrator``.
 
+    Applies the same file-size DoS guard as :func:`_load_seed_from_yaml` so a
+    pathological seed file can't bypass the size check by being read via this
+    early-probe path.
+
     Returns:
         ``seed_id`` string when present, ``None`` on any error or if the field
-        is absent / empty.
+        is absent / empty (including the size-guard failure case).
     """
     try:
+        file_size = seed_file.stat().st_size
+        is_valid, _err = InputValidator.validate_seed_file_size(file_size)
+        if not is_valid:
+            return None
         with open(seed_file) as _f:
             _data = yaml.safe_load(_f)
         return ((_data or {}).get("metadata") or {}).get("seed_id") or None
@@ -250,10 +258,24 @@ def _validate_compounding_resume_not_fresh_seed(
                 "checkpoint has been deleted. "
                 "To start a fresh compounding run, omit --resume."
             )
+        # A checkpoint exists, but it might belong to a different mode (e.g. the
+        # seed was previously run in parallel mode and produced a non-compounding
+        # checkpoint).  CompoundingCheckpointState always stamps state["mode"] =
+        # "compounding"; reject anything else with the same user-facing message
+        # so --resume only resumes compounding runs.
+        checkpoint = load_result.value
+        state = getattr(checkpoint, "state", None) or {}
+        if state.get("mode") != "compounding":
+            return (
+                f"Cannot resume: no compounding checkpoint found for seed '{seed_id}'. "
+                "The seed has not been run in compounding mode before, or its "
+                "checkpoint has been deleted. "
+                "To start a fresh compounding run, omit --resume."
+            )
     except Exception:  # noqa: BLE001
         return None  # Store error; fail open.
 
-    return None  # Checkpoint found; valid to resume.
+    return None  # Compounding checkpoint found; valid to resume.
 
 
 def _load_skip_completed_markers(
