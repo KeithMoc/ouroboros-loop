@@ -1030,6 +1030,99 @@ class TestPostmortemChain:
         assert POSTMORTEM_DEFAULT_K_FULL >= 1
         assert POSTMORTEM_DEFAULT_TOKEN_BUDGET > 0
 
+    # --- on_truncated callback (Q7 truncation event seam) ---
+
+    def test_on_truncated_callback_invoked_when_over_budget(self) -> None:
+        """on_truncated is called when to_prompt_text exceeds the char budget.
+
+        Verifies that the callback receives the correct positional arguments:
+        (dropped_count, char_budget, rendered_chars, full_forms_preserved,
+        cumulative_invariants_preserved).
+
+        This is the level_context.py side of the Q7 truncation event seam.
+        The serial executor converts these args into a structured event via
+        create_postmortem_chain_truncated_event.
+
+        Compounding ref: AC-2 [[INVARIANT: ACPostmortem.sub_postmortems preserves
+        structure in serialized chain]] — sub-postmortem content can inflate the
+        chain size and trigger this truncation path.
+
+        [[INVARIANT: Truncation event emitted alongside log.warning, not replacing it]]
+        """
+        # Build a large chain with many digest-eligible entries.
+        pms = tuple(_mk_pm(i, content=f"ac_content_{i}") for i in range(8))
+        recent = _mk_pm(8, content="recent_ac", invariants=("SOME_INVARIANT",))
+        chain = PostmortemChain(postmortems=pms + (recent,))
+
+        calls: list[tuple] = []
+
+        def _capture(*args: object) -> None:
+            calls.append(args)
+
+        # Force truncation with a very small budget (1 token = 4 chars).
+        chain.to_prompt_text(token_budget=1, k_full=1, on_truncated=_capture)
+
+        assert len(calls) == 1, "callback must be invoked exactly once when over budget"
+        dropped_count, char_budget, rendered_chars, full_forms, inv_count = calls[0]
+        assert dropped_count >= 0, "dropped_count must be non-negative"
+        assert char_budget > 0, "char_budget must reflect the token_budget * 4 factor"
+        assert rendered_chars > char_budget, (
+            "rendered_chars must exceed char_budget to confirm truncation"
+        )
+        assert full_forms == 1, "k_full=1 → 1 full-form entry preserved"
+        assert inv_count >= 0
+
+    def test_on_truncated_not_called_when_chain_fits(self) -> None:
+        """on_truncated is NOT called when the chain fits within the budget.
+
+        [[INVARIANT: no truncation event emitted when chain fits within budget]]
+        """
+        pms = tuple(_mk_pm(i) for i in range(3))
+        chain = PostmortemChain(postmortems=pms)
+
+        calls: list[tuple] = []
+        chain.to_prompt_text(
+            token_budget=8000,  # generous budget — no truncation
+            on_truncated=lambda *a: calls.append(a),
+        )
+
+        assert calls == [], "on_truncated must NOT be invoked when chain fits in budget"
+
+    def test_on_truncated_not_called_when_callback_is_none(self) -> None:
+        """No error when on_truncated=None (default) and chain overflows budget."""
+        pms = tuple(_mk_pm(i, content=f"ac_{i}") for i in range(5))
+        chain = PostmortemChain(postmortems=pms)
+
+        # Should not raise even when truncation occurs and callback is None.
+        result = chain.to_prompt_text(token_budget=1, on_truncated=None)
+        assert isinstance(result, str)
+
+    def test_on_truncated_callback_args_match_log_warning_fields(self) -> None:
+        """Callback args (dropped_count, char_budget, rendered_chars, full_forms,
+        inv_count) mirror the keyword args passed to log.warning at the same site.
+
+        This documents the positional contract so future refactors don't silently
+        swap arg order.
+        """
+        pms = tuple(_mk_pm(i, content=f"ac_{i}") for i in range(6))
+        chain = PostmortemChain(postmortems=pms)
+
+        captured: list[tuple] = []
+        chain.to_prompt_text(token_budget=1, k_full=2, on_truncated=lambda *a: captured.append(a))
+
+        assert len(captured) == 1
+        dropped, budget, rendered, full_forms, inv_ct = captured[0]
+        # Positional contract checks.
+        assert isinstance(dropped, int)
+        assert isinstance(budget, int)
+        assert isinstance(rendered, int)
+        assert isinstance(full_forms, int)
+        assert isinstance(inv_ct, int)
+        # Budget must equal token_budget * chars_per_token (4).
+        from ouroboros.orchestrator.level_context import _POSTMORTEM_CHARS_PER_TOKEN
+
+        assert budget == 1 * _POSTMORTEM_CHARS_PER_TOKEN
+
 
 class TestPostmortemSerialization:
     def test_empty_chain_roundtrip(self) -> None:
