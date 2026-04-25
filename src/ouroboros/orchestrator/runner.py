@@ -1723,6 +1723,12 @@ class OrchestratorRunner:
                 }
                 if externally_satisfied_acs:
                     parallel_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
+                # Thread resume_session_id through to the compounding executor.
+                # Without this, the compounding branch of _execute_parallel would
+                # NameError at runtime (the variable is referenced there but
+                # never bound in scope).
+                if resume_session_id is not None:
+                    parallel_kwargs["resume_session_id"] = resume_session_id
 
                 return await self._execute_parallel(**parallel_kwargs)
         except Exception as e:
@@ -2139,6 +2145,7 @@ class OrchestratorRunner:
         start_time: datetime,
         externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
         mode: str = "parallel",
+        resume_session_id: str | None = None,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute seed with parallel AC execution.
 

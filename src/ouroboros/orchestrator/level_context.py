@@ -603,12 +603,20 @@ class ACPostmortem:
     ac_native_session_id: str | None = None
     sub_postmortems: tuple["ACPostmortem", ...] = field(default_factory=tuple)
 
-    def to_digest(self) -> str:
+    def to_digest(self, *, min_reliability: float = 0.0) -> str:
         """Render a one-line digest for compressed display in the chain.
 
         Format: ``AC {n} [{status}]: {content} — files: a,b (+K more) | invariants: X, Y``
         For non-passing ACs, the first gotcha is appended instead of invariants
         when present, since gotchas are the anti-repeat signal.
+
+        Args:
+            min_reliability: Reliability gate applied to invariants in the
+                digest line.  Contradicted invariants
+                (``is_contradicted=True``) are always excluded.  Defaults to
+                0.0 (no filtering) when called standalone; the chain caller
+                passes the chain-level threshold for consistency with
+                :meth:`to_full_text` and :meth:`PostmortemChain.to_prompt_text`.
         """
         s = self.summary
         content = s.ac_content[:_POSTMORTEM_DIGEST_CONTENT_CHARS].rstrip()
@@ -624,11 +632,21 @@ class ACPostmortem:
 
         if self.status != "pass" and self.gotchas:
             parts.append(f"gotcha: {self.gotchas[0]}")
-        elif self.invariants_established:
-            inv_head = "; ".join(inv.text for inv in self.invariants_established[:2])
-            extra_inv = len(self.invariants_established) - 2
-            inv_str = inv_head + (f" (+{extra_inv} more)" if extra_inv > 0 else "")
-            parts.append(f"invariants: {inv_str}")
+        else:
+            # Apply the same reliability gate as to_full_text/to_prompt_text.
+            # Older entries render via to_digest, so without this filter
+            # below-threshold or contradicted invariants would leak back into
+            # the chain context — defeating the render gate.
+            visible_invs = tuple(
+                inv
+                for inv in self.invariants_established
+                if not inv.is_contradicted and inv.reliability >= min_reliability
+            )
+            if visible_invs:
+                inv_head = "; ".join(inv.text for inv in visible_invs[:2])
+                extra_inv = len(visible_invs) - 2
+                inv_str = inv_head + (f" (+{extra_inv} more)" if extra_inv > 0 else "")
+                parts.append(f"invariants: {inv_str}")
 
         return " | ".join(parts)
 
@@ -949,7 +967,9 @@ class PostmortemChain:
                 sections.extend(f"- {inv.text}" for inv in invariants)
             if digests:
                 sections.append("### Earlier ACs (digests)")
-                sections.extend(f"- {pm.to_digest()}" for pm in digests)
+                sections.extend(
+                    f"- {pm.to_digest(min_reliability=min_reliability)}" for pm in digests
+                )
             if full_entries:
                 sections.append("### Recent ACs (full postmortems)")
                 # Pass min_reliability so individual full-form sections apply the
@@ -970,8 +990,12 @@ class PostmortemChain:
             remaining.pop(0)
             text = _render(tuple(remaining))
 
-        if len(text) > char_budget:
-            dropped_count = len(digest_entries) - len(remaining)
+        # Compute truncation outside the over-budget branch: when the loop
+        # successfully shrunk the chain below budget by dropping entries, the
+        # caller still needs to know — otherwise telemetry only fires on the
+        # rare case where truncation FAILS to fit, which inverts the intent.
+        dropped_count = len(digest_entries) - len(remaining)
+        if dropped_count > 0:
             log.warning(
                 "postmortem_chain.over_budget",
                 rendered_chars=len(text),

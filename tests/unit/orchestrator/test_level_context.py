@@ -907,6 +907,55 @@ class TestACPostmortem:
         digest = pm.to_digest()
         assert "+7 more" in digest
 
+    def test_digest_filters_below_threshold_invariants(self) -> None:
+        """to_digest must apply the same reliability gate as to_full_text /
+        to_prompt_text — otherwise older entries (rendered as digests) would
+        leak below-threshold or contradicted invariants back into the chain
+        context, defeating the render gate.
+
+        [[INVARIANT: to_digest filters by min_reliability and excludes contradicted invariants]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            Invariant,
+        )
+
+        pm = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="Wire auth",
+                success=True,
+            ),
+            status="pass",
+            invariants_established=(
+                Invariant(text="HIGH_RELIABILITY", reliability=0.95, occurrences=2),
+                Invariant(text="LOW_RELIABILITY", reliability=0.3, occurrences=1),
+                Invariant(
+                    text="CONTRADICTED",
+                    reliability=0.0,
+                    occurrences=1,
+                    is_contradicted=True,
+                ),
+            ),
+        )
+
+        # Default threshold (0.0) — all non-contradicted invariants visible.
+        digest_open = pm.to_digest()
+        assert "HIGH_RELIABILITY" in digest_open
+        assert "LOW_RELIABILITY" in digest_open
+        assert "CONTRADICTED" not in digest_open  # always excluded
+
+        # Threshold 0.7 — drops the low-reliability one too.
+        digest_gated = pm.to_digest(min_reliability=0.7)
+        assert "HIGH_RELIABILITY" in digest_gated
+        assert "LOW_RELIABILITY" not in digest_gated
+        assert "CONTRADICTED" not in digest_gated
+
+        # All filtered → no invariants section in the digest at all.
+        digest_all_gated = pm.to_digest(min_reliability=1.1)
+        assert "invariants:" not in digest_all_gated
+
     def test_full_text_includes_all_sections(self) -> None:
         pm = _mk_pm(
             0,
@@ -1087,6 +1136,53 @@ class TestPostmortemChain:
         )
 
         assert calls == [], "on_truncated must NOT be invoked when chain fits in budget"
+
+    def test_on_truncated_called_when_drops_make_chain_fit(self) -> None:
+        """on_truncated MUST fire when entries are dropped, even if the final
+        chain fits within budget after the drops.
+
+        Regression for the bug where the callback was nested under a
+        ``len(text) > char_budget`` post-loop check, so a chain that
+        successfully shrunk under budget by dropping entries reported zero
+        truncation events — masking real telemetry.
+
+        [[INVARIANT: truncation event fires whenever dropped_count > 0,
+        regardless of whether final text fits within budget]]
+        """
+        from ouroboros.orchestrator.level_context import _POSTMORTEM_CHARS_PER_TOKEN
+
+        # Build a chain with several digest-eligible entries so dropping some
+        # meaningfully shrinks the rendered text.
+        pms = tuple(_mk_pm(i, content=f"ac_{i}_with_some_padding") for i in range(8))
+        recent = _mk_pm(8, content="r", invariants=("X",))
+        chain = PostmortemChain(postmortems=pms + (recent,))
+
+        # Measure the unbudgeted render to pick a budget that lands in the
+        # drops-but-fit zone deterministically across rendering tweaks.
+        unbudgeted = chain.to_prompt_text(k_full=1, token_budget=1_000_000)
+        full_size = len(unbudgeted)
+        # 70% of full size: large enough that dropping 1-2 oldest digests fits,
+        # small enough that the initial render exceeds the budget.
+        target_chars = (full_size * 7) // 10
+        token_budget = max(1, target_chars // _POSTMORTEM_CHARS_PER_TOKEN)
+
+        calls: list[tuple] = []
+        chain.to_prompt_text(
+            token_budget=token_budget,
+            k_full=1,
+            on_truncated=lambda *a: calls.append(a),
+        )
+
+        assert len(calls) == 1, (
+            f"Expected exactly one truncation callback; got {len(calls)}. "
+            f"full_size={full_size}, token_budget={token_budget}"
+        )
+        dropped_count, char_budget, rendered_chars, _, _ = calls[0]
+        assert dropped_count > 0, "must have dropped at least one entry"
+        assert rendered_chars <= char_budget, (
+            f"final text must fit within budget after drops; got "
+            f"rendered_chars={rendered_chars}, char_budget={char_budget}"
+        )
 
     def test_on_truncated_not_called_when_callback_is_none(self) -> None:
         """No error when on_truncated=None (default) and chain overflows budget."""

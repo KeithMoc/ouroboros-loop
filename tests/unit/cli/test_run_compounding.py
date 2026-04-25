@@ -358,6 +358,83 @@ class TestCompoundingResume:
         )
         assert captured.get("mode") == "compounding"
 
+    def test_execute_parallel_signature_threads_resume_session_id(self) -> None:
+        """Regression: _execute_parallel must accept resume_session_id and
+        execute_precreated_session must include it in parallel_kwargs when set.
+
+        The compounding branch of _execute_parallel references resume_session_id
+        directly. Without the parameter binding (and the caller forwarding it),
+        any --resume --compounding run would NameError.
+
+        [[INVARIANT: resume_session_id flows through OrchestratorRunner._execute_parallel]]
+        """
+        import ast
+        import inspect
+        from pathlib import Path
+
+        runner_src = (
+            Path(__file__).resolve().parents[3]
+            / "src"
+            / "ouroboros"
+            / "orchestrator"
+            / "runner.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(runner_src)
+
+        # 1. _execute_parallel must declare resume_session_id as a parameter.
+        execute_parallel_def = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "_execute_parallel"
+            ),
+            None,
+        )
+        assert execute_parallel_def is not None, "_execute_parallel not found"
+        param_names = {
+            arg.arg
+            for arg in (
+                *execute_parallel_def.args.args,
+                *execute_parallel_def.args.kwonlyargs,
+            )
+        }
+        assert "resume_session_id" in param_names, (
+            "_execute_parallel must accept resume_session_id; otherwise the "
+            "compounding branch's reference to it raises NameError at runtime."
+        )
+
+        # 2. execute_precreated_session must forward resume_session_id when set.
+        eps_def = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "execute_precreated_session"
+            ),
+            None,
+        )
+        assert eps_def is not None, "execute_precreated_session not found"
+        forwards_resume = False
+        eps_src = ast.unparse(eps_def)
+        # Cheap textual check: the body must mention parallel_kwargs and bind
+        # resume_session_id into it.  ast-level Subscript matching would be more
+        # rigorous but adds complexity for little additional safety.
+        forwards_resume = (
+            'parallel_kwargs["resume_session_id"]' in eps_src
+            or "parallel_kwargs['resume_session_id']" in eps_src
+        )
+        assert forwards_resume, (
+            "execute_precreated_session must forward resume_session_id into "
+            "parallel_kwargs (only when not None)."
+        )
+
+        # 3. Sanity: the actual function object exposes the parameter at runtime.
+        from ouroboros.orchestrator.runner import OrchestratorRunner
+
+        runtime_sig = inspect.signature(OrchestratorRunner._execute_parallel)
+        assert "resume_session_id" in runtime_sig.parameters
+
 
 class TestCompoundingResumeFreshSeedValidation:
     """Sub-AC 3 (b): Mutual exclusivity of --resume with fresh seed path.

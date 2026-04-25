@@ -765,8 +765,21 @@ async def _adjudicate_monolithic_resume(
             from ouroboros.config.loader import get_invariant_verifier_model
 
             model = get_invariant_verifier_model()
-        except Exception:  # noqa: BLE001
-            model = "claude-haiku-4-5"
+        except Exception as exc:  # noqa: BLE001
+            # Fall back to the same resolution path get_invariant_verifier_model
+            # uses internally (assertion-extraction model). Avoids drifting onto
+            # an unversioned model name that may not match adapter routing.
+            try:
+                from ouroboros.config.loader import get_assertion_extraction_model
+
+                model = get_assertion_extraction_model()
+            except Exception:  # noqa: BLE001
+                model = "claude-haiku-4-5-20251001"
+            log.warning(
+                "serial_executor.monolithic_resume.verifier_model_lookup_failed",
+                error=str(exc),
+                fallback_model=model,
+            )
 
     config = CompletionConfig(model=model, temperature=0.0, max_tokens=256)
     messages = [Message(role=MessageRole.USER, content=prompt)]
@@ -1005,6 +1018,17 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     store=self._checkpoint_store,
                     seed_id=seed.metadata.seed_id,
                 )
+            )
+        elif resume_session_id is not None:
+            # User asked to resume but no checkpoint store is configured. Without
+            # this warning, the resume request is silently ignored and the run
+            # starts fresh — surprising to anyone debugging why their --resume
+            # produced an unrelated execution.
+            log.warning(
+                "serial_executor.resume.checkpoint_store_unavailable",
+                resume_session_id=resume_session_id,
+                seed_id=seed.metadata.seed_id,
+                detail="--resume requested but checkpoint store is not configured; starting fresh",
             )
 
         results: list[ACExecutionResult] = []
@@ -1292,57 +1316,81 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 
             # Q3 (C-plus): Extract [[INVARIANT: ...]] tags inline-blocking before
             # chain advance so the next AC's prompt sees verified invariants.
-            # Scan final_message first; fall back to full message list.
-            inv_tags = extract_invariant_tags(result.final_message or "")
-            if not inv_tags and result.messages:
-                inv_tags = extract_invariant_tags(result.messages)
+            # Scan BOTH final_message and the full message stream — tags emitted
+            # mid-execution must not be dropped just because the final message
+            # also has tags.  extract_invariant_tags dedups internally; we then
+            # union the two sources by normalized key to preserve insertion
+            # order without re-rendering duplicates.
+            final_tags = extract_invariant_tags(result.final_message or "")
+            inv_tags: list[str] = list(final_tags)
+            if result.messages:
+                stream_tags = extract_invariant_tags(result.messages)
+                seen_norm = {" ".join(t.lower().split()) for t in inv_tags}
+                for tag in stream_tags:
+                    norm = " ".join(tag.lower().split())
+                    if norm and norm not in seen_norm:
+                        inv_tags.append(tag)
+                        seen_norm.add(norm)
 
-            if inv_tags:
-                verified_pairs = await verify_invariants(
-                    self._adapter,
-                    inv_tags,
-                    ac_trace=result.final_message or "",
-                    files_modified=list(postmortem.summary.files_modified),
-                )
-                min_rel = _get_min_reliability()
-                trusted: list[Invariant] = [
-                    Invariant(
-                        text=tag,
-                        reliability=score,
-                        occurrences=1,
-                        first_seen_ac_id=f"ac_{ac_index}",
+            if inv_tags or postmortem.sub_postmortems:
+                verified_pairs: list[tuple[str, float]] = []
+                if inv_tags:
+                    verified_pairs = list(
+                        await verify_invariants(
+                            self._adapter,
+                            inv_tags,
+                            ac_trace=result.final_message or "",
+                            files_modified=list(postmortem.summary.files_modified),
+                        )
                     )
-                    for tag, score in verified_pairs
-                    if score >= min_rel
-                ]
-                if trusted:
+
+                # Sub-AC invariants flatten upward (AC-2 B-prime extension):
+                # include each non-contradicted sub-postmortem invariant in the
+                # merge input so the parent's invariants_established reflects
+                # work done by decomposed sub-ACs.  merge_invariants handles
+                # re-declaration semantics (occurrence bumps, reliability blend).
+                sub_pairs: list[tuple[str, float]] = []
+                for sub_pm in postmortem.sub_postmortems:
+                    for sub_inv in sub_pm.invariants_established:
+                        if not sub_inv.is_contradicted:
+                            sub_pairs.append((sub_inv.text, sub_inv.reliability))
+
+                # Route through PostmortemChain.merge_invariants so re-declarations
+                # bump occurrences, blended reliability accumulates across ACs,
+                # and NOT-prefix contradictions are detected.  Below-threshold
+                # invariants are STILL stored — the render-gate in to_prompt_text
+                # filters them at display time per the seed's design.
+                merged = chain.merge_invariants(
+                    verified_pairs + sub_pairs,
+                    source_ac_id=f"ac_{ac_index}",
+                )
+                if merged:
                     postmortem = ACPostmortem(
                         summary=postmortem.summary,
                         diff_summary=postmortem.diff_summary,
                         tool_trace_digest=postmortem.tool_trace_digest,
                         gotchas=postmortem.gotchas,
                         qa_suggestions=postmortem.qa_suggestions,
-                        invariants_established=tuple(trusted),
+                        invariants_established=merged,
                         retry_attempts=postmortem.retry_attempts,
                         status=postmortem.status,
                         duration_seconds=postmortem.duration_seconds,
                         ac_native_session_id=postmortem.ac_native_session_id,
                         sub_postmortems=postmortem.sub_postmortems,
                     )
+                    min_rel = _get_min_reliability()
+                    above_threshold = sum(
+                        1 for inv in merged
+                        if not inv.is_contradicted and inv.reliability >= min_rel
+                    )
                     log.info(
                         "serial_executor.invariants.captured",
                         session_id=session_id,
                         ac_index=ac_index,
                         total_tags=len(inv_tags),
-                        trusted_count=len(trusted),
-                        min_reliability=min_rel,
-                    )
-                else:
-                    log.info(
-                        "serial_executor.invariants.all_below_threshold",
-                        session_id=session_id,
-                        ac_index=ac_index,
-                        total_tags=len(inv_tags),
+                        sub_invariants_merged=len(sub_pairs),
+                        merged_count=len(merged),
+                        above_threshold=above_threshold,
                         min_reliability=min_rel,
                     )
 

@@ -12,8 +12,11 @@ from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
 import click
+import structlog
 import typer
 import yaml
+
+log = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
@@ -835,6 +838,18 @@ def workflow(
             if _resume_error:
                 print_error(_resume_error)
                 raise typer.Exit(1)
+        else:
+            # Skipping the fresh-seed guard. _load_seed_id_from_yaml returns
+            # None when the YAML is unreadable or has no metadata.seed_id; the
+            # downstream Seed.from_dict parse in _run_orchestrator will surface
+            # the real error if the file is structurally bad. Log so a
+            # maintainer chasing "why didn't my --resume reject this seed?" can
+            # find the breadcrumb.
+            log.debug(
+                "cli.run.compounding_resume.fresh_seed_validation_skipped",
+                seed_file=str(seed_file),
+                reason="_load_seed_id_from_yaml returned None (no metadata.seed_id or unreadable)",
+            )
 
     if orchestrator or resume_session:
         # Orchestrator mode

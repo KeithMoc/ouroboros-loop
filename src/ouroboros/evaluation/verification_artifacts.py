@@ -342,9 +342,9 @@ def _render_compact_artifact(
     git_state_error: str | None,
     runs: tuple[VerificationRunArtifact, ...],
     history: CommittedHistoryCapture,
+    recent_commits: tuple[str, ...],
 ) -> str:
     integrated_run = next((run for run in runs if run.is_integrated), None)
-    recent_commits = _parse_recent_commits(history.recent_log)
     lines = [
         "# Verification Summary",
         f"Execution ID: {execution_id}",
@@ -388,8 +388,12 @@ def _render_compact_artifact(
                 *[f"- {commit}" for commit in recent_commits],
             ]
         )
-        if history.head_show_stat:
-            lines.extend(["", "## HEAD Commit Diff Stat", history.head_show_stat])
+
+    # HEAD diff stat is independent of recent_commits: when the log capture
+    # fails but the show capture succeeds (e.g. extremely shallow clones),
+    # the stat should still appear so the QA judge sees real change evidence.
+    if history.head_show_stat:
+        lines.extend(["", "## HEAD Commit Diff Stat", history.head_show_stat])
 
     for run in runs:
         lines.extend(["", *_render_run_summary(run)])
@@ -449,7 +453,9 @@ def _render_reference(
     if git_diff_stat:
         lines.extend(["", "## git diff --stat --find-renames", git_diff_stat])
     if history.recent_log:
-        lines.extend(["", "## git log --oneline -n 30", history.recent_log])
+        lines.extend(
+            ["", f"## git log --oneline -n {_RECENT_LOG_LIMIT}", history.recent_log]
+        )
     if history.head_show_stat:
         lines.extend(["", "## git show --stat HEAD", history.head_show_stat])
     if history.error and not history.available:
@@ -600,6 +606,7 @@ async def build_verification_artifacts(
         git_state_error,
         rendered_runs,
         history,
+        recent_commits,
     )
     reference = _render_reference(
         execution_id,

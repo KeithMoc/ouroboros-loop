@@ -620,6 +620,69 @@ class TestCommittedHistoryCapture:
         assert "abc1234 feat: shipped feature" in artifacts.artifact
 
     @pytest.mark.asyncio
+    async def test_head_show_stat_renders_without_recent_log(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A successful HEAD show with empty log (e.g. shallow clone) still renders.
+
+        Edge case: ``git log --oneline`` returns nothing but ``git show HEAD``
+        succeeds. Before the fix, the HEAD diff stat was nested under the
+        ``recent_commits`` block and got dropped — now it renders independently.
+        """
+        config = MechanicalConfig(timeout_seconds=30, working_dir=tmp_path)
+
+        head_show = (
+            "deadbeefdeadbeefdeadbeef\n"
+            "feat: shallow-only HEAD\n"
+            "\n"
+            "Keithm\n"
+            "\n"
+            " src/foo.py | 1 +\n"
+        )
+
+        async def fake_run_command(
+            command: tuple[str, ...],
+            timeout: int,  # noqa: ARG001
+            working_dir: Path | None = None,  # noqa: ARG001
+        ) -> CommandResult:
+            if command[:3] == ("git", "status", "--short"):
+                return CommandResult(0, "", "")
+            if command[:4] == ("git", "status", "--porcelain=v1", "-z"):
+                return CommandResult(0, "", "")
+            if command[:3] == ("git", "diff", "--stat"):
+                return CommandResult(0, "", "")
+            if command[:3] == ("git", "log", "--oneline"):
+                # Shallow clone: log unavailable / empty.
+                return CommandResult(0, "", "")
+            if command[:2] == ("git", "show"):
+                return CommandResult(0, head_show, "")
+            raise AssertionError(f"Unexpected command: {command}")
+
+        artifact_root = tmp_path / "artifact-store"
+        with (
+            patch(
+                "ouroboros.evaluation.verification_artifacts._ARTIFACT_BASE_DIR",
+                artifact_root,
+            ),
+            patch(
+                "ouroboros.evaluation.verification_artifacts.build_mechanical_config",
+                return_value=config,
+            ),
+            patch(
+                "ouroboros.evaluation.verification_artifacts.run_command",
+                new=AsyncMock(side_effect=fake_run_command),
+            ),
+        ):
+            artifacts = await build_verification_artifacts("exec_show_no_log", "done", tmp_path)
+
+        # Recent Commits section should NOT appear (no log).
+        assert "## Recent Commits" not in artifacts.artifact
+        # HEAD diff stat must still render — that's the whole point of the fix.
+        assert "## HEAD Commit Diff Stat" in artifacts.artifact
+        assert "src/foo.py | 1 +" in artifacts.artifact
+
+    @pytest.mark.asyncio
     async def test_history_capture_failure_is_non_fatal(
         self,
         tmp_path: Path,

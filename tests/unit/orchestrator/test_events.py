@@ -477,7 +477,12 @@ class TestPostmortemChainTruncatedEvent:
         datetime.fromisoformat(event.data["timestamp"])
 
     def test_zero_dropped_count_valid(self) -> None:
-        """dropped_count=0 is a valid (non-error) value — budget tight but not over."""
+        """The factory accepts dropped_count=0 as a valid input — constructor-level
+        validation, not runtime emission. At runtime, the level_context truncation
+        gate only invokes the callback (and thus this factory) when dropped_count
+        is strictly positive; this test simply asserts the factory itself does
+        not reject zero, in case a future caller passes the value verbatim.
+        """
         event = self._call(dropped_count=0, rendered_chars=7999)
         assert event.data["dropped_count"] == 0
         assert event.type == "execution.postmortem_chain.truncated"
