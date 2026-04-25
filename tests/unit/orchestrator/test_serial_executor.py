@@ -2315,3 +2315,624 @@ class TestTruncationEvent:
         assert trunc_events == [], (
             f"Unexpected truncation events with default budget; got: {trunc_events}"
         )
+
+
+class TestResumeCorrectness:
+    """Sub-AC 3: Resume correctness — rehydrated chain identity and AC skip/execute semantics.
+
+    These tests verify that when execute_serial is invoked with resume_session_id:
+    1. Completed ACs (index <= last_completed_ac_index) are skipped.
+    2. Remaining ACs are executed normally.
+    3. The rehydrated postmortem chain is field-identical to the original
+       (all postmortem fields — including sub_postmortems and Invariant objects —
+       survive the checkpoint round-trip without mutation or loss).
+
+    Compounding context:
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — chain serialization round-trip verified.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — sub-postmortems survive round-trips.
+    - AC-3 established [[INVARIANT: invariants_established is now
+      tuple[Invariant, ...] not tuple[str, ...]]] — Invariant objects with
+      reliability and occurrences must survive checkpoint round-trips.
+    - Sub-AC 1 established [[INVARIANT: deserialized chain is injected before
+      the AC loop so resumed ACs see prior postmortems]].
+    - Sub-AC 2's checkpoint writing ensures per-AC checkpoints include full
+      chain state [[INVARIANT: CompoundingCheckpointState.last_completed_ac_index
+      equals the 0-based AC index]].
+
+    [[INVARIANT: checkpoint round-trip preserves all ACPostmortem fields including
+    Invariant objects, sub_postmortems, gotchas, and files_modified]]
+    [[INVARIANT: resume skips ACs with index <= last_completed_ac_index and executes the rest]]
+    """
+
+    def _make_executor_with_real_store(
+        self, tmp_path: Path
+    ) -> tuple[SerialCompoundingExecutor, Any]:
+        """Build an executor with a real CheckpointStore backed by tmp_path."""
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, store
+
+    def test_rehydrated_chain_is_field_identical_to_original(
+        self, tmp_path: Path
+    ) -> None:
+        """The deserialized chain from a checkpoint is field-identical to the original.
+
+        Builds a rich postmortem with:
+        - files_modified (multiple files)
+        - gotchas (multiple)
+        - invariants_established with Invariant objects (reliability, occurrences,
+          first_seen_ac_id, is_contradicted)
+        - sub_postmortems (nested ACPostmortem)
+
+        After write → load via _write_compounding_checkpoint + _load_compounding_checkpoint,
+        every field must be equal to the original.
+
+        Compounding reference: AC-2 proved sub_postmortems round-trip; AC-3 proved
+        Invariant objects serialize/deserialize. This test combines all fields in a
+        single checkpoint round-trip — the most complete identity check.
+
+        [[INVARIANT: checkpoint round-trip preserves all ACPostmortem fields including
+        Invariant objects, sub_postmortems, gotchas, and files_modified]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            Invariant,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _load_compounding_checkpoint,
+            _write_compounding_checkpoint,
+        )
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        # Build a sub-postmortem for the parent's sub_postmortems field.
+        sub_summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Sub task: extract schema",
+            success=True,
+            files_modified=("src/schema.py", "src/schema_types.py"),
+            public_api="SchemaExtractor",
+        )
+        sub_pm = ACPostmortem(
+            summary=sub_summary,
+            status="pass",
+            gotchas=("schema must be frozen",),
+            invariants_established=(
+                Invariant(
+                    text="schema extraction is idempotent",
+                    reliability=0.88,
+                    occurrences=1,
+                    first_seen_ac_id="ac_0_sub",
+                    is_contradicted=False,
+                ),
+            ),
+        )
+
+        # Build the main postmortem with multiple invariants (including a
+        # contradicted one) and the sub-postmortem above.
+        main_summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Implement the data pipeline",
+            success=True,
+            files_modified=("src/pipeline.py", "src/pipeline_utils.py", "tests/test_pipeline.py"),
+            tools_used=("Read", "Write", "Bash"),
+            key_output="Pipeline implemented with 3 stages",
+            public_api="run_pipeline, PipelineStage",
+        )
+        trusted_inv = Invariant(
+            text="pipeline stages run in topological order",
+            reliability=0.92,
+            occurrences=2,
+            first_seen_ac_id="ac_0",
+            is_contradicted=False,
+        )
+        contradicted_inv = Invariant(
+            text="pipeline is synchronous",
+            reliability=0.0,
+            occurrences=1,
+            first_seen_ac_id="ac_0",
+            is_contradicted=True,
+        )
+        main_pm = ACPostmortem(
+            summary=main_summary,
+            diff_summary="+ 240 lines pipeline logic",
+            tool_trace_digest="Read x5, Write x3, Bash x2",
+            gotchas=("async pipeline needs special error handling", "don't use global state"),
+            qa_suggestions=("add integration test for stage ordering",),
+            invariants_established=(trusted_inv, contradicted_inv),
+            retry_attempts=1,
+            status="pass",
+            duration_seconds=42.5,
+            ac_native_session_id="native_sess_abc",
+            sub_postmortems=(sub_pm,),
+        )
+
+        original_chain = PostmortemChain(postmortems=(main_pm,))
+
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id="seed_identity_test",
+            session_id="sess_identity",
+            ac_index=0,
+            chain=original_chain,
+        )
+
+        loaded_chain, last_idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="seed_identity_test",
+            session_id="sess_identity_new",
+            resume_session_id="sess_identity",
+        )
+
+        assert last_idx == 0, f"Expected last_completed_ac_index=0, got {last_idx}"
+        assert len(loaded_chain.postmortems) == 1
+
+        loaded_pm = loaded_chain.postmortems[0]
+
+        # --- ACContextSummary fields ---
+        assert loaded_pm.summary.ac_index == 0
+        assert loaded_pm.summary.ac_content == "Implement the data pipeline"
+        assert loaded_pm.summary.success is True
+        assert set(loaded_pm.summary.files_modified) == {
+            "src/pipeline.py", "src/pipeline_utils.py", "tests/test_pipeline.py"
+        }
+        assert loaded_pm.summary.public_api == "run_pipeline, PipelineStage"
+        assert loaded_pm.summary.key_output == "Pipeline implemented with 3 stages"
+
+        # --- ACPostmortem scalar fields ---
+        assert loaded_pm.diff_summary == "+ 240 lines pipeline logic"
+        assert loaded_pm.tool_trace_digest == "Read x5, Write x3, Bash x2"
+        assert loaded_pm.status == "pass"
+        assert loaded_pm.retry_attempts == 1
+        assert abs(loaded_pm.duration_seconds - 42.5) < 1e-6
+        assert loaded_pm.ac_native_session_id == "native_sess_abc"
+
+        # --- gotchas and qa_suggestions ---
+        assert "async pipeline needs special error handling" in loaded_pm.gotchas
+        assert "don't use global state" in loaded_pm.gotchas
+        assert "add integration test for stage ordering" in loaded_pm.qa_suggestions
+
+        # --- Invariant objects: all fields preserved ---
+        assert len(loaded_pm.invariants_established) == 2
+
+        # Find the trusted invariant by text.
+        loaded_trusted = next(
+            (i for i in loaded_pm.invariants_established
+             if "topological order" in i.text),
+            None,
+        )
+        assert loaded_trusted is not None, "Trusted invariant not found in loaded chain"
+        assert loaded_trusted.text == "pipeline stages run in topological order"
+        assert abs(loaded_trusted.reliability - 0.92) < 1e-6
+        assert loaded_trusted.occurrences == 2
+        assert loaded_trusted.first_seen_ac_id == "ac_0"
+        assert loaded_trusted.is_contradicted is False
+
+        # The contradicted invariant should also survive.
+        loaded_contradicted = next(
+            (i for i in loaded_pm.invariants_established
+             if "synchronous" in i.text),
+            None,
+        )
+        assert loaded_contradicted is not None, "Contradicted invariant not found in loaded chain"
+        assert loaded_contradicted.is_contradicted is True
+        assert abs(loaded_contradicted.reliability - 0.0) < 1e-6
+
+        # --- sub_postmortems: nested structure preserved ---
+        assert len(loaded_pm.sub_postmortems) == 1
+        loaded_sub = loaded_pm.sub_postmortems[0]
+        assert loaded_sub.summary.ac_content == "Sub task: extract schema"
+        assert "src/schema.py" in loaded_sub.summary.files_modified
+        assert "schema must be frozen" in loaded_sub.gotchas
+        assert len(loaded_sub.invariants_established) == 1
+        loaded_sub_inv = loaded_sub.invariants_established[0]
+        assert loaded_sub_inv.text == "schema extraction is idempotent"
+        assert abs(loaded_sub_inv.reliability - 0.88) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_partial_checkpoint_2ac_of_3_skips_completed_executes_remaining(
+        self, tmp_path: Path
+    ) -> None:
+        """Create a partial checkpoint (ACs 0+1 done), resume 3-AC run, assert AC 2 executes.
+
+        Setup:
+        - A 3-AC seed.
+        - A checkpoint with last_completed_ac_index=1 (ACs 0 and 1 complete).
+        - The checkpoint chain has rich postmortems for ACs 0 and 1.
+
+        Assertions:
+        - ACs 0 and 1 are NOT executed (skipped via checkpoint).
+        - AC 2 IS executed.
+        - AC 2's context_override contains content from BOTH AC 0 and AC 1 postmortems.
+        - Result has 3 entries (2 SATISFIED_EXTERNALLY + 1 SUCCEEDED).
+
+        Compounding reference: the checkpoint payload stores the complete
+        PostmortemChain (established in AC-1 Q6.1), including sub_postmortems
+        (AC-2 B-prime) and Invariant objects (AC-3 C-plus), ensuring the
+        context AC 2 receives is as rich as possible.
+
+        [[INVARIANT: resume skips ACs with index <= last_completed_ac_index and executes the rest]]
+        [[INVARIANT: deserialized chain is injected before the AC loop so resumed ACs see prior postmortems]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            Invariant,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionOutcome
+
+        seed = _make_seed(
+            "AC 0: implement auth module",
+            "AC 1: implement user service",
+            "AC 2: implement API layer",
+        )
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Build a rich prior chain for ACs 0 and 1.
+        pm_ac0 = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="AC 0: implement auth module",
+                success=True,
+                files_modified=("src/auth.py", "tests/test_auth.py"),
+            ),
+            status="pass",
+            gotchas=("JWT tokens expire after 1 hour",),
+            invariants_established=(
+                Invariant(
+                    text="all API routes require auth header",
+                    reliability=0.95,
+                    occurrences=1,
+                    first_seen_ac_id="ac_0",
+                ),
+            ),
+        )
+        pm_ac1 = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=1,
+                ac_content="AC 1: implement user service",
+                success=True,
+                files_modified=("src/user_service.py",),
+            ),
+            status="pass",
+            gotchas=("UserService depends on AuthModule being initialized first",),
+            invariants_established=(
+                Invariant(
+                    text="UserService.create() validates email uniqueness",
+                    reliability=0.90,
+                    occurrences=1,
+                    first_seen_ac_id="ac_1",
+                ),
+            ),
+        )
+        prior_chain = PostmortemChain(postmortems=(pm_ac0, pm_ac1))
+
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_session_partial",
+            ac_index=1,  # last_completed = AC 1 (0-based)
+            chain=prior_chain,
+        )
+
+        executed_indices: list[int] = []
+        captured_overrides: list[str] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,), (2,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_session_partial",
+            execution_id="exec_partial_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_partial",
+        )
+
+        # Only AC 2 was executed — ACs 0 and 1 were skipped.
+        assert executed_indices == [2], (
+            f"Only AC 2 should execute; executed: {executed_indices}"
+        )
+
+        # AC 2's context_override must reference BOTH prior ACs.
+        assert len(captured_overrides) == 1
+        ac2_override = captured_overrides[0]
+        assert "AC 0: implement auth module" in ac2_override, (
+            "AC 2 context must include AC 0's postmortem"
+        )
+        assert "AC 1: implement user service" in ac2_override, (
+            "AC 2 context must include AC 1's postmortem"
+        )
+        assert "JWT tokens expire after 1 hour" in ac2_override, (
+            "AC 2 context must include AC 0's gotchas from the loaded chain"
+        )
+        assert "UserService depends on AuthModule" in ac2_override, (
+            "AC 2 context must include AC 1's gotchas from the loaded chain"
+        )
+
+        # Result structure: 3 entries total.
+        assert len(result.results) == 3
+
+        # ACs 0 and 1: SATISFIED_EXTERNALLY (skipped via checkpoint).
+        assert result.results[0].outcome == ACExecutionOutcome.SATISFIED_EXTERNALLY
+        assert result.results[1].outcome == ACExecutionOutcome.SATISFIED_EXTERNALLY
+
+        # AC 2: SUCCEEDED.
+        assert result.results[2].outcome == ACExecutionOutcome.SUCCEEDED
+        assert result.results[2].success is True
+
+    @pytest.mark.asyncio
+    async def test_resume_chain_includes_invariants_in_resumed_context(
+        self, tmp_path: Path
+    ) -> None:
+        """Invariants from the prior run appear in the resumed AC's context.
+
+        When the saved chain has Invariants in invariants_established, they
+        must appear in the 'Established Invariants' section of the resumed
+        AC's context_override after the chain is rehydrated.
+
+        Compounding references:
+        - AC-3 established [[INVARIANT: only above-threshold invariants appear
+          in downstream chain context]] — verified invariants propagate.
+        - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+          structure in serialized chain]] — full chain state survives.
+
+        [[INVARIANT: checkpoint round-trip preserves all ACPostmortem fields including
+        Invariant objects, sub_postmortems, gotchas, and files_modified]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            Invariant,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+
+        seed = _make_seed("AC 0 with invariant", "AC 1 resumed sees invariant")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # AC 0 postmortem with a high-reliability invariant.
+        INVARIANT_TEXT = "serialize_postmortem_chain produces a stable list"
+        pm_ac0 = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="AC 0 with invariant",
+                success=True,
+                files_modified=("src/level_context.py",),
+            ),
+            status="pass",
+            invariants_established=(
+                Invariant(
+                    text=INVARIANT_TEXT,
+                    reliability=0.95,
+                    occurrences=1,
+                    first_seen_ac_id="ac_0",
+                ),
+            ),
+        )
+        prior_chain = PostmortemChain(postmortems=(pm_ac0,))
+
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_inv_session",
+            ac_index=0,
+            chain=prior_chain,
+        )
+
+        captured_overrides: list[str] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="resumed_inv_session",
+            execution_id="exec_inv_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_inv_session",
+        )
+
+        # AC 1's context must include the invariant from the prior run.
+        assert len(captured_overrides) == 1, (
+            f"Only AC 1 should execute; got {len(captured_overrides)} overrides"
+        )
+        ac1_override = captured_overrides[0]
+
+        # The invariant must appear in the 'Established Invariants' section.
+        established_idx = ac1_override.find("Established Invariants")
+        assert established_idx != -1, (
+            f"'Established Invariants' section must be present in resumed AC context; "
+            f"override snippet:\n{ac1_override[:500]}"
+        )
+        established_section = ac1_override[established_idx:]
+        assert INVARIANT_TEXT in established_section, (
+            f"Invariant from prior run must appear in 'Established Invariants' section "
+            f"of resumed AC's context; section was:\n{established_section[:500]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_resume_flow_end_to_end_with_real_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end test: first run writes checkpoint; second run resumes from it.
+
+        Simulates the real workflow:
+        1. First execute_serial run (3 ACs, all succeed) — writes per-AC checkpoints.
+        2. The run is interrupted after AC 1 (by monkeypatching the store to raise
+           an error for AC 2, which makes the second "run" start from AC 2).
+        3. A second execute_serial run resumes from the first run's checkpoint —
+           only AC 2 executes, and its context_override includes postmortems for
+           ACs 0 and 1 from the first run.
+
+        This is the closest to a production resume scenario: the checkpoint was
+        written by the executor itself (not manually), and the resume uses that
+        checkpoint to skip the completed ACs.
+
+        Compounding references:
+        - AC-1: end-of-run artifact (Q6.1) — both runs produce artifacts.
+        - AC-2: sub_postmortems preserved in checkpoints.
+        - AC-3: invariant verifier runs inline before chain advance, so
+          invariants in the chain come from the real verify_invariants path.
+
+        [[INVARIANT: resume skips ACs with index <= last_completed_ac_index and executes the rest]]
+        [[INVARIANT: checkpoint round-trip preserves all ACPostmortem fields including
+        Invariant objects, sub_postmortems, gotchas, and files_modified]]
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        # Suppress invariant verification (no real Haiku calls in unit tests).
+        async def fake_verify(
+            adapter: Any,
+            tags: list[str],
+            **kwargs: Any,
+        ) -> list[tuple[str, float]]:
+            # Accept all tags at high reliability.
+            return [(tag, 0.9) for tag in tags]
+
+        monkeypatch.setattr(serial_mod, "verify_invariants", fake_verify)
+
+        # Use a custom artifact dir so the test doesn't pollute docs/brainstorm/.
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        seed = _make_seed(
+            "AC 0: write data model",
+            "AC 1: write service layer",
+            "AC 2: write API endpoints",
+        )
+
+        # ---- First run: ACs 0 and 1 succeed, AC 2 fails ----
+        event_store_1, _ = _make_replaying_event_store()
+        executor_1 = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store_1,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor_1._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        call_count_1: list[int] = []
+
+        async def fake_single_ac_run1(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            call_count_1.append(ac_index)
+            if ac_index == 2:
+                # Simulate AC 2 failing in the first run.
+                return _fail_result(
+                    ac_index, str(kwargs["ac_content"]), error="timeout in run 1"
+                )
+            return _ok_result(
+                ac_index,
+                str(kwargs["ac_content"]),
+                final_message=f"AC {ac_index} done [[INVARIANT: ac{ac_index} outputs stable]]",
+                files_written=(f"src/ac{ac_index}.py",),
+            )
+
+        executor_1._execute_single_ac = fake_single_ac_run1  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,), (2,))
+        result_1 = await executor_1.execute_serial(
+            seed=seed,
+            session_id="session_run1",
+            execution_id="exec_run1",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        # First run: ACs 0 and 1 succeeded, AC 2 failed.
+        assert result_1.success_count == 2
+        assert result_1.failure_count == 1
+        assert call_count_1 == [0, 1, 2], f"Expected [0, 1, 2] called; got {call_count_1}"
+
+        # ---- Second run: resume from session_run1 ----
+        event_store_2, _ = _make_replaying_event_store()
+        executor_2 = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store_2,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor_2._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+
+        call_count_2: list[int] = []
+        captured_overrides_2: list[str] = []
+
+        async def fake_single_ac_run2(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            call_count_2.append(ac_index)
+            captured_overrides_2.append(kwargs.get("context_override") or "")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor_2._execute_single_ac = fake_single_ac_run2  # type: ignore[method-assign]
+
+        result_2 = await executor_2.execute_serial(
+            seed=seed,
+            session_id="session_run2",
+            execution_id="exec_run2",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="session_run1",
+        )
+
+        # Second run: only AC 2 was executed (ACs 0 and 1 were checkpointed).
+        assert call_count_2 == [2], (
+            f"Only AC 2 should execute in the resumed run; got {call_count_2}"
+        )
+
+        # AC 2's context must include postmortems from the first run.
+        assert len(captured_overrides_2) == 1
+        ac2_context = captured_overrides_2[0]
+        assert "AC 0: write data model" in ac2_context, (
+            "Resumed AC 2 must see AC 0's postmortem from the first run"
+        )
+        assert "AC 1: write service layer" in ac2_context, (
+            "Resumed AC 2 must see AC 1's postmortem from the first run"
+        )
+
+        # Overall second run result.
+        assert len(result_2.results) == 3
+        assert result_2.success_count >= 1  # At least AC 2 succeeded in run 2.
