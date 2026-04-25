@@ -657,7 +657,8 @@ def _build_monolithic_resume_decision_prompt(
 
     [[INVARIANT: monolithic resume prompt always includes the literal text DECISION: continue and DECISION: restart as options]]
     """
-    context_block = context_section.strip() if context_section else "(No prior context recorded)"
+    stripped = context_section.strip() if context_section else ""
+    context_block = stripped if stripped else "(No prior context recorded)"
     return (
         "You are resuming an interrupted AI workflow task.\n\n"
         "## Original Task (Acceptance Criterion)\n\n"
