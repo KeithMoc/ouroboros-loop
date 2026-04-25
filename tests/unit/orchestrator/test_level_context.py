@@ -1983,6 +1983,55 @@ class TestBuildSystemPromptInvariantSection:
         prompt_explicit_false = build_system_prompt(seed, include_invariant_instructions=False)  # type: ignore[arg-type]
         assert prompt_default == prompt_explicit_false
 
+    def test_compounding_call_site_passes_flag_true(self) -> None:
+        """Regression: the compounding branch in OrchestratorRunner._run_orchestrator
+        must pass include_invariant_instructions=True so the agent is told to emit
+        ``[[INVARIANT: ...]]`` tags. The parameter exists; this test catches the
+        case where the runner forgets to flip it (the gap surfaced by the QA
+        verdict on the phase-1.5 dogfood).
+        """
+        import ast
+        from pathlib import Path
+
+        runner_src = (
+            Path(__file__).resolve().parents[3] / "src" / "ouroboros" / "orchestrator" / "runner.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(runner_src)
+
+        # Find every call to build_system_prompt where include_claude_md=True
+        # is passed (the marker for the compounding-mode call site, per the
+        # AC-3 seed: "compounding system prompt builder ... with include_claude_md").
+        found_compounding_call_with_flag = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = (
+                func.attr if isinstance(func, ast.Attribute)
+                else func.id if isinstance(func, ast.Name)
+                else None
+            )
+            if name != "build_system_prompt":
+                continue
+            kwargs = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+            includes_claude_md = (
+                isinstance(kwargs.get("include_claude_md"), ast.Constant)
+                and kwargs["include_claude_md"].value is True
+            )
+            includes_invariants = (
+                isinstance(kwargs.get("include_invariant_instructions"), ast.Constant)
+                and kwargs["include_invariant_instructions"].value is True
+            )
+            if includes_claude_md and includes_invariants:
+                found_compounding_call_with_flag = True
+                break
+
+        assert found_compounding_call_with_flag, (
+            "Compounding call site of build_system_prompt is missing "
+            "include_invariant_instructions=True; the agent will not be "
+            "instructed to emit [[INVARIANT: ...]] tags."
+        )
+
 
 # ---------------------------------------------------------------------------
 # AC-3 (Q3 render gate) — reliability-threshold filter in to_prompt_text()

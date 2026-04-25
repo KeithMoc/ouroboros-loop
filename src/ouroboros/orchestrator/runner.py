@@ -1679,6 +1679,7 @@ class OrchestratorRunner:
                     strategy=strategy,
                     include_claude_md=True,
                     workspace_root=workspace_root,
+                    include_invariant_instructions=True,
                 )
             else:
                 system_prompt = build_system_prompt(seed, strategy=strategy)
@@ -2303,6 +2304,7 @@ class OrchestratorRunner:
         final_message = render_parallel_completion_message(
             parallel_result,
             len(seed.acceptance_criteria),
+            mode=mode,
         )
         verification_report = render_parallel_verification_report(
             parallel_result,
@@ -2343,10 +2345,15 @@ class OrchestratorRunner:
                 execution_summary,
             )
 
+            _completion_title = (
+                "[green]Compounding Execution Completed[/green]"
+                if mode == "compounding"
+                else "[green]Parallel Execution Completed[/green]"
+            )
             self._console.print(
                 Panel(
                     Text(final_message, style="green"),
-                    title="[green]Parallel Execution Completed[/green]",
+                    title=_completion_title,
                     border_style="green",
                 )
             )
