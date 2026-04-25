@@ -729,6 +729,54 @@ def _chain_of_one(postmortem: ACPostmortem):
     return PostmortemChain(postmortems=(postmortem,))
 
 
+def create_sub_postmortem_resume_event(
+    session_id: str,
+    execution_id: str,
+    *,
+    ac_index: int,
+    sub_acs_completed: int,
+    resume_from_sub_ac: int,
+) -> BaseEvent:
+    """Create sub-postmortem resume event (Q6.2 sub-postmortem path).
+
+    Emitted when a resume run detects that the failing AC had sub-postmortems
+    from a prior partial decomposition (B-prime, AC-2).  The event records the
+    AC boundary decision so downstream consumers can trace why a particular
+    sub-AC was the starting point.
+
+    The event coexists with the log line emitted by the serial executor and
+    does NOT replace it.
+
+    Args:
+        session_id: Parent session id.
+        execution_id: Parent execution id.
+        ac_index: 0-based index of the AC being resumed.
+        sub_acs_completed: Number of sub-ACs that were already completed in
+            the prior partial run.
+        resume_from_sub_ac: 0-based index of the first sub-AC that still needs
+            to be executed (= sub_acs_completed, since sub-ACs are 0-indexed).
+
+    Returns:
+        BaseEvent for the sub-postmortem resume decision.
+
+    [[INVARIANT: sub-postmortem resume event type is execution.serial.resume.sub_postmortem_boundary]]
+    [[INVARIANT: resume_from_sub_ac == sub_acs_completed (no gaps, boundary is first incomplete sub-AC)]]
+    """
+    return BaseEvent(
+        type="execution.serial.resume.sub_postmortem_boundary",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data={
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "ac_index": ac_index,
+            "sub_acs_completed": sub_acs_completed,
+            "resume_from_sub_ac": resume_from_sub_ac,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 def create_execution_terminal_event(
     execution_id: str,
     session_id: str,
@@ -770,6 +818,7 @@ def create_execution_terminal_event(
 __all__ = [
     "create_ac_postmortem_captured_event",
     "create_postmortem_chain_truncated_event",
+    "create_sub_postmortem_resume_event",
     "create_ac_stall_detected_event",
     "create_drift_measured_event",
     "create_execution_terminal_event",

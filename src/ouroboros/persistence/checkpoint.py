@@ -63,21 +63,41 @@ class CompoundingCheckpointState:
             Stored as a list of dicts so no import cycle is introduced here.
         mode: Literal sentinel ``"compounding"`` — asserts which executor wrote
             the checkpoint.
+        partial_failing_ac_index: When set, the 0-based index of a decomposed AC
+            that failed after some of its sub-ACs completed.  Used by the sub-
+            postmortem resume path to identify which AC to resume and at which
+            sub-AC boundary.  ``None`` when no partial sub-AC state exists.
+        partial_failing_ac_sub_postmortems: Serialized sub-postmortems for the
+            completed sub-ACs of the partially-failed AC indicated by
+            ``partial_failing_ac_index``.  Each entry is a dict produced by
+            :func:`~ouroboros.orchestrator.level_context.serialize_postmortem_chain`
+            for a single sub-AC postmortem.  ``None`` when not applicable.
 
     [[INVARIANT: CompoundingCheckpointState.mode is always the literal "compounding"]]
+    [[INVARIANT: partial_failing_ac_index is set only for decomposed ACs with sub_results]]
     """
 
     last_completed_ac_index: int
     postmortem_chain: list[dict[str, Any]]
+    # Optional: partial sub-AC progress for a failing decomposed AC.
+    # Both fields are always set together (both None or both non-None).
+    partial_failing_ac_index: int | None = None
+    partial_failing_ac_sub_postmortems: list[dict[str, Any]] | None = None
     mode: str = field(default="compounding", init=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to a JSON-serializable dict suitable for ``CheckpointData.state``."""
-        return {
+        d: dict[str, Any] = {
             "last_completed_ac_index": self.last_completed_ac_index,
             "postmortem_chain": self.postmortem_chain,
             "mode": self.mode,
         }
+        if self.partial_failing_ac_index is not None:
+            d["partial_failing_ac_index"] = self.partial_failing_ac_index
+            d["partial_failing_ac_sub_postmortems"] = (
+                self.partial_failing_ac_sub_postmortems or []
+            )
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CompoundingCheckpointState":
@@ -99,9 +119,17 @@ class CompoundingCheckpointState:
             )
         if "last_completed_ac_index" not in data:
             raise ValueError("Missing required key 'last_completed_ac_index'")
+        # Parse optional partial sub-AC fields.
+        partial_ac_index: int | None = None
+        partial_sub_pms: list[dict[str, Any]] | None = None
+        if "partial_failing_ac_index" in data and data["partial_failing_ac_index"] is not None:
+            partial_ac_index = int(data["partial_failing_ac_index"])
+            partial_sub_pms = list(data.get("partial_failing_ac_sub_postmortems") or [])
         obj = cls(
             last_completed_ac_index=int(data["last_completed_ac_index"]),
             postmortem_chain=list(data.get("postmortem_chain") or []),
+            partial_failing_ac_index=partial_ac_index,
+            partial_failing_ac_sub_postmortems=partial_sub_pms,
         )
         return obj
 

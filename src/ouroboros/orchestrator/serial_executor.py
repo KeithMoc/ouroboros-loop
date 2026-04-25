@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 from ouroboros.orchestrator.events import (
     create_ac_postmortem_captured_event,
     create_postmortem_chain_truncated_event,
+    create_sub_postmortem_resume_event,
 )
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
@@ -450,6 +451,187 @@ def _write_compounding_checkpoint(
         )
 
 
+def _write_partial_sub_ac_checkpoint(
+    store: Any,
+    *,
+    seed_id: str,
+    session_id: str,
+    ac_index: int,
+    sub_postmortems: tuple["ACPostmortem", ...],
+    base_chain: "PostmortemChain",
+    last_completed_ac_index: int,
+) -> None:
+    """Write a partial sub-AC state checkpoint after a decomposed AC fails.
+
+    Called when a decomposed AC fails but some sub-ACs completed.  The
+    checkpoint advances *neither* ``last_completed_ac_index`` (the failing AC
+    is NOT counted as done) nor the ``postmortem_chain`` (the failing AC's
+    postmortem is excluded); but it records which sub-ACs completed so a
+    subsequent resume can skip them.
+
+    The sub-postmortem context is included in the context_override of the
+    resumed AC by :func:`_build_sub_postmortem_resume_context`.
+
+    Failures are caught and logged so a write error never propagates.
+
+    Args:
+        store: :class:`~ouroboros.persistence.checkpoint.CheckpointStore`
+            instance (or any object with a ``write`` method accepting a
+            :class:`~ouroboros.persistence.checkpoint.CheckpointData`).
+        seed_id: Seed identifier used as the checkpoint key.
+        session_id: Session identifier — included in log context only.
+        ac_index: 0-based index of the failing AC (partial sub-AC progress).
+        sub_postmortems: Sub-postmortems for completed sub-ACs.
+        base_chain: The postmortem chain up to (but not including) the
+            failing AC.  The chain is NOT advanced in this checkpoint write.
+        last_completed_ac_index: The last fully-completed AC index (unchanged
+            because the failing AC did not succeed).
+
+    [[INVARIANT: partial sub-AC checkpoint does NOT advance last_completed_ac_index]]
+    [[INVARIANT: partial sub-AC checkpoint is written only when sub_results is non-empty]]
+    """
+    from ouroboros.orchestrator.level_context import PostmortemChain
+
+    try:
+        # Serialize each sub-postmortem independently using serialize_postmortem_chain
+        # on a single-element chain to reuse the existing format.
+        serialized_subs: list[dict] = []
+        for sub_pm in sub_postmortems:
+            sub_chain = PostmortemChain(postmortems=(sub_pm,))
+            entries = serialize_postmortem_chain(sub_chain)
+            if entries:
+                serialized_subs.append(entries[0])
+
+        serialized_base_chain = serialize_postmortem_chain(base_chain)
+        state = CompoundingCheckpointState(
+            last_completed_ac_index=last_completed_ac_index,
+            postmortem_chain=serialized_base_chain,
+            partial_failing_ac_index=ac_index,
+            partial_failing_ac_sub_postmortems=serialized_subs,
+        )
+        checkpoint = CheckpointData.create(
+            seed_id=seed_id,
+            phase="execution",
+            state=state.to_dict(),
+        )
+        result = store.write(checkpoint)
+        if result.is_err:
+            log.warning(
+                "serial_executor.partial_checkpoint.write_failed",
+                session_id=session_id,
+                ac_index=ac_index,
+                error=str(result.error),
+            )
+        else:
+            log.info(
+                "serial_executor.partial_checkpoint.written",
+                session_id=session_id,
+                ac_index=ac_index,
+                seed_id=seed_id,
+                sub_postmortems_count=len(sub_postmortems),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "serial_executor.partial_checkpoint.unexpected_error",
+            session_id=session_id,
+            ac_index=ac_index,
+            error=str(exc),
+        )
+
+
+def _load_partial_failing_ac_state(
+    store: Any,
+    *,
+    seed_id: str,
+) -> tuple[int | None, list[dict] | None]:
+    """Load partial failing AC state from a compounding checkpoint.
+
+    Returns the ``partial_failing_ac_index`` and
+    ``partial_failing_ac_sub_postmortems`` from the stored checkpoint without
+    re-deriving the postmortem chain (which is handled by
+    :func:`_load_compounding_checkpoint`).
+
+    On any error (missing checkpoint, wrong mode, parse failure), returns
+    ``(None, None)`` so the caller falls back to a fresh AC execution.
+
+    Args:
+        store: :class:`~ouroboros.persistence.checkpoint.CheckpointStore`
+            instance.
+        seed_id: Seed identifier — the key used to look up the checkpoint.
+
+    Returns:
+        ``(partial_failing_ac_index, partial_failing_ac_sub_postmortems)``
+        where both are ``None`` when no partial state is present.
+
+    [[INVARIANT: _load_partial_failing_ac_state returns (None, None) on any failure]]
+    """
+    try:
+        load_result = store.load(seed_id)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    if load_result.is_err:
+        return None, None
+
+    checkpoint = load_result.value
+    try:
+        state = CompoundingCheckpointState.from_dict(checkpoint.state)
+    except (ValueError, KeyError, TypeError):
+        return None, None
+
+    return state.partial_failing_ac_index, state.partial_failing_ac_sub_postmortems
+
+
+def _build_sub_postmortem_resume_context(
+    sub_postmortem_dicts: list[dict],
+) -> str:
+    """Build a context section listing completed sub-ACs for the resumed AC.
+
+    When a decomposed AC is resumed after a partial failure, the agent needs
+    to know which sub-ACs were already completed so it can avoid re-running
+    them.  This function formats the serialized sub-postmortems as a compact
+    markdown section suitable for inclusion in the AC's context_override.
+
+    Args:
+        sub_postmortem_dicts: Serialized sub-postmortem dicts (each entry
+            from :func:`~ouroboros.orchestrator.level_context.serialize_postmortem_chain`).
+
+    Returns:
+        Markdown string with one section per completed sub-AC, or empty
+        string if ``sub_postmortem_dicts`` is empty.
+
+    [[INVARIANT: sub-postmortem resume context is appended to context_override, not replacing it]]
+    """
+    if not sub_postmortem_dicts:
+        return ""
+
+    lines: list[str] = [
+        "",
+        "---",
+        "## Sub-AC Resume Context",
+        "",
+        "The following sub-ACs were ALREADY COMPLETED in the prior partial run.",
+        "Do NOT re-execute them.  Resume from the next incomplete sub-AC.",
+        "",
+    ]
+    for i, entry in enumerate(sub_postmortem_dicts):
+        summary = entry.get("summary") or {}
+        ac_content = summary.get("ac_content", f"Sub-AC {i}")
+        status = entry.get("status", "pass")
+        files_modified = summary.get("files_modified") or []
+        gotchas = entry.get("gotchas") or []
+
+        lines.append(f"### Completed Sub-AC {i} [{status}]")
+        lines.append(f"**Task:** {ac_content}")
+        if files_modified:
+            lines.append(f"**Files:** {', '.join(str(f) for f in files_modified)}")
+        if gotchas:
+            lines.append(f"**Gotchas:** {'; '.join(str(g) for g in gotchas)}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _load_compounding_checkpoint(
     store: Any,
     *,
@@ -638,6 +820,10 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         # and their postmortems are injected into the rolling chain immediately.
         chain = PostmortemChain()
         last_completed_ac_index: int = -1  # -1 means "nothing completed yet"
+        # Sub-AC resume: partial state for a failing decomposed AC.
+        # Set when the checkpoint records a partially-completed decomposed AC.
+        _partial_failing_ac_index: int | None = None
+        _partial_failing_ac_sub_pms: list[dict] | None = None
 
         if resume_session_id is not None and self._checkpoint_store is not None:
             chain, last_completed_ac_index = _load_compounding_checkpoint(
@@ -645,6 +831,14 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 seed_id=seed.metadata.seed_id,
                 session_id=session_id,
                 resume_session_id=resume_session_id,
+            )
+            # Also load partial sub-AC state (separate load to avoid breaking
+            # _load_compounding_checkpoint's return type contract).
+            _partial_failing_ac_index, _partial_failing_ac_sub_pms = (
+                _load_partial_failing_ac_state(
+                    store=self._checkpoint_store,
+                    seed_id=seed.metadata.seed_id,
+                )
             )
 
         results: list[ACExecutionResult] = []
@@ -795,6 +989,37 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     )
                 )
 
+            # Q6.2 sub-postmortem resume: if this AC matches the partial failing
+            # AC recorded in the checkpoint, append the completed sub-AC context
+            # to context_section so the agent knows what was already done and
+            # where to resume.  Emit a structured event for observability.
+            if (
+                _partial_failing_ac_index is not None
+                and ac_index == _partial_failing_ac_index
+                and _partial_failing_ac_sub_pms
+            ):
+                sub_resume_ctx = _build_sub_postmortem_resume_context(
+                    _partial_failing_ac_sub_pms
+                )
+                context_section = context_section + sub_resume_ctx
+                _n_sub_completed = len(_partial_failing_ac_sub_pms)
+                log.info(
+                    "serial_executor.resume.sub_postmortem_boundary",
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    sub_acs_completed=_n_sub_completed,
+                    resume_from_sub_ac=_n_sub_completed,
+                )
+                await self._safe_emit_event(
+                    create_sub_postmortem_resume_event(
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        ac_index=ac_index,
+                        sub_acs_completed=_n_sub_completed,
+                        resume_from_sub_ac=_n_sub_completed,
+                    )
+                )
+
             ac_content = seed.acceptance_criteria[ac_index]
 
             self._console.print(
@@ -897,6 +1122,10 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         min_reliability=min_rel,
                     )
 
+            # Capture chain BEFORE appending the new postmortem so the partial
+            # checkpoint (for a failing decomposed AC) can reference the base chain
+            # without the failing AC's postmortem included.
+            chain_before_append = chain
             chain = chain.append(postmortem)
 
             # Q6.2: Write per-AC checkpoint after successful completion.
@@ -909,6 +1138,25 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     session_id=session_id,
                     ac_index=ac_index,
                     chain=chain,
+                )
+            elif (
+                not result.success
+                and result.sub_results
+                and postmortem.sub_postmortems
+                and self._checkpoint_store is not None
+            ):
+                # Q6.2 sub-postmortem path: decomposed AC failed but some sub-ACs
+                # completed.  Write a partial checkpoint so a future resume can
+                # detect the sub-AC boundary and skip already-completed sub-ACs.
+                # Does NOT advance last_completed_ac_index.
+                _write_partial_sub_ac_checkpoint(
+                    store=self._checkpoint_store,
+                    seed_id=seed.metadata.seed_id,
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    sub_postmortems=postmortem.sub_postmortems,
+                    base_chain=chain_before_append,
+                    last_completed_ac_index=last_completed_ac_index,
                 )
 
             await self._safe_emit_event(
@@ -1116,6 +1364,9 @@ __all__ = [
     "verify_invariants",
     "write_chain_artifact",
     "_load_compounding_checkpoint",
+    "_load_partial_failing_ac_state",
     "_write_compounding_checkpoint",
+    "_write_partial_sub_ac_checkpoint",
+    "_build_sub_postmortem_resume_context",
     "create_postmortem_chain_truncated_event",
 ]

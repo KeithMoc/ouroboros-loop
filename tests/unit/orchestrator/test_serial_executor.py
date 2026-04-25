@@ -3300,3 +3300,633 @@ class TestResumeEdgeCases:
             f"Fresh run must proceed when store raises; executed: {executed}"
         )
         assert result.success_count == 2
+
+
+class TestSubPostmortemResumePath:
+    """Sub-AC 1: sub_postmortem resume path implementation.
+
+    Verifies that:
+    1. When a decomposed AC fails with sub_results, a partial checkpoint is
+       written preserving the completed sub-ACs' postmortems.
+    2. On resume, the partial sub-postmortem context is included in the
+       failing AC's context_override.
+    3. A structured ``execution.serial.resume.sub_postmortem_boundary`` event
+       is emitted when the sub-postmortem resume path is triggered.
+    4. Monolithic (non-decomposed) failing ACs do NOT trigger a partial
+       checkpoint write.
+
+    Compounding context (from prior ACs):
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — chain serialization verified.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — sub-postmortems survive round-trips;
+      this test builds directly on that guarantee.
+    - AC-3 established [[INVARIANT: Haiku verifier runs inline per AC before
+      chain advances]] — invariants in sub-postmortems survive checkpoints.
+    - AC-3 checkpoint tests established [[INVARIANT: checkpoints are only
+      written after AC success, never on failure]] — this task introduces
+      partial checkpoints that do NOT advance last_completed_ac_index.
+
+    [[INVARIANT: sub-postmortem resume event type is execution.serial.resume.sub_postmortem_boundary]]
+    [[INVARIANT: partial sub-AC checkpoint does NOT advance last_completed_ac_index]]
+    [[INVARIANT: partial sub-AC checkpoint is written only when sub_results is non-empty]]
+    [[INVARIANT: sub-postmortem resume context is appended to context_override, not replacing it]]
+    """
+
+    def _make_executor_with_mock_store(
+        self,
+    ) -> tuple[SerialCompoundingExecutor, MagicMock, list[BaseEvent]]:
+        """Build an executor with a mock store and collecting event store."""
+        from ouroboros.core.types import Result
+
+        event_store, appended = _make_replaying_event_store()
+
+        mock_store = MagicMock()
+        mock_store.write.return_value = Result.ok(None)
+        # load() returns error by default (no checkpoint saved)
+        from ouroboros.core.errors import PersistenceError
+        mock_store.load.return_value = Result.err(
+            PersistenceError(message="no checkpoint", operation="load", details={})
+        )
+
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=mock_store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, mock_store, appended
+
+    def _make_executor_with_real_store(
+        self, tmp_path: Path
+    ) -> tuple[SerialCompoundingExecutor, Any, list[BaseEvent]]:
+        """Build an executor with a real CheckpointStore backed by tmp_path."""
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        event_store, appended = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, store, appended
+
+    def _make_decomposed_fail_result(
+        self,
+        ac_index: int,
+        ac_content: str,
+        *,
+        sub_files: tuple[tuple[str, ...], ...],
+    ) -> ACExecutionResult:
+        """Build a failed ACExecutionResult with sub_results (decomposed AC)."""
+        sub_results = tuple(
+            ACExecutionResult(
+                ac_index=ac_index,
+                ac_content=f"Sub-AC {i}",
+                success=True,
+                messages=tuple(
+                    AgentMessage(
+                        type="tool_use",
+                        content=f"writing sub{i}",
+                        tool_name="Write",
+                        data={"tool_input": {"file_path": f}},
+                    )
+                    for f in files
+                ),
+                final_message=f"sub {i} done",
+            )
+            for i, files in enumerate(sub_files)
+        )
+        return ACExecutionResult(
+            ac_index=ac_index,
+            ac_content=ac_content,
+            success=False,
+            error="decomposed AC failed mid-way",
+            is_decomposed=True,
+            sub_results=sub_results,
+            outcome=ACExecutionOutcome.FAILED,
+        )
+
+    # ------------------------------------------------------------------
+    # Checkpoint writing on decomposed-AC failure
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_partial_checkpoint_written_when_decomposed_ac_fails(
+        self,
+    ) -> None:
+        """When a decomposed AC fails with sub_results, a partial checkpoint is written.
+
+        The checkpoint must:
+        - Have last_completed_ac_index = -1 (no fully completed AC)
+        - Have partial_failing_ac_index = 0 (the failing AC)
+        - Have partial_failing_ac_sub_postmortems with the completed sub-ACs
+
+        [[INVARIANT: partial sub-AC checkpoint does NOT advance last_completed_ac_index]]
+        [[INVARIANT: partial sub-AC checkpoint is written only when sub_results is non-empty]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        seed = _make_seed("Decomposed AC with partial sub-results")
+        executor, mock_store, _ = self._make_executor_with_mock_store()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return self._make_decomposed_fail_result(
+                0,
+                str(kwargs["ac_content"]),
+                sub_files=(("src/sub_a.py",), ("src/sub_b.py",)),
+            )
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_partial_write",
+            execution_id="exec_partial_write",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        assert result.failure_count == 1
+
+        # A partial checkpoint must have been written (in addition to any
+        # other writes). We look for a call with a payload that has
+        # partial_failing_ac_index set.
+        partial_writes = [
+            call.args[0]
+            for call in mock_store.write.call_args_list
+            if CompoundingCheckpointState.from_dict(call.args[0].state).partial_failing_ac_index
+               is not None
+        ]
+        assert len(partial_writes) == 1, (
+            f"Expected exactly 1 partial checkpoint write, got {len(partial_writes)}"
+        )
+
+        state = CompoundingCheckpointState.from_dict(partial_writes[0].state)
+        # last_completed_ac_index must NOT be advanced (failing AC is not done).
+        assert state.last_completed_ac_index == -1, (
+            f"Partial checkpoint must not advance cursor; got {state.last_completed_ac_index}"
+        )
+        assert state.partial_failing_ac_index == 0, (
+            f"partial_failing_ac_index must be 0 (the failing AC); got {state.partial_failing_ac_index}"
+        )
+        assert state.partial_failing_ac_sub_postmortems is not None
+        assert len(state.partial_failing_ac_sub_postmortems) == 2, (
+            f"Expected 2 sub-postmortems serialized, got {len(state.partial_failing_ac_sub_postmortems)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_partial_checkpoint_for_monolithic_failing_ac(
+        self,
+    ) -> None:
+        """A monolithic (non-decomposed) failing AC must NOT trigger a partial checkpoint.
+
+        Only ACs with sub_results trigger the partial checkpoint path.
+
+        [[INVARIANT: partial sub-AC checkpoint is written only when sub_results is non-empty]]
+        [[INVARIANT: checkpoints are only written after AC success, never on failure]]
+        """
+        seed = _make_seed("Monolithic AC that fails")
+        executor, mock_store, _ = self._make_executor_with_mock_store()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            # Monolithic (is_decomposed=False, sub_results=()) failing AC
+            return _fail_result(0, str(kwargs["ac_content"]), error="network error")
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_mono_fail",
+            execution_id="exec_mono_fail",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        # Zero checkpoint writes for monolithic failing AC.
+        assert mock_store.write.call_count == 0, (
+            f"Expected 0 writes for monolithic failure; got {mock_store.write.call_count}"
+        )
+
+    # ------------------------------------------------------------------
+    # Resume context inclusion
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sub_postmortem_context_in_context_override_on_resume(
+        self, tmp_path: Path
+    ) -> None:
+        """On resume, the failing AC's context_override includes completed sub-AC context.
+
+        Setup: write a partial checkpoint for AC 0 with 2 completed sub-ACs.
+        Resume: execute_serial with resume_session_id set.
+        Expect: AC 0's context_override contains the "Sub-AC Resume Context"
+        section listing the completed sub-ACs.
+
+        Compounding reference: this builds on AC-2's B-prime sub_postmortems
+        preservation [[INVARIANT: ACPostmortem.sub_postmortems preserves structure
+        in serialized chain]] — the partial checkpoint uses the same serialization.
+
+        [[INVARIANT: sub-postmortem resume context is appended to context_override, not replacing it]]
+        [[INVARIANT: sub-postmortem resume event type is execution.serial.resume.sub_postmortem_boundary]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _write_partial_sub_ac_checkpoint,
+        )
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        seed = _make_seed("Failing decomposed AC to resume")
+        executor, store, appended = self._make_executor_with_real_store(tmp_path)
+
+        # Build two completed sub-postmortems.
+        sub_pm0 = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="Sub-AC 0: extract schema",
+                success=True,
+                files_modified=("src/schema.py",),
+            ),
+            status="pass",
+            gotchas=("schema must be frozen",),
+        )
+        sub_pm1 = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="Sub-AC 1: write tests",
+                success=True,
+                files_modified=("tests/test_schema.py",),
+            ),
+            status="pass",
+        )
+
+        # Write partial checkpoint: no fully-completed ACs, but AC 0 has 2 completed sub-ACs.
+        _write_partial_sub_ac_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_partial_session",
+            ac_index=0,
+            sub_postmortems=(sub_pm0, sub_pm1),
+            base_chain=PostmortemChain(),  # empty base chain (no fully-completed ACs)
+            last_completed_ac_index=-1,
+        )
+
+        captured_overrides: list[str] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="new_session_resume",
+            execution_id="exec_sub_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_partial_session",
+        )
+
+        # AC 0 was executed (not skipped — last_completed_ac_index=-1).
+        assert len(captured_overrides) == 1, (
+            f"AC 0 should have been executed once; got {len(captured_overrides)} overrides"
+        )
+        context = captured_overrides[0]
+
+        # Sub-AC resume section must be present.
+        assert "Sub-AC Resume Context" in context, (
+            f"Sub-AC Resume Context section missing from context_override:\n{context[:600]}"
+        )
+        # Completed sub-ACs must be listed.
+        assert "Sub-AC 0: extract schema" in context, (
+            "First completed sub-AC must appear in resume context"
+        )
+        assert "Sub-AC 1: write tests" in context, (
+            "Second completed sub-AC must appear in resume context"
+        )
+        # The "do not re-execute" instruction must be present.
+        assert "Do NOT re-execute" in context, (
+            "Resume context must include the 'Do NOT re-execute' instruction"
+        )
+
+    # ------------------------------------------------------------------
+    # Resume event emission
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_sub_postmortem_resume_event_emitted(
+        self, tmp_path: Path
+    ) -> None:
+        """execution.serial.resume.sub_postmortem_boundary event emitted on sub-resume.
+
+        When the partial sub-postmortem path is triggered, the executor must
+        emit one event per resumed AC.
+
+        Compounding reference: the event factory follows the existing pattern
+        established in AC-1 (create_ac_postmortem_captured_event) and AC-4 Q7
+        (create_postmortem_chain_truncated_event).  Events coexist with log lines.
+
+        [[INVARIANT: sub-postmortem resume event type is execution.serial.resume.sub_postmortem_boundary]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _write_partial_sub_ac_checkpoint,
+        )
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        seed = _make_seed("Decomposed AC with sub resume")
+        executor, store, appended = self._make_executor_with_real_store(tmp_path)
+
+        sub_pm = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="Sub-AC 0: task A",
+                success=True,
+                files_modified=("src/task_a.py",),
+            ),
+            status="pass",
+        )
+
+        _write_partial_sub_ac_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_sub_session",
+            ac_index=0,
+            sub_postmortems=(sub_pm,),
+            base_chain=PostmortemChain(),
+            last_completed_ac_index=-1,
+        )
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="resume_event_sess",
+            execution_id="exec_resume_event",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_sub_session",
+        )
+
+        resume_events = [
+            e
+            for e in appended
+            if e.type == "execution.serial.resume.sub_postmortem_boundary"
+        ]
+        assert len(resume_events) == 1, (
+            f"Expected 1 sub-postmortem resume event; got {len(resume_events)}. "
+            f"All event types: {[e.type for e in appended]}"
+        )
+        ev = resume_events[0]
+        assert ev.aggregate_type == "execution"
+        assert ev.aggregate_id == "exec_resume_event"
+        assert ev.data["session_id"] == "resume_event_sess"
+        assert ev.data["ac_index"] == 0
+        assert ev.data["sub_acs_completed"] == 1, (
+            f"sub_acs_completed should be 1; got {ev.data['sub_acs_completed']}"
+        )
+        assert ev.data["resume_from_sub_ac"] == 1, (
+            f"resume_from_sub_ac should equal sub_acs_completed; got {ev.data['resume_from_sub_ac']}"
+        )
+        assert "timestamp" in ev.data
+
+    # ------------------------------------------------------------------
+    # Helper function tests
+    # ------------------------------------------------------------------
+
+    def test_load_partial_failing_ac_state_returns_none_when_no_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_partial_failing_ac_state returns (None, None) when no checkpoint exists.
+
+        [[INVARIANT: _load_partial_failing_ac_state returns (None, None) on any failure]]
+        """
+        from ouroboros.orchestrator.serial_executor import _load_partial_failing_ac_state
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "empty")
+        store.initialize()
+
+        idx, subs = _load_partial_failing_ac_state(store=store, seed_id="nonexistent")
+        assert idx is None
+        assert subs is None
+
+    def test_load_partial_failing_ac_state_returns_stored_values(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_partial_failing_ac_state returns the stored partial sub-AC state.
+
+        [[INVARIANT: _load_partial_failing_ac_state returns (None, None) on any failure]]
+        [[INVARIANT: partial sub-AC checkpoint does NOT advance last_completed_ac_index]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _load_partial_failing_ac_state,
+            _write_partial_sub_ac_checkpoint,
+        )
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "ckpts")
+        store.initialize()
+
+        sub_pm = ACPostmortem(
+            summary=ACContextSummary(
+                ac_index=0,
+                ac_content="Sub task",
+                success=True,
+                files_modified=("src/sub.py",),
+            ),
+            status="pass",
+        )
+
+        _write_partial_sub_ac_checkpoint(
+            store=store,
+            seed_id="test_seed",
+            session_id="sess",
+            ac_index=2,
+            sub_postmortems=(sub_pm,),
+            base_chain=PostmortemChain(),
+            last_completed_ac_index=1,
+        )
+
+        idx, subs = _load_partial_failing_ac_state(store=store, seed_id="test_seed")
+        assert idx == 2, f"Expected partial_failing_ac_index=2, got {idx}"
+        assert subs is not None
+        assert len(subs) == 1, f"Expected 1 serialized sub-postmortem, got {len(subs)}"
+
+    def test_build_sub_postmortem_resume_context_includes_required_sections(
+        self,
+    ) -> None:
+        """_build_sub_postmortem_resume_context formats completed sub-ACs correctly.
+
+        [[INVARIANT: sub-postmortem resume context is appended to context_override, not replacing it]]
+        """
+        from ouroboros.orchestrator.serial_executor import _build_sub_postmortem_resume_context
+
+        sub_pm_dicts = [
+            {
+                "summary": {
+                    "ac_index": 0,
+                    "ac_content": "Sub-AC 0: write schema",
+                    "files_modified": ["src/schema.py"],
+                },
+                "status": "pass",
+                "gotchas": ["schema must be immutable"],
+            },
+            {
+                "summary": {
+                    "ac_index": 0,
+                    "ac_content": "Sub-AC 1: write tests",
+                    "files_modified": ["tests/test_schema.py"],
+                },
+                "status": "pass",
+                "gotchas": [],
+            },
+        ]
+
+        ctx = _build_sub_postmortem_resume_context(sub_pm_dicts)
+
+        # Must contain the resume header.
+        assert "Sub-AC Resume Context" in ctx
+        # Must include both sub-ACs' content.
+        assert "Sub-AC 0: write schema" in ctx
+        assert "Sub-AC 1: write tests" in ctx
+        # Must include "do not re-execute" instruction.
+        assert "Do NOT re-execute" in ctx
+        # Must include files_modified.
+        assert "src/schema.py" in ctx
+        # Must include gotchas.
+        assert "schema must be immutable" in ctx
+
+    def test_build_sub_postmortem_resume_context_empty_returns_empty_string(
+        self,
+    ) -> None:
+        """_build_sub_postmortem_resume_context returns empty string for empty input."""
+        from ouroboros.orchestrator.serial_executor import _build_sub_postmortem_resume_context
+
+        assert _build_sub_postmortem_resume_context([]) == ""
+
+    def test_compounding_checkpoint_state_partial_fields_round_trip(
+        self,
+    ) -> None:
+        """CompoundingCheckpointState partial fields round-trip through to_dict/from_dict.
+
+        Verifies that partial_failing_ac_index and partial_failing_ac_sub_postmortems
+        survive a serialize/deserialize cycle.
+
+        [[INVARIANT: partial sub-AC checkpoint does NOT advance last_completed_ac_index]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        original = CompoundingCheckpointState(
+            last_completed_ac_index=3,
+            postmortem_chain=[{"ac_index": 0, "status": "pass"}],
+            partial_failing_ac_index=4,
+            partial_failing_ac_sub_postmortems=[
+                {"summary": {"ac_content": "sub 0"}, "status": "pass"},
+                {"summary": {"ac_content": "sub 1"}, "status": "pass"},
+            ],
+        )
+        d = original.to_dict()
+        restored = CompoundingCheckpointState.from_dict(d)
+
+        assert restored.last_completed_ac_index == 3
+        assert restored.mode == "compounding"
+        assert restored.partial_failing_ac_index == 4
+        assert restored.partial_failing_ac_sub_postmortems is not None
+        assert len(restored.partial_failing_ac_sub_postmortems) == 2
+        assert restored.partial_failing_ac_sub_postmortems[0]["summary"]["ac_content"] == "sub 0"
+
+    def test_compounding_checkpoint_state_no_partial_fields_when_none(
+        self,
+    ) -> None:
+        """CompoundingCheckpointState with no partial fields serializes cleanly.
+
+        When partial_failing_ac_index is None, neither partial key appears in
+        the serialized dict, keeping backward compatibility.
+
+        [[INVARIANT: partial sub-AC checkpoint is written only when sub_results is non-empty]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        state = CompoundingCheckpointState(
+            last_completed_ac_index=2,
+            postmortem_chain=[],
+        )
+        d = state.to_dict()
+
+        assert "partial_failing_ac_index" not in d, (
+            "partial_failing_ac_index must not appear when None (backward compat)"
+        )
+        assert "partial_failing_ac_sub_postmortems" not in d, (
+            "partial_failing_ac_sub_postmortems must not appear when None (backward compat)"
+        )
+
+        # Deserialization of a dict without the optional keys must succeed.
+        restored = CompoundingCheckpointState.from_dict(d)
+        assert restored.partial_failing_ac_index is None
+        assert restored.partial_failing_ac_sub_postmortems is None
+
+    # ------------------------------------------------------------------
+    # create_sub_postmortem_resume_event factory
+    # ------------------------------------------------------------------
+
+    def test_create_sub_postmortem_resume_event_fields(self) -> None:
+        """create_sub_postmortem_resume_event produces correct event structure.
+
+        [[INVARIANT: sub-postmortem resume event type is execution.serial.resume.sub_postmortem_boundary]]
+        [[INVARIANT: resume_from_sub_ac == sub_acs_completed (no gaps, boundary is first incomplete sub-AC)]]
+        """
+        from ouroboros.orchestrator.events import create_sub_postmortem_resume_event
+
+        event = create_sub_postmortem_resume_event(
+            session_id="sess_sub_event",
+            execution_id="exec_sub_event",
+            ac_index=3,
+            sub_acs_completed=2,
+            resume_from_sub_ac=2,
+        )
+
+        assert event.type == "execution.serial.resume.sub_postmortem_boundary"
+        assert event.aggregate_type == "execution"
+        assert event.aggregate_id == "exec_sub_event"
+        assert event.data["session_id"] == "sess_sub_event"
+        assert event.data["execution_id"] == "exec_sub_event"
+        assert event.data["ac_index"] == 3
+        assert event.data["sub_acs_completed"] == 2
+        assert event.data["resume_from_sub_ac"] == 2
+        assert "timestamp" in event.data
