@@ -777,6 +777,55 @@ def create_sub_postmortem_resume_event(
     )
 
 
+def create_monolithic_resume_adjudicated_event(
+    session_id: str,
+    execution_id: str,
+    *,
+    ac_index: int,
+    decision: str,
+    raw_response_preview: str,
+) -> BaseEvent:
+    """Create monolithic resume adjudication event (Q6.2 monolithic path).
+
+    Emitted when a resume run encounters a monolithic (non-decomposed) failing
+    AC and the agent is invoked to decide whether to continue from the
+    interrupted state or restart from the top.
+
+    The decision is stored as ``"continue"`` or ``"restart"`` — both values
+    are equally valid outcomes; neither indicates an error.
+
+    The event coexists with the log line emitted by the serial executor and
+    does NOT replace it.
+
+    Args:
+        session_id: Parent session id.
+        execution_id: Parent execution id.
+        ac_index: 0-based index of the AC being adjudicated.
+        decision: Agent's decision — ``"continue"`` or ``"restart"``.
+        raw_response_preview: First 200 chars of the agent's raw response
+            (for diagnostics).
+
+    Returns:
+        BaseEvent for the adjudication decision.
+
+    [[INVARIANT: monolithic resume adjudication event type is execution.serial.resume.monolithic_adjudicated]]
+    [[INVARIANT: decision field is always "continue" or "restart" (never None or empty)]]
+    """
+    return BaseEvent(
+        type="execution.serial.resume.monolithic_adjudicated",
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data={
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "ac_index": ac_index,
+            "decision": decision,
+            "raw_response_preview": raw_response_preview[:200],
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 def create_execution_terminal_event(
     execution_id: str,
     session_id: str,
@@ -817,6 +866,7 @@ def create_execution_terminal_event(
 
 __all__ = [
     "create_ac_postmortem_captured_event",
+    "create_monolithic_resume_adjudicated_event",
     "create_postmortem_chain_truncated_event",
     "create_sub_postmortem_resume_event",
     "create_ac_stall_detected_event",

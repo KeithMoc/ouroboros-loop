@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from ouroboros.orchestrator.events import (
     create_ac_postmortem_captured_event,
+    create_monolithic_resume_adjudicated_event,
     create_postmortem_chain_truncated_event,
     create_sub_postmortem_resume_event,
 )
@@ -632,6 +633,170 @@ def _build_sub_postmortem_resume_context(
     return "\n".join(lines)
 
 
+def _build_monolithic_resume_decision_prompt(
+    ac_content: str,
+    context_section: str,
+) -> str:
+    """Build the DECISION prompt for monolithic AC resume adjudication.
+
+    Packages the original AC text and the available context (prior AC
+    postmortems) into a prompt asking the agent to decide whether to
+    *continue* from the interrupted state or *restart* from scratch.
+
+    The decision instruction is on the last line, asking for a first-line
+    response of exactly ``DECISION: continue`` or ``DECISION: restart``.
+
+    Args:
+        ac_content: Original acceptance criterion text (the full task).
+        context_section: Postmortem chain context rendered for the prompt
+            (used as the best available "pre-crash trace" since per-message
+            traces are not stored in the checkpoint for monolithic ACs).
+
+    Returns:
+        Prompt string for the adjudication LLM call.
+
+    [[INVARIANT: monolithic resume prompt always includes the literal text DECISION: continue and DECISION: restart as options]]
+    """
+    context_block = context_section.strip() if context_section else "(No prior context recorded)"
+    return (
+        "You are resuming an interrupted AI workflow task.\n\n"
+        "## Original Task (Acceptance Criterion)\n\n"
+        f"{ac_content}\n\n"
+        "## Prior Work Context\n\n"
+        f"{context_block}\n\n"
+        "## Decision Required\n\n"
+        "This task was interrupted before completion in a prior run.\n"
+        "Based on the context above, decide whether to:\n"
+        "  (a) continue — resume from the interrupted state if there is "
+        "evidence of substantial partial work that should not be repeated\n"
+        "  (b) restart — start this task fresh from the beginning if there "
+        "is little or no partial work, or if a clean start is safer\n\n"
+        "State your decision on the FIRST LINE as exactly one of:\n"
+        "  DECISION: continue\n"
+        "or\n"
+        "  DECISION: restart\n\n"
+        "Then briefly explain your reasoning on subsequent lines."
+    )
+
+
+def _parse_monolithic_resume_decision(response_text: str) -> str:
+    """Parse DECISION: continue|restart from the first line of a response.
+
+    Looks for ``DECISION:`` (case-insensitive) in the first non-empty line
+    and extracts ``continue`` or ``restart``.  Falls back to ``"restart"``
+    on any parse failure — the conservative default keeps the workflow safe.
+
+    Args:
+        response_text: Raw text response from the adjudication call.
+
+    Returns:
+        ``"continue"`` or ``"restart"``.
+
+    [[INVARIANT: _parse_monolithic_resume_decision always returns "continue" or "restart"]]
+    """
+    if not response_text or not response_text.strip():
+        return "restart"
+
+    for line in response_text.strip().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if "decision:" in lower:
+            # Extract the part after the colon.
+            after_colon = lower.split("decision:", 1)[1].strip()
+            if after_colon.startswith("continue"):
+                return "continue"
+            if after_colon.startswith("restart"):
+                return "restart"
+        # Only examine the first non-empty line.
+        break
+
+    log.info(
+        "serial_executor.monolithic_resume.unparseable_decision",
+        response_preview=response_text[:100],
+    )
+    return "restart"
+
+
+async def _adjudicate_monolithic_resume(
+    adapter: Any,
+    ac_content: str,
+    context_section: str,
+    *,
+    model: str | None = None,
+) -> tuple[str, str]:
+    """Invoke the agent to decide continue vs restart for a monolithic AC resume.
+
+    Constructs the DECISION prompt, calls ``adapter.complete()``, and parses
+    the first line for ``DECISION: continue`` or ``DECISION: restart``.
+
+    Falls back to ``"restart"`` on any adapter or parse error — the safe
+    conservative default that ensures a clean execution from the top.
+
+    This call is **inline-blocking**: the caller must await it before
+    proceeding to ``_execute_single_ac`` so the decision is known before
+    the AC runs.
+
+    Args:
+        adapter: LLM adapter with a ``complete`` method.
+        ac_content: Original AC text (the full task description).
+        context_section: Postmortem chain context (acts as the pre-crash trace).
+        model: Model override.  When ``None``, resolved via
+            :func:`~ouroboros.config.loader.get_invariant_verifier_model`
+            (same helper used by the Haiku verifier — a cheap model is fine
+            for a binary continue/restart decision).
+
+    Returns:
+        ``(decision, raw_response)`` where ``decision`` is ``"continue"`` or
+        ``"restart"`` and ``raw_response`` is the full raw text from the
+        adapter (may be empty on error).
+
+    [[INVARIANT: _adjudicate_monolithic_resume always returns ("continue"|"restart", str)]]
+    [[INVARIANT: adapter error in monolithic adjudication defaults to "restart"]]
+    """
+    from ouroboros.providers.base import CompletionConfig, Message, MessageRole
+
+    prompt = _build_monolithic_resume_decision_prompt(ac_content, context_section)
+
+    if model is None:
+        try:
+            from ouroboros.config.loader import get_invariant_verifier_model
+
+            model = get_invariant_verifier_model()
+        except Exception:  # noqa: BLE001
+            model = "claude-haiku-4-5"
+
+    config = CompletionConfig(model=model, temperature=0.0, max_tokens=256)
+    messages = [Message(role=MessageRole.USER, content=prompt)]
+
+    try:
+        result = await adapter.complete(messages, config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "serial_executor.monolithic_resume.adapter_error",
+            error=str(exc),
+        )
+        return "restart", ""
+
+    if result.is_err:
+        log.warning(
+            "serial_executor.monolithic_resume.llm_failed",
+            error=str(result.error),
+        )
+        return "restart", ""
+
+    raw_text = (result.value.content or "").strip()
+    decision = _parse_monolithic_resume_decision(raw_text)
+
+    log.info(
+        "serial_executor.monolithic_resume.decision_made",
+        decision=decision,
+        raw_preview=raw_text[:100],
+    )
+    return decision, raw_text
+
+
 def _load_compounding_checkpoint(
     store: Any,
     *,
@@ -1022,6 +1187,64 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 
             ac_content = seed.acceptance_criteria[ac_index]
 
+            # Q6.2 monolithic resume adjudication:
+            # When resuming from a checkpoint and this is the first AC after
+            # the last completed one, and the sub-AC boundary resume path was
+            # NOT taken (no sub_postmortems), invoke the agent to decide
+            # whether to continue from the interrupted state or restart fresh.
+            #
+            # Trigger conditions:
+            #   1. resume_session_id is set (explicit resume)
+            #   2. last_completed_ac_index >= 0 (real checkpoint loaded)
+            #   3. ac_index == last_completed_ac_index + 1 (this is the failing AC)
+            #   4. Sub-AC boundary path was not taken for this AC
+            _is_monolithic_failing_ac = (
+                resume_session_id is not None
+                and last_completed_ac_index >= 0
+                and ac_index == last_completed_ac_index + 1
+            )
+            _sub_ac_boundary_taken = (
+                _partial_failing_ac_index is not None
+                and ac_index == _partial_failing_ac_index
+                and bool(_partial_failing_ac_sub_pms)
+            )
+
+            if _is_monolithic_failing_ac and not _sub_ac_boundary_taken:
+                _adj_decision, _adj_raw = await _adjudicate_monolithic_resume(
+                    self._adapter,
+                    ac_content,
+                    context_section,
+                )
+                log.info(
+                    "serial_executor.resume.monolithic_adjudication",
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    decision=_adj_decision,
+                )
+                await self._safe_emit_event(
+                    create_monolithic_resume_adjudicated_event(
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        ac_index=ac_index,
+                        decision=_adj_decision,
+                        raw_response_preview=_adj_raw,
+                    )
+                )
+                if _adj_decision == "continue":
+                    # Append a continuation hint so the agent knows to resume
+                    # rather than restart from scratch.
+                    context_section = (
+                        context_section
+                        + "\n\n---\n"
+                        + "## Resume Instruction\n\n"
+                        + "This AC was interrupted in a prior run. "
+                        + "Based on context above, you decided to CONTINUE "
+                        + "from where you left off. Resume the task rather "
+                        + "than restarting from scratch.\n"
+                    )
+                # If decision == "restart": no modification — agent runs the
+                # AC fresh without any continuation hint.
+
             self._console.print(
                 f"[bold cyan]Serial AC {ac_index + 1}/{len(ac_order)}[/bold cyan]"
                 f" [{len(chain.postmortems)} postmortems in chain]"
@@ -1363,8 +1586,11 @@ __all__ = [
     "linearize_execution_plan",
     "verify_invariants",
     "write_chain_artifact",
+    "_adjudicate_monolithic_resume",
+    "_build_monolithic_resume_decision_prompt",
     "_load_compounding_checkpoint",
     "_load_partial_failing_ac_state",
+    "_parse_monolithic_resume_decision",
     "_write_compounding_checkpoint",
     "_write_partial_sub_ac_checkpoint",
     "_build_sub_postmortem_resume_context",

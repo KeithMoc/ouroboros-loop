@@ -3930,3 +3930,719 @@ class TestSubPostmortemResumePath:
         assert event.data["sub_acs_completed"] == 2
         assert event.data["resume_from_sub_ac"] == 2
         assert "timestamp" in event.data
+
+
+class TestMonolithicResume:
+    """Sub-AC 2: Monolithic agent-adjudicated resume (Q6.2 monolithic path).
+
+    Verifies:
+    1. _build_monolithic_resume_decision_prompt includes AC text, context,
+       and both DECISION: continue / DECISION: restart options.
+    2. _parse_monolithic_resume_decision correctly parses responses.
+    3. _adjudicate_monolithic_resume calls adapter and returns correct decision.
+    4. Adapter error defaults to "restart".
+    5. Integration: monolithic resume triggers adjudication and emits event.
+    6. DECISION: continue adds continuation hint to context_override.
+    7. DECISION: restart leaves context_override unchanged.
+    8. Adjudication NOT triggered when not resuming (no resume_session_id).
+    9. Adjudication NOT triggered when last_completed_ac_index == -1.
+    10. Adjudication NOT triggered when sub-AC boundary path was taken.
+
+    Compounding context (from prior ACs):
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — the chain survives even on resume.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — sub-AC boundary resume uses this;
+      monolithic path is taken only when sub_postmortems is empty.
+    - AC-3 established [[INVARIANT: Haiku verifier runs inline per AC before
+      chain advances]] — adjudication similarly calls adapter.complete().
+    - Sub-AC 1 established [[INVARIANT: partial sub-AC checkpoint does NOT
+      advance last_completed_ac_index]] — monolithic path is the complement:
+      no partial checkpoint, agent adjudicates on full resume.
+
+    [[INVARIANT: monolithic resume adjudication event type is execution.serial.resume.monolithic_adjudicated]]
+    [[INVARIANT: decision field is always "continue" or "restart" (never None or empty)]]
+    [[INVARIANT: _parse_monolithic_resume_decision always returns "continue" or "restart"]]
+    [[INVARIANT: _adjudicate_monolithic_resume always returns ("continue"|"restart", str)]]
+    [[INVARIANT: adapter error in monolithic adjudication defaults to "restart"]]
+    """
+
+    # ------------------------------------------------------------------
+    # Unit tests for helper functions
+    # ------------------------------------------------------------------
+
+    def test_build_decision_prompt_includes_ac_text(self) -> None:
+        """The DECISION prompt must include the original AC text verbatim.
+
+        [[INVARIANT: monolithic resume prompt always includes the literal text DECISION: continue and DECISION: restart as options]]
+        """
+        from ouroboros.orchestrator.serial_executor import (
+            _build_monolithic_resume_decision_prompt,
+        )
+
+        ac_text = "Implement the user authentication module with JWT tokens."
+        context = "Prior AC postmortem: files modified = src/auth.py"
+        prompt = _build_monolithic_resume_decision_prompt(ac_text, context)
+
+        assert ac_text in prompt, "AC text must appear verbatim in the prompt"
+        assert "DECISION: continue" in prompt, "continue option must be in prompt"
+        assert "DECISION: restart" in prompt, "restart option must be in prompt"
+
+    def test_build_decision_prompt_includes_context_section(self) -> None:
+        """The DECISION prompt includes the context section as prior work trace."""
+        from ouroboros.orchestrator.serial_executor import (
+            _build_monolithic_resume_decision_prompt,
+        )
+
+        context = "Postmortem for AC 1: files modified = src/model.py"
+        prompt = _build_monolithic_resume_decision_prompt("Some AC", context)
+
+        assert context in prompt, "Context section must appear in the prompt"
+
+    def test_build_decision_prompt_handles_empty_context(self) -> None:
+        """Empty context section falls back to a placeholder message."""
+        from ouroboros.orchestrator.serial_executor import (
+            _build_monolithic_resume_decision_prompt,
+        )
+
+        prompt = _build_monolithic_resume_decision_prompt("AC text", "")
+
+        assert "(No prior context recorded)" in prompt
+        # Both decision options still present.
+        assert "DECISION: continue" in prompt
+        assert "DECISION: restart" in prompt
+
+    def test_parse_decision_continue(self) -> None:
+        """'DECISION: continue' on the first line → 'continue'."""
+        from ouroboros.orchestrator.serial_executor import (
+            _parse_monolithic_resume_decision,
+        )
+
+        response = "DECISION: continue\nI see evidence of partial work in the trace."
+        assert _parse_monolithic_resume_decision(response) == "continue"
+
+    def test_parse_decision_restart(self) -> None:
+        """'DECISION: restart' on the first line → 'restart'."""
+        from ouroboros.orchestrator.serial_executor import (
+            _parse_monolithic_resume_decision,
+        )
+
+        response = "DECISION: restart\nNo prior work visible; starting fresh is safer."
+        assert _parse_monolithic_resume_decision(response) == "restart"
+
+    def test_parse_decision_case_insensitive(self) -> None:
+        """Decision parsing is case-insensitive ('decision: CONTINUE' works)."""
+        from ouroboros.orchestrator.serial_executor import (
+            _parse_monolithic_resume_decision,
+        )
+
+        assert _parse_monolithic_resume_decision("decision: CONTINUE") == "continue"
+        assert _parse_monolithic_resume_decision("DECISION: RESTART") == "restart"
+
+    def test_parse_decision_empty_response_defaults_restart(self) -> None:
+        """Empty or whitespace-only response falls back to 'restart'.
+
+        [[INVARIANT: _parse_monolithic_resume_decision always returns "continue" or "restart"]]
+        """
+        from ouroboros.orchestrator.serial_executor import (
+            _parse_monolithic_resume_decision,
+        )
+
+        assert _parse_monolithic_resume_decision("") == "restart"
+        assert _parse_monolithic_resume_decision("   ") == "restart"
+
+    def test_parse_decision_unparseable_defaults_restart(self) -> None:
+        """A response without 'DECISION:' falls back to 'restart'.
+
+        [[INVARIANT: _parse_monolithic_resume_decision always returns "continue" or "restart"]]
+        """
+        from ouroboros.orchestrator.serial_executor import (
+            _parse_monolithic_resume_decision,
+        )
+
+        assert _parse_monolithic_resume_decision("I cannot decide.") == "restart"
+        assert _parse_monolithic_resume_decision("The task looks complex.") == "restart"
+
+    @pytest.mark.asyncio
+    async def test_adjudicate_calls_adapter_and_parses_continue(self) -> None:
+        """_adjudicate_monolithic_resume calls adapter.complete() and returns 'continue'.
+
+        [[INVARIANT: _adjudicate_monolithic_resume always returns ("continue"|"restart", str)]]
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.serial_executor import _adjudicate_monolithic_resume
+        from ouroboros.providers.base import CompletionResponse, UsageInfo
+
+        stub_response = CompletionResponse(
+            content="DECISION: continue\nEvidence of partial work exists in prior postmortems.",
+            model="claude-haiku-4-5",
+            usage=UsageInfo(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+        )
+        adapter = MagicMock()
+        adapter.complete = AsyncMock(return_value=Result.ok(stub_response))
+
+        decision, raw = await _adjudicate_monolithic_resume(
+            adapter,
+            "Build user auth module",
+            "Prior AC: src/user.py modified",
+            model="claude-haiku-4-5",
+        )
+
+        assert decision == "continue"
+        assert "DECISION: continue" in raw
+        adapter.complete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_adjudicate_calls_adapter_and_parses_restart(self) -> None:
+        """_adjudicate_monolithic_resume calls adapter.complete() and returns 'restart'."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.serial_executor import _adjudicate_monolithic_resume
+        from ouroboros.providers.base import CompletionResponse, UsageInfo
+
+        stub_response = CompletionResponse(
+            content="DECISION: restart\nNo partial work found; clean start recommended.",
+            model="claude-haiku-4-5",
+            usage=UsageInfo(prompt_tokens=100, completion_tokens=15, total_tokens=115),
+        )
+        adapter = MagicMock()
+        adapter.complete = AsyncMock(return_value=Result.ok(stub_response))
+
+        decision, raw = await _adjudicate_monolithic_resume(
+            adapter,
+            "Build user auth module",
+            "",
+            model="claude-haiku-4-5",
+        )
+
+        assert decision == "restart"
+        assert "DECISION: restart" in raw
+
+    @pytest.mark.asyncio
+    async def test_adjudicate_adapter_error_defaults_restart(self) -> None:
+        """Adapter error causes _adjudicate_monolithic_resume to return 'restart'.
+
+        [[INVARIANT: adapter error in monolithic adjudication defaults to "restart"]]
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ouroboros.core.errors import ProviderError
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.serial_executor import _adjudicate_monolithic_resume
+
+        adapter = MagicMock()
+        adapter.complete = AsyncMock(
+            return_value=Result.err(ProviderError(message="rate limit", details={}))
+        )
+
+        decision, raw = await _adjudicate_monolithic_resume(
+            adapter,
+            "Some AC",
+            "context",
+            model="claude-haiku-4-5",
+        )
+
+        assert decision == "restart"
+        assert raw == ""
+
+    @pytest.mark.asyncio
+    async def test_adjudicate_exception_defaults_restart(self) -> None:
+        """Unexpected exception in adapter.complete() returns 'restart'."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ouroboros.orchestrator.serial_executor import _adjudicate_monolithic_resume
+
+        adapter = MagicMock()
+        adapter.complete = AsyncMock(side_effect=RuntimeError("network error"))
+
+        decision, raw = await _adjudicate_monolithic_resume(
+            adapter,
+            "Some AC",
+            "context",
+            model="claude-haiku-4-5",
+        )
+
+        assert decision == "restart"
+
+    # ------------------------------------------------------------------
+    # Integration tests: execute_serial + monolithic resume
+    # ------------------------------------------------------------------
+
+    def _make_executor_with_checkpoint(
+        self, tmp_path: Path
+    ) -> tuple[SerialCompoundingExecutor, Any, list[BaseEvent]]:
+        """Build an executor with a real CheckpointStore and collecting event store."""
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        event_store, appended = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, store, appended
+
+    @pytest.mark.asyncio
+    async def test_monolithic_adjudication_triggered_on_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When resuming and encountering the failing monolithic AC, adjudication fires.
+
+        AC 0 completes (checkpoint written). On resume, AC 1 (the failing AC)
+        should trigger agent adjudication. The adjudication event must be emitted.
+
+        Compounding reference: relies on AC-1's chain artifact invariant — the
+        checkpoint written after AC 0 contains the serialized chain.
+
+        [[INVARIANT: monolithic resume adjudication event type is execution.serial.resume.monolithic_adjudicated]]
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        adjudication_calls: list[dict] = []
+
+        async def fake_adjudicate(
+            adapter: Any,
+            ac_content: str,
+            context_section: str,
+            *,
+            model: str | None = None,
+        ) -> tuple[str, str]:
+            adjudication_calls.append({
+                "ac_content": ac_content,
+                "context_section": context_section,
+            })
+            return "restart", "DECISION: restart\nNo prior work detected."
+
+        monkeypatch.setattr(serial_mod, "_adjudicate_monolithic_resume", fake_adjudicate)
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        seed = _make_seed("AC 0 — build model", "AC 1 — build endpoint (failing AC)")
+        executor, store, appended = self._make_executor_with_checkpoint(tmp_path)
+
+        # First run: AC 0 succeeds, AC 1 fails.
+        call_count = [0]
+
+        async def fake_single_ac_first_run(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            call_count[0] += 1
+            if ac_index == 0:
+                return _ok_result(ac_index, str(kwargs["ac_content"]))
+            return _fail_result(ac_index, str(kwargs["ac_content"]), error="timeout")
+
+        executor._execute_single_ac = fake_single_ac_first_run  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        first_result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_mono_first",
+            execution_id="exec_mono_first",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+        assert first_result.success_count == 1
+        assert first_result.failure_count == 1
+        # adjudication should NOT be called in the first (non-resume) run.
+        assert adjudication_calls == [], (
+            "Adjudication must not fire in a non-resume run"
+        )
+
+        # Resume run: resume_session_id provided. AC 0 skipped, AC 1 gets adjudicated.
+        resume_call_count = [0]
+        captured_context: list[str] = []
+
+        async def fake_single_ac_resume(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            resume_call_count[0] += 1
+            captured_context.append(kwargs.get("context_override") or "")
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac_resume  # type: ignore[method-assign]
+
+        resume_result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_mono_resume",
+            execution_id="exec_mono_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="sess_mono_first",
+        )
+
+        # AC 1 should have been executed (AC 0 was skipped via resume).
+        assert resume_call_count[0] == 1, (
+            f"AC 1 must run exactly once on resume; ran {resume_call_count[0]} times"
+        )
+
+        # Adjudication must have fired once (for AC 1).
+        assert len(adjudication_calls) == 1, (
+            f"Expected 1 adjudication call for AC 1; got {adjudication_calls}"
+        )
+        assert "AC 1 — build endpoint" in adjudication_calls[0]["ac_content"]
+
+        # The adjudication event must appear in the event stream.
+        adj_events = [
+            e for e in appended
+            if e.type == "execution.serial.resume.monolithic_adjudicated"
+        ]
+        assert len(adj_events) == 1, (
+            f"Expected 1 adjudication event; got {adj_events}"
+        )
+        assert adj_events[0].data["ac_index"] == 1
+        assert adj_events[0].data["decision"] == "restart"
+
+    @pytest.mark.asyncio
+    async def test_decision_continue_adds_continuation_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When adjudication returns 'continue', the context_override gains a hint.
+
+        The continuation hint must appear in the context_override passed to
+        _execute_single_ac for the resumed AC.
+
+        [[INVARIANT: monolithic resume adjudication event type is execution.serial.resume.monolithic_adjudicated]]
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        async def fake_adjudicate_continue(
+            adapter: Any,
+            ac_content: str,
+            context_section: str,
+            *,
+            model: str | None = None,
+        ) -> tuple[str, str]:
+            return "continue", "DECISION: continue\nSome partial work detected."
+
+        monkeypatch.setattr(
+            serial_mod, "_adjudicate_monolithic_resume", fake_adjudicate_continue
+        )
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        seed = _make_seed("AC 0 — done", "AC 1 — failing, will continue")
+        executor, store, appended = self._make_executor_with_checkpoint(tmp_path)
+
+        # First run: AC 0 succeeds, AC 1 fails.
+        async def fake_first_run(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            if ac_index == 0:
+                return _ok_result(ac_index, str(kwargs["ac_content"]))
+            return _fail_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_first_run  # type: ignore[method-assign]
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_cont_first",
+            execution_id="exec_cont_first",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        # Resume: capture context for AC 1.
+        captured_context: list[str] = []
+
+        async def fake_resume(**kwargs: Any) -> ACExecutionResult:
+            captured_context.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_resume  # type: ignore[method-assign]
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_cont_resume",
+            execution_id="exec_cont_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="sess_cont_first",
+        )
+
+        # captured_context[0] is for AC 1 (AC 0 was skipped).
+        assert len(captured_context) == 1
+        ac1_ctx = captured_context[0]
+        assert "Resume Instruction" in ac1_ctx, (
+            "DECISION: continue must add 'Resume Instruction' to context"
+        )
+        assert "CONTINUE" in ac1_ctx.upper() or "continue" in ac1_ctx.lower(), (
+            "Context must mention continuing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_decision_restart_does_not_add_hint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When adjudication returns 'restart', NO continuation hint is added.
+
+        The context_override for the restarted AC must not contain the
+        Resume Instruction section.
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        async def fake_adjudicate_restart(
+            adapter: Any,
+            ac_content: str,
+            context_section: str,
+            *,
+            model: str | None = None,
+        ) -> tuple[str, str]:
+            return "restart", "DECISION: restart\nStarting fresh."
+
+        monkeypatch.setattr(
+            serial_mod, "_adjudicate_monolithic_resume", fake_adjudicate_restart
+        )
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        seed = _make_seed("AC 0 — done", "AC 1 — failing, will restart")
+        executor, store, appended = self._make_executor_with_checkpoint(tmp_path)
+
+        # First run: AC 0 succeeds, AC 1 fails.
+        async def fake_first_run(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            if ac_index == 0:
+                return _ok_result(ac_index, str(kwargs["ac_content"]))
+            return _fail_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_first_run  # type: ignore[method-assign]
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_rst_first",
+            execution_id="exec_rst_first",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+
+        # Resume run.
+        captured_context: list[str] = []
+
+        async def fake_resume(**kwargs: Any) -> ACExecutionResult:
+            captured_context.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_resume  # type: ignore[method-assign]
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_rst_resume",
+            execution_id="exec_rst_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="sess_rst_first",
+        )
+
+        # AC 1 ran once.
+        assert len(captured_context) == 1
+        ac1_ctx = captured_context[0]
+        # No Resume Instruction section for restart decision.
+        assert "Resume Instruction" not in ac1_ctx, (
+            "DECISION: restart must NOT add a Resume Instruction section"
+        )
+
+    @pytest.mark.asyncio
+    async def test_adjudication_not_triggered_in_fresh_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adjudication is NEVER called in a fresh run (no resume_session_id)."""
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        adj_calls: list[Any] = []
+
+        async def fake_adjudicate(*args: Any, **kwargs: Any) -> tuple[str, str]:
+            adj_calls.append(True)
+            return "restart", ""
+
+        monkeypatch.setattr(serial_mod, "_adjudicate_monolithic_resume", fake_adjudicate)
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        seed = _make_seed("AC 0", "AC 1")
+        executor = _make_executor()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_fresh",
+            execution_id="exec_fresh",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            # No resume_session_id → fresh run.
+        )
+
+        assert adj_calls == [], "Adjudication must not fire in a fresh (non-resume) run"
+
+    @pytest.mark.asyncio
+    async def test_adjudication_not_triggered_when_no_checkpoint_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adjudication is NOT triggered when resume is requested but no checkpoint exists.
+
+        When last_completed_ac_index == -1 (checkpoint missing), the condition
+        `last_completed_ac_index >= 0` prevents adjudication.
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        adj_calls: list[Any] = []
+
+        async def fake_adjudicate(*args: Any, **kwargs: Any) -> tuple[str, str]:
+            adj_calls.append(True)
+            return "restart", ""
+
+        monkeypatch.setattr(serial_mod, "_adjudicate_monolithic_resume", fake_adjudicate)
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        seed = _make_seed("AC 0")
+        executor, store, _ = self._make_executor_with_checkpoint(tmp_path)
+        # Do NOT write any checkpoint — store is empty.
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,),)
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_no_ckpt_resume",
+            execution_id="exec_no_ckpt_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="sess_that_never_ran",
+        )
+
+        # No checkpoint loaded → last_completed_ac_index == -1 → no adjudication.
+        assert adj_calls == [], (
+            "Adjudication must not fire when no checkpoint was found "
+            "(last_completed_ac_index == -1)"
+        )
+
+    def test_create_monolithic_resume_adjudicated_event_fields(self) -> None:
+        """create_monolithic_resume_adjudicated_event produces correct event structure.
+
+        [[INVARIANT: monolithic resume adjudication event type is execution.serial.resume.monolithic_adjudicated]]
+        [[INVARIANT: decision field is always "continue" or "restart" (never None or empty)]]
+        """
+        from ouroboros.orchestrator.events import create_monolithic_resume_adjudicated_event
+
+        event = create_monolithic_resume_adjudicated_event(
+            session_id="sess_mono_event",
+            execution_id="exec_mono_event",
+            ac_index=2,
+            decision="continue",
+            raw_response_preview="DECISION: continue\nSome partial work.",
+        )
+
+        assert event.type == "execution.serial.resume.monolithic_adjudicated"
+        assert event.aggregate_type == "execution"
+        assert event.aggregate_id == "exec_mono_event"
+        assert event.data["session_id"] == "sess_mono_event"
+        assert event.data["execution_id"] == "exec_mono_event"
+        assert event.data["ac_index"] == 2
+        assert event.data["decision"] == "continue"
+        assert "DECISION: continue" in event.data["raw_response_preview"]
+        assert "timestamp" in event.data
+
+    def test_create_monolithic_resume_adjudicated_event_truncates_preview(self) -> None:
+        """raw_response_preview is capped at 200 chars."""
+        from ouroboros.orchestrator.events import create_monolithic_resume_adjudicated_event
+
+        long_response = "DECISION: restart\n" + "A" * 500
+        event = create_monolithic_resume_adjudicated_event(
+            session_id="s",
+            execution_id="e",
+            ac_index=0,
+            decision="restart",
+            raw_response_preview=long_response,
+        )
+
+        assert len(event.data["raw_response_preview"]) <= 200
+
+    @pytest.mark.asyncio
+    async def test_adjudication_event_fields_in_execute_serial(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adjudication event has correct session_id, execution_id, and decision.
+
+        [[INVARIANT: monolithic resume adjudication event type is execution.serial.resume.monolithic_adjudicated]]
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        async def fake_adjudicate(
+            adapter: Any,
+            ac_content: str,
+            context_section: str,
+            *,
+            model: str | None = None,
+        ) -> tuple[str, str]:
+            return "continue", "DECISION: continue\nWork in progress."
+
+        monkeypatch.setattr(serial_mod, "_adjudicate_monolithic_resume", fake_adjudicate)
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path / "artifacts"))
+
+        seed = _make_seed("AC 0 — completed", "AC 1 — to be resumed")
+        executor, store, appended = self._make_executor_with_checkpoint(tmp_path)
+
+        # First run: AC 0 completes, AC 1 fails.
+        async def fake_first_run(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            if ac_index == 0:
+                return _ok_result(ac_index, str(kwargs["ac_content"]))
+            return _fail_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_first_run  # type: ignore[method-assign]
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_ev_first",
+            execution_id="exec_ev_first",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            fail_fast=True,
+        )
+        appended.clear()  # clear first-run events
+
+        # Resume run.
+        async def fake_resume(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_resume  # type: ignore[method-assign]
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_ev_resume",
+            execution_id="exec_ev_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="sess_ev_first",
+        )
+
+        adj_events = [
+            e for e in appended
+            if e.type == "execution.serial.resume.monolithic_adjudicated"
+        ]
+        assert len(adj_events) == 1
+        ev = adj_events[0]
+        assert ev.data["session_id"] == "sess_ev_resume"
+        assert ev.data["execution_id"] == "exec_ev_resume"
+        assert ev.data["ac_index"] == 1
+        assert ev.data["decision"] == "continue"
+        assert ev.aggregate_id == "exec_ev_resume"
