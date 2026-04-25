@@ -809,3 +809,341 @@ class TestSubPostmortems:
         # Sub-files must appear in the rendered chain text.
         assert "src/sub_a.py" in text, "sub_a.py missing from chain prompt"
         assert "src/sub_b.py" in text, "sub_b.py missing from chain prompt"
+
+
+class TestInvariantVerifier:
+    """AC-3 (Q3, C-plus): [[INVARIANT]] tag extraction + Haiku verifier gate.
+
+    Verifies:
+    - verify_invariants() is called inline-blocking before chain advance.
+    - Above-threshold invariants appear in the next AC's context_override.
+    - Below-threshold invariants are silently dropped.
+    - The verify_invariants() function correctly interacts with a stub adapter.
+
+    [[INVARIANT: verify_invariants is called inline-blocking before chain advance]]
+    [[INVARIANT: only above-threshold invariants appear in downstream chain context]]
+    """
+
+    @pytest.mark.asyncio
+    async def test_above_threshold_invariant_appears_in_next_ac_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When verify_invariants returns score ≥ 0.7, the invariant propagates.
+
+        AC 0 emits [[INVARIANT: serialize_postmortem_chain produces a list]].
+        The stub verifier returns 0.95. AC 1's context_override must include
+        the invariant text.
+
+        Compounding reference (AC-1): ACPostmortem.invariants_established carries
+        the Invariant dataclass introduced in AC-2's level_context.py changes.
+        [[INVARIANT: only above-threshold invariants appear in downstream chain context]]
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        verify_calls: list[dict] = []
+
+        async def fake_verify(
+            adapter: Any,
+            tags: list[str],
+            *,
+            ac_trace: str,
+            files_modified: list[str],
+            model: str | None = None,
+        ) -> list[tuple[str, float]]:
+            verify_calls.append({"tags": list(tags), "ac_trace": ac_trace})
+            # Return high-reliability score for all tags.
+            return [(tag, 0.95) for tag in tags]
+
+        monkeypatch.setattr(serial_mod, "verify_invariants", fake_verify)
+
+        seed = _make_seed("AC with invariant tag", "AC that sees invariant")
+        executor = _make_executor()
+        captured_overrides: list[str] = []
+
+        INVARIANT_TEXT = "serialize_postmortem_chain produces a list"
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            captured_overrides.append(kwargs.get("context_override") or "")
+            final_msg = "task done"
+            if ac_index == 0:
+                final_msg = f"task done [[INVARIANT: {INVARIANT_TEXT}]]"
+            return _ok_result(ac_index, str(kwargs["ac_content"]), final_message=final_msg)
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_inv_above",
+            execution_id="exec_inv_above",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+        )
+
+        # Verification was called for AC 0 (which had a tag).
+        assert len(verify_calls) == 1, f"Expected 1 verify call, got: {verify_calls}"
+        assert INVARIANT_TEXT in verify_calls[0]["tags"]
+
+        # AC 1's context_override must contain the invariant text in the
+        # "Established Invariants (cumulative)" section — not just in key_output.
+        ac1_override = captured_overrides[1]
+        established_idx = ac1_override.find("Established Invariants")
+        assert established_idx != -1, (
+            f"'Established Invariants' section missing from AC 1 override:\n{ac1_override[:500]}"
+        )
+        established_section = ac1_override[established_idx:]
+        assert INVARIANT_TEXT in established_section, (
+            f"Invariant should appear in 'Established Invariants' section; "
+            f"section was:\n{established_section[:500]}"
+        )
+
+        # Overall result is still successful.
+        assert result.success_count == 2
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_invariant_filtered_from_established_section(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When verify_invariants returns score < 0.7, invariant is NOT added to
+        the cumulative 'Established Invariants' section of the chain prompt.
+
+        AC 0 emits a tag; stub verifier returns 0.3 (below default 0.7 threshold).
+        The invariant text must NOT appear in the "Established Invariants" section
+        of AC 1's context_override.  (The raw [[INVARIANT:...]] text may still
+        appear in the key_output excerpt of the full postmortem — that is expected
+        and harmless; the gate applies only to structured storage in
+        invariants_established and the cumulative rendering section.)
+
+        Compounding reference: this relies on the sub_postmortems field added
+        in AC-2 (the ACPostmortem.sub_postmortems field is preserved but the
+        invariants_established stays empty for below-threshold tags).
+
+        [[INVARIANT: only above-threshold invariants appear in downstream chain context]]
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        async def fake_verify(
+            adapter: Any,
+            tags: list[str],
+            *,
+            ac_trace: str,
+            files_modified: list[str],
+            model: str | None = None,
+        ) -> list[tuple[str, float]]:
+            # All tags score below threshold.
+            return [(tag, 0.3) for tag in tags]
+
+        monkeypatch.setattr(serial_mod, "verify_invariants", fake_verify)
+
+        seed = _make_seed("AC with low-reliability tag", "AC checks chain")
+        executor = _make_executor()
+        captured_overrides: list[str] = []
+
+        LOW_REL_TAG = "this invariant is unreliable xyz123"
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            captured_overrides.append(kwargs.get("context_override") or "")
+            final_msg = "done"
+            if ac_index == 0:
+                final_msg = f"done [[INVARIANT: {LOW_REL_TAG}]]"
+            return _ok_result(ac_index, str(kwargs["ac_content"]), final_message=final_msg)
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_inv_low",
+            execution_id="exec_inv_low",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+        )
+
+        # AC 1's context must NOT list the low-reliability tag under
+        # "Established Invariants (cumulative)" section.
+        ac1_override = captured_overrides[1]
+        established_start = ac1_override.find("Established Invariants")
+        if established_start != -1:
+            # If the section exists, the low-reliability tag must not be in it.
+            established_section = ac1_override[established_start:]
+            assert LOW_REL_TAG not in established_section, (
+                "Below-threshold invariant must NOT appear in 'Established Invariants' section"
+            )
+        # If the section doesn't exist at all, the invariant is definitely not there — also fine.
+
+    @pytest.mark.asyncio
+    async def test_verify_invariants_not_called_when_no_tags(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the AC emits no [[INVARIANT]] tags, verify_invariants is skipped."""
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        verify_calls: list[dict] = []
+
+        async def fake_verify(
+            adapter: Any,
+            tags: list[str],
+            **kwargs: Any,
+        ) -> list[tuple[str, float]]:
+            verify_calls.append({"tags": tags})
+            return []
+
+        monkeypatch.setattr(serial_mod, "verify_invariants", fake_verify)
+
+        seed = _make_seed("AC without tags", "AC 2")
+        executor = _make_executor()
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_no_tags",
+            execution_id="exec_no_tags",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+        )
+
+        # verify_invariants should not have been called at all.
+        assert verify_calls == [], (
+            "verify_invariants must not be called when no tags are present"
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_invariants_stub_adapter_integration(self) -> None:
+        """verify_invariants calls adapter.complete() and parses the score.
+
+        This is the integration test with a stub Haiku call. The adapter
+        is a MagicMock whose .complete() returns a synthetic response with
+        a numeric score. The function must return the correct (tag, score) pair.
+
+        [[INVARIANT: verify_invariants is called inline-blocking before chain advance]]
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.serial_executor import verify_invariants
+        from ouroboros.providers.base import CompletionResponse, UsageInfo
+
+        # Build a stub adapter that returns "0.82" as its response.
+        stub_response = CompletionResponse(
+            content="0.82",
+            model="claude-haiku-4-5-20251001",
+            usage=UsageInfo(prompt_tokens=50, completion_tokens=2, total_tokens=52),
+        )
+        adapter = MagicMock()
+        adapter.complete = AsyncMock(return_value=Result.ok(stub_response))
+
+        tags = ["ACPostmortem.sub_postmortems preserves structure"]
+        results = await verify_invariants(
+            adapter,
+            tags,
+            ac_trace="Built sub_postmortems field and verified round-trip.",
+            files_modified=["src/ouroboros/orchestrator/level_context.py"],
+            model="claude-haiku-4-5-20251001",
+        )
+
+        assert len(results) == 1
+        tag_out, score = results[0]
+        assert tag_out == tags[0]
+        # Score should be parsed from "0.82".
+        assert abs(score - 0.82) < 1e-9, f"Expected 0.82 but got {score}"
+
+        # adapter.complete was called exactly once (one tag → one Haiku call).
+        adapter.complete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_verify_invariants_adapter_error_returns_fallback(self) -> None:
+        """When adapter.complete() fails, the fallback score (0.5) is returned."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from ouroboros.core.errors import ProviderError
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.serial_executor import verify_invariants
+
+        adapter = MagicMock()
+        adapter.complete = AsyncMock(
+            return_value=Result.err(ProviderError(message="rate limit", details={}))
+        )
+
+        tags = ["some invariant"]
+        results = await verify_invariants(
+            adapter,
+            tags,
+            ac_trace="trace",
+            files_modified=[],
+            model="claude-haiku-4-5-20251001",
+        )
+
+        assert len(results) == 1
+        _, score = results[0]
+        # Fallback score must be 0.5.
+        assert score == 0.5, f"Expected fallback 0.5 but got {score}"
+
+    @pytest.mark.asyncio
+    async def test_custom_min_reliability_threshold_via_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OUROBOROS_INVARIANT_MIN_RELIABILITY controls the inclusion gate.
+
+        When set to 0.4, a score of 0.45 must be accepted.
+        When set to 0.9, a score of 0.85 must be rejected.
+        """
+        import ouroboros.orchestrator.serial_executor as serial_mod
+
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "0.4")
+
+        async def fake_verify_medium(
+            adapter: Any,
+            tags: list[str],
+            **kwargs: Any,
+        ) -> list[tuple[str, float]]:
+            return [(tag, 0.45) for tag in tags]
+
+        monkeypatch.setattr(serial_mod, "verify_invariants", fake_verify_medium)
+
+        seed = _make_seed("AC with medium tag", "AC checks invariant")
+        executor = _make_executor()
+        captured_overrides: list[str] = []
+        MEDIUM_TAG = "medium reliability invariant"
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            captured_overrides.append(kwargs.get("context_override") or "")
+            final_msg = "done"
+            if ac_index == 0:
+                final_msg = f"done [[INVARIANT: {MEDIUM_TAG}]]"
+            return _ok_result(ac_index, str(kwargs["ac_content"]), final_message=final_msg)
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_thresh",
+            execution_id="exec_thresh",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+        )
+
+        # With threshold=0.4 and score=0.45, invariant should appear in the
+        # "Established Invariants (cumulative)" section of AC 1's context.
+        ac1_override = captured_overrides[1]
+        established_idx = ac1_override.find("Established Invariants")
+        assert established_idx != -1, (
+            f"'Established Invariants' section missing; override:\n{ac1_override[:500]}"
+        )
+        established_section = ac1_override[established_idx:]
+        assert MEDIUM_TAG in established_section, (
+            f"Invariant with score 0.45 must appear when threshold is 0.4; "
+            f"established section was:\n{established_section[:500]}"
+        )

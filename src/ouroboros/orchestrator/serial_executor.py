@@ -28,6 +28,7 @@ Out of scope for phase 1 (follow-up milestones):
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,9 +37,11 @@ from ouroboros.orchestrator.events import create_ac_postmortem_captured_event
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
     ACPostmortem,
+    Invariant,
     PostmortemChain,
     PostmortemStatus,
     build_postmortem_chain_prompt,
+    extract_invariant_tags,
     extract_level_context,
     serialize_postmortem_chain,
 )
@@ -66,6 +69,173 @@ log = get_logger(__name__)
 
 # Default directory for chain artifact output. Override with OUROBOROS_CHAIN_ARTIFACT_DIR.
 _DEFAULT_CHAIN_ARTIFACT_DIR = "docs/brainstorm"
+
+# Q3 (C-plus): Invariant reliability gate defaults.
+# OUROBOROS_INVARIANT_MIN_RELIABILITY — minimum score for an invariant to be stored.
+_DEFAULT_INVARIANT_MIN_RELIABILITY = 0.7
+# Regex to extract a float score from a Haiku response (first 0.0-1.0 match).
+_HAIKU_SCORE_RE = re.compile(r"\b(1\.0+|0\.\d+)\b")
+# Fallback reliability when the verifier response cannot be parsed.
+_HAIKU_SCORE_FALLBACK = 0.5
+
+
+def _get_min_reliability() -> float:
+    """Return the minimum reliability threshold for invariant inclusion.
+
+    Reads ``OUROBOROS_INVARIANT_MIN_RELIABILITY`` env var; defaults to 0.7.
+    Invalid values fall back to the default silently.
+    """
+    raw = os.environ.get("OUROBOROS_INVARIANT_MIN_RELIABILITY", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return _DEFAULT_INVARIANT_MIN_RELIABILITY
+
+
+async def _verify_single_tag(
+    adapter: Any,
+    tag: str,
+    *,
+    ac_trace: str,
+    files_modified: list[str],
+    model: str,
+) -> float:
+    """Ask the Haiku verifier to score one [[INVARIANT]] tag.
+
+    Sends a short prompt asking the model to return a reliability score
+    0.0–1.0. Parses the first float in the response. On any error
+    (API failure, unparseable response) returns :data:`_HAIKU_SCORE_FALLBACK`.
+
+    Args:
+        adapter: LLM adapter with a :meth:`complete` method.
+        tag: Invariant text to verify.
+        ac_trace: Final message from the AC (work summary / trace).
+        files_modified: Files changed during the AC.
+        model: Model identifier to use for the call.
+
+    Returns:
+        Reliability score in [0.0, 1.0].
+    """
+    from ouroboros.providers.base import CompletionConfig, Message, MessageRole
+
+    files_str = ", ".join(files_modified) if files_modified else "(none)"
+    trace_preview = (ac_trace or "")[:800]
+
+    user_content = (
+        "You are a fact-checking assistant for a software development workflow.\n\n"
+        "An AI agent declared the following invariant after completing a task:\n\n"
+        f'  Invariant: "{tag}"\n\n'
+        "Context:\n"
+        f"  Files modified: {files_str}\n"
+        f"  Agent trace / final output:\n  {trace_preview}\n\n"
+        "Is this invariant actually supported by the evidence above?\n"
+        "Reply with ONLY a single number between 0.0 and 1.0, where:\n"
+        "  1.0 = definitely supported\n"
+        "  0.5 = uncertain\n"
+        "  0.0 = not supported or contradicted\n"
+        "Be conservative — prefer 0.5 when evidence is ambiguous.\n"
+        "Reply with the number only, nothing else."
+    )
+
+    config = CompletionConfig(model=model, temperature=0.0, max_tokens=16)
+    messages = [Message(role=MessageRole.USER, content=user_content)]
+
+    try:
+        result = await adapter.complete(messages, config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "invariant_verifier.adapter_error",
+            tag=tag[:60],
+            error=str(exc),
+        )
+        return _HAIKU_SCORE_FALLBACK
+
+    if result.is_err:
+        log.warning(
+            "invariant_verifier.llm_failed",
+            tag=tag[:60],
+            error=str(result.error),
+        )
+        return _HAIKU_SCORE_FALLBACK
+
+    raw_text = (result.value.content or "").strip()
+    match = _HAIKU_SCORE_RE.search(raw_text)
+    if match:
+        try:
+            score = float(match.group(1))
+            return max(0.0, min(1.0, score))
+        except ValueError:
+            pass
+
+    log.warning(
+        "invariant_verifier.unparseable_score",
+        tag=tag[:60],
+        response_preview=raw_text[:80],
+    )
+    return _HAIKU_SCORE_FALLBACK
+
+
+async def verify_invariants(
+    adapter: Any,
+    tags: list[str],
+    *,
+    ac_trace: str,
+    files_modified: list[str],
+    model: str | None = None,
+) -> list[tuple[str, float]]:
+    """Verify ``[[INVARIANT]]`` tags via a Haiku model call per tag.
+
+    Implements the Q3 (C-plus) Haiku verifier gate.  For each tag, a short
+    prompt is sent to the ``model`` asking for a reliability score 0.0–1.0.
+    Results are returned in input order; errors result in :data:`_HAIKU_SCORE_FALLBACK`.
+
+    This function is intentionally **inline / blocking** — callers must
+    ``await`` it before advancing the postmortem chain so the verified
+    invariants are visible to the next AC's prompt.
+
+    Args:
+        adapter: LLM adapter used for completion calls (must implement
+            the :class:`~ouroboros.providers.base.LLMAdapter` protocol).
+        tags: Extracted invariant text strings (from :func:`~ouroboros.orchestrator.level_context.extract_invariant_tags`).
+        ac_trace: Final message from the AC, used as evidence for verification.
+        files_modified: Files changed during the AC, used as evidence.
+        model: Override model. When ``None``, resolved via
+            :func:`~ouroboros.config.loader.get_invariant_verifier_model`.
+
+    Returns:
+        List of ``(tag_text, reliability_score)`` pairs in input order.
+        Empty when ``tags`` is empty.
+
+    [[INVARIANT: verify_invariants is called inline-blocking before chain advance]]
+    [[INVARIANT: only above-threshold invariants appear in downstream chain context]]
+    """
+    if not tags:
+        return []
+
+    if model is None:
+        from ouroboros.config.loader import get_invariant_verifier_model
+
+        model = get_invariant_verifier_model()
+
+    results: list[tuple[str, float]] = []
+    for tag in tags:
+        score = await _verify_single_tag(
+            adapter,
+            tag,
+            ac_trace=ac_trace,
+            files_modified=files_modified,
+            model=model,
+        )
+        log.info(
+            "invariant_verifier.tag_scored",
+            tag=tag[:80],
+            score=score,
+            model=model,
+        )
+        results.append((tag, score))
+    return results
 
 
 def _render_chain_as_markdown(
@@ -412,6 +582,63 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             postmortem = self._build_postmortem_from_result(
                 result, workspace_root=self._task_cwd
             )
+
+            # Q3 (C-plus): Extract [[INVARIANT: ...]] tags inline-blocking before
+            # chain advance so the next AC's prompt sees verified invariants.
+            # Scan final_message first; fall back to full message list.
+            inv_tags = extract_invariant_tags(result.final_message or "")
+            if not inv_tags and result.messages:
+                inv_tags = extract_invariant_tags(result.messages)
+
+            if inv_tags:
+                verified_pairs = await verify_invariants(
+                    self._adapter,
+                    inv_tags,
+                    ac_trace=result.final_message or "",
+                    files_modified=list(postmortem.summary.files_modified),
+                )
+                min_rel = _get_min_reliability()
+                trusted: list[Invariant] = [
+                    Invariant(
+                        text=tag,
+                        reliability=score,
+                        occurrences=1,
+                        first_seen_ac_id=f"ac_{ac_index}",
+                    )
+                    for tag, score in verified_pairs
+                    if score >= min_rel
+                ]
+                if trusted:
+                    postmortem = ACPostmortem(
+                        summary=postmortem.summary,
+                        diff_summary=postmortem.diff_summary,
+                        tool_trace_digest=postmortem.tool_trace_digest,
+                        gotchas=postmortem.gotchas,
+                        qa_suggestions=postmortem.qa_suggestions,
+                        invariants_established=tuple(trusted),
+                        retry_attempts=postmortem.retry_attempts,
+                        status=postmortem.status,
+                        duration_seconds=postmortem.duration_seconds,
+                        ac_native_session_id=postmortem.ac_native_session_id,
+                        sub_postmortems=postmortem.sub_postmortems,
+                    )
+                    log.info(
+                        "serial_executor.invariants.captured",
+                        session_id=session_id,
+                        ac_index=ac_index,
+                        total_tags=len(inv_tags),
+                        trusted_count=len(trusted),
+                        min_reliability=min_rel,
+                    )
+                else:
+                    log.info(
+                        "serial_executor.invariants.all_below_threshold",
+                        session_id=session_id,
+                        ac_index=ac_index,
+                        total_tags=len(inv_tags),
+                        min_reliability=min_rel,
+                    )
+
             chain = chain.append(postmortem)
 
             await self._safe_emit_event(
@@ -616,5 +843,6 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 __all__ = [
     "SerialCompoundingExecutor",
     "linearize_execution_plan",
+    "verify_invariants",
     "write_chain_artifact",
 ]
