@@ -2119,3 +2119,332 @@ class TestRenderGate:
         # The rendered prompt hides it (threshold=0.7).
         text = chain.to_prompt_text(min_reliability=0.7)
         assert "BELOW_THRESHOLD claim" not in text
+
+
+# ---------------------------------------------------------------------------
+# Sub-AC 4: Additional tests for invariant insertion, occurrence bumping,
+# reliability averaging, contradiction detection, and threshold-filter gating.
+#
+# These tests build on the facts established by prior ACs:
+#   AC-1: end-of-run chain artifact exists in docs/brainstorm/chain-*.md
+#   AC-2: ACPostmortem.sub_postmortems preserves structure in serialized chain;
+#         to_prompt_text flattens sub-AC data; parent digest fields are unions
+#   AC-3: merge_invariants bumps occurrences and averages reliability on
+#         re-declaration; NOT-prefix contradictions set is_contradicted=True;
+#         OUROBOROS_INVARIANT_MIN_RELIABILITY defaults to 0.7
+# ---------------------------------------------------------------------------
+
+
+class TestACPostmortemFullTextRenderGate:
+    """Tests for ACPostmortem.to_full_text() min_reliability gate.
+
+    ``to_full_text`` is called by ``to_prompt_text`` for the "recent window"
+    full-form entries.  Its per-postmortem reliability gate must be consistent
+    with the cumulative-invariants block in ``to_prompt_text``.
+
+    [[INVARIANT: to_full_text applies min_reliability gate to per-AC invariants]]
+    [[INVARIANT: contradicted invariants excluded from to_full_text at any threshold]]
+    """
+
+    def test_to_full_text_default_shows_all_non_contradicted(self) -> None:
+        """Default call (min_reliability=0.0) shows all non-contradicted invariants."""
+        inv = Invariant(text="LOW_SCORE fact", reliability=0.1, occurrences=1, first_seen_ac_id="ac_0")
+        summary = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=(inv,))
+
+        text = pm.to_full_text()
+        assert "LOW_SCORE fact" in text
+
+    def test_to_full_text_with_min_reliability_filters_below_threshold(self) -> None:
+        """to_full_text hides invariants below the given reliability threshold."""
+        low_inv = Invariant(
+            text="LOW_CONF claim", reliability=0.3, occurrences=1, first_seen_ac_id="ac_0"
+        )
+        high_inv = Invariant(
+            text="HIGH_CONF claim", reliability=0.95, occurrences=1, first_seen_ac_id="ac_0"
+        )
+        summary = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=(low_inv, high_inv))
+
+        text = pm.to_full_text(min_reliability=0.7)
+        assert "HIGH_CONF claim" in text
+        assert "LOW_CONF claim" not in text
+
+    def test_to_full_text_excludes_contradicted_at_zero_threshold(self) -> None:
+        """Contradicted invariants never appear in to_full_text, even at min_reliability=0.0.
+
+        Builds on the AC-2 (B-prime) invariant:
+        'NOT-prefix contradictions set is_contradicted=True and reliability=0.0'.
+        """
+        contradicted = Invariant(
+            text="NOT feature is on",
+            reliability=0.0,
+            occurrences=1,
+            first_seen_ac_id="ac_2",
+            is_contradicted=True,
+        )
+        summary = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=(contradicted,))
+
+        # Even at zero threshold (show all), contradicted ones stay hidden.
+        text = pm.to_full_text(min_reliability=0.0)
+        assert "NOT feature is on" not in text
+
+    def test_to_full_text_no_invariants_section_when_all_filtered(self) -> None:
+        """When all invariants are filtered, the 'Invariants established' header is absent."""
+        low_inv = Invariant(
+            text="FILTERED fact", reliability=0.2, occurrences=1, first_seen_ac_id="ac_0"
+        )
+        summary = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=(low_inv,))
+
+        text = pm.to_full_text(min_reliability=0.7)
+        assert "Invariants established" not in text
+        assert "FILTERED fact" not in text
+
+    def test_to_full_text_exactly_at_threshold_included(self) -> None:
+        """Invariant exactly at min_reliability threshold appears (>= comparison)."""
+        inv = Invariant(
+            text="BORDERLINE inv", reliability=0.7, occurrences=1, first_seen_ac_id="ac_0"
+        )
+        summary = ACContextSummary(ac_index=0, ac_content="AC 1", success=True)
+        pm = ACPostmortem(summary=summary, invariants_established=(inv,))
+
+        text = pm.to_full_text(min_reliability=0.7)
+        assert "BORDERLINE inv" in text
+
+
+class TestRenderGateSectionHeader:
+    """Tests that the 'Established Invariants' section header is managed correctly.
+
+    When all cumulative invariants are below the threshold, the section header
+    must be absent too (not just the invariant text).
+    """
+
+    def test_all_below_threshold_omits_section_header(self) -> None:
+        """When all invariants fail the threshold, the section header is absent."""
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "WEAK_A", 0.1),
+                _mk_pm_with_reliability(1, "WEAK_B", 0.2),
+            )
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "Established Invariants" not in text
+        assert "WEAK_A" not in text
+        assert "WEAK_B" not in text
+
+    def test_section_header_present_when_any_passes_threshold(self) -> None:
+        """Section header appears when at least one invariant passes threshold."""
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "WEAK_X", 0.1),
+                _mk_pm_with_reliability(1, "STRONG_Y", 0.9),
+            )
+        )
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "Established Invariants" in text
+        assert "STRONG_Y" in text
+        assert "WEAK_X" not in text
+
+    def test_contradicted_only_chain_omits_section_header(self) -> None:
+        """A chain with only contradicted invariants omits the section header."""
+        chain = PostmortemChain(
+            postmortems=(
+                _mk_pm_with_reliability(0, "NEGATED_CLAIM", 0.0, is_contradicted=True),
+            )
+        )
+        text = chain.to_prompt_text(min_reliability=0.0)
+        assert "Established Invariants" not in text
+        assert "NEGATED_CLAIM" not in text
+
+
+class TestInvariantFullLifecycle:
+    """Integration tests for the full invariant lifecycle across multiple ACs.
+
+    Demonstrates compounding by building a 3-AC chain where:
+    - AC-0 establishes invariants (referencing AC-1's chain artifact fact)
+    - AC-1 re-declares one, bumping occurrence and blending reliability
+    - AC-2 contradicts one, establishing a new one
+
+    This mirrors how the serial compounding executor uses merge_invariants
+    after each AC, then appends to the chain, then renders for the next AC.
+
+    [[INVARIANT: full lifecycle: establish -> re-declare -> contradict -> gate]]
+    [[INVARIANT: serialized chain retains contradicted invariants for audit]]
+    """
+
+    def test_three_ac_lifecycle_occurrence_bumping_and_contradiction(self) -> None:
+        """Full 3-AC lifecycle: establish, bump, contradict; render shows only trusted."""
+        chain = PostmortemChain()
+
+        # AC-0: establishes "X is stable" (reliability=0.9) and "auth required" (0.8).
+        # These two invariants reference data patterns established by AC-1 and AC-2
+        # (chain artifact + sub-postmortem preservation).
+        inv_ac0 = chain.merge_invariants(
+            [("X is stable", 0.9), ("auth required", 0.8)],
+            source_ac_id="ac_0",
+        )
+        summary0 = ACContextSummary(ac_index=0, ac_content="Establish invariants", success=True)
+        pm0 = ACPostmortem(summary=summary0, invariants_established=inv_ac0)
+        chain = chain.append(pm0)
+
+        # AC-1: re-declares "X is stable" (occurrence bumps to 2, reliability blends).
+        inv_ac1 = chain.merge_invariants(
+            [("X is stable", 1.0)],  # confirms the claim
+            source_ac_id="ac_1",
+        )
+        assert inv_ac1[0].occurrences == 2
+        # Weighted mean: (0.9*1 + 1.0) / 2 = 0.95
+        assert abs(inv_ac1[0].reliability - 0.95) < 1e-6
+        assert inv_ac1[0].first_seen_ac_id == "ac_0"  # origin preserved
+
+        summary1 = ACContextSummary(ac_index=1, ac_content="Re-declare X", success=True)
+        pm1 = ACPostmortem(summary=summary1, invariants_established=inv_ac1)
+        chain = chain.append(pm1)
+
+        # AC-2: contradicts "auth required" with "not auth required".
+        inv_ac2 = chain.merge_invariants(
+            [("not auth required", 0.85), ("Y is new", 0.75)],
+            source_ac_id="ac_2",
+        )
+        # The contradiction is marked, and Y is fresh.
+        assert inv_ac2[0].is_contradicted is True
+        assert inv_ac2[0].reliability == 0.0
+        assert inv_ac2[1].is_contradicted is False
+        assert inv_ac2[1].occurrences == 1
+
+        summary2 = ACContextSummary(ac_index=2, ac_content="Contradict auth, add Y", success=True)
+        pm2 = ACPostmortem(summary=summary2, invariants_established=inv_ac2)
+        chain = chain.append(pm2)
+
+        # Render with threshold=0.7:
+        # - "X is stable" (reliability=0.95) → visible
+        # - "auth required" (reliability=0.8, not contradicted) → still visible from ac_0
+        # - "not auth required" (is_contradicted=True) → HIDDEN
+        # - "Y is new" (reliability=0.75) → visible
+        text = chain.to_prompt_text(min_reliability=0.7)
+        assert "X is stable" in text
+        assert "Y is new" in text
+        assert "not auth required" not in text
+
+    def test_three_ac_lifecycle_serializes_full_chain_including_contradicted(self) -> None:
+        """The serialized chain retains all invariants (including contradicted ones).
+
+        Builds on AC-1's invariant: 'end-of-run chain artifact exists in
+        docs/brainstorm/chain-*.md' — the chain artifact captures the FULL
+        state for auditing, even when the render gate hides some invariants.
+        """
+        chain = PostmortemChain()
+
+        # AC-0: establishes two invariants.
+        inv_ac0 = chain.merge_invariants(
+            [("chain artifact written at run end", 0.9)],
+            source_ac_id="ac_0",
+        )
+        summary0 = ACContextSummary(ac_index=0, ac_content="AC 0", success=True)
+        chain = chain.append(ACPostmortem(summary=summary0, invariants_established=inv_ac0))
+
+        # AC-1: contradicts the first invariant.
+        inv_ac1 = chain.merge_invariants(
+            [("not chain artifact written at run end", 0.6)],
+            source_ac_id="ac_1",
+        )
+        summary1 = ACContextSummary(ac_index=1, ac_content="AC 1", success=True)
+        chain = chain.append(ACPostmortem(summary=summary1, invariants_established=inv_ac1))
+
+        # Serialize the full chain — contradicted invariant must be present.
+        data = serialize_postmortem_chain(chain)
+        assert len(data) == 2
+        inv_data = data[1]["invariants_established"]
+        assert len(inv_data) == 1
+        assert inv_data[0]["is_contradicted"] is True
+        assert abs(inv_data[0]["reliability"]) < 1e-9  # reliability=0.0
+
+        # Rendered prompt excludes it.
+        text = chain.to_prompt_text(min_reliability=0.0)
+        assert "not chain artifact written at run end" not in text
+
+    def test_occurrence_and_reliability_compounds_across_four_acs(self) -> None:
+        """Occurrence count and blended reliability compound correctly over 4 ACs.
+
+        Demonstrates that the merge_invariants weighted-mean formula produces
+        consistent results across many re-declarations — the core value of
+        serial compounding.
+        """
+        chain = PostmortemChain()
+        scores = [0.6, 0.8, 1.0, 0.9]  # reliability scores per AC
+        expected_occurrences = [1, 2, 3, 4]
+        # Compute expected blended reliability step by step.
+        # Weighted mean: (prior_rel * prior_occ + new_score) / new_occ
+        rel = 0.6
+        for step, (score, expected_occ) in enumerate(
+            zip(scores[1:], expected_occurrences[1:]), start=1
+        ):
+            prior_occ = expected_occurrences[step - 1]
+            rel = (rel * prior_occ + score) / expected_occ
+
+        # Run the actual merge through 4 ACs.
+        chain_state = PostmortemChain()
+        for ac_idx, new_score in enumerate(scores):
+            merged = chain_state.merge_invariants(
+                [("compounding invariant", new_score)], source_ac_id=f"ac_{ac_idx}"
+            )
+            summary = ACContextSummary(
+                ac_index=ac_idx, ac_content=f"AC {ac_idx}", success=True
+            )
+            pm = ACPostmortem(summary=summary, invariants_established=merged)
+            chain_state = chain_state.append(pm)
+
+        cumulative = chain_state.cumulative_invariants()
+        assert len(cumulative) == 1
+        final_inv = cumulative[0]
+        assert final_inv.occurrences == 4
+        assert abs(final_inv.reliability - rel) < 1e-5
+
+    def test_re_declared_invariant_from_sub_postmortem_merge(self) -> None:
+        """Invariants from sub_postmortems (AC-2 B-prime) feed into merge correctly.
+
+        Builds on AC-2's invariant: 'parent digest fields are unions of its
+        own plus sub-postmortem fields'. When sub_postmortems are flattened
+        into the parent ACPostmortem by the serial executor, the resulting
+        parent pm's invariants_established participates in merge_invariants
+        for subsequent ACs exactly like any other postmortem.
+        """
+        # Simulate a parent ACPostmortem with flattened sub-postmortem invariants.
+        # The sub-PM contributed "api_token header is required" as an invariant.
+        sub_inv = Invariant(
+            text="api_token header is required",
+            reliability=0.85,
+            occurrences=1,
+            first_seen_ac_id="ac_0_sub_1",
+        )
+        # Build a fake sub-postmortem (structure preserved per AC-2 B-prime).
+        sub_summary = ACContextSummary(
+            ac_index=0, ac_content="Sub-AC: add auth header", success=True
+        )
+        sub_pm = ACPostmortem(summary=sub_summary, invariants_established=(sub_inv,))
+
+        # Parent postmortem has sub_postmortems field populated (AC-2 B-prime) and
+        # also carries the flattened invariants in its own invariants_established.
+        parent_summary = ACContextSummary(
+            ac_index=0, ac_content="Parent AC with decomposition", success=True
+        )
+        parent_pm = ACPostmortem(
+            summary=parent_summary,
+            invariants_established=(sub_inv,),  # flattened from sub
+            sub_postmortems=(sub_pm,),          # preserved for serialization
+        )
+        chain = PostmortemChain(postmortems=(parent_pm,))
+
+        # AC-1 re-declares the same invariant — merge should bump occurrence.
+        merged = chain.merge_invariants(
+            [("api_token header is required", 0.95)], source_ac_id="ac_1"
+        )
+        assert len(merged) == 1
+        assert merged[0].occurrences == 2
+        # Reliability blended: (0.85*1 + 0.95) / 2 = 0.9
+        assert abs(merged[0].reliability - 0.9) < 1e-6
+        # Canonical text from first occurrence preserved (AC-2 B-prime flattening)
+        assert merged[0].text == "api_token header is required"
+        assert merged[0].first_seen_ac_id == "ac_0_sub_1"
