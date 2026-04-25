@@ -41,6 +41,7 @@ from ouroboros.orchestrator.level_context import (
     PostmortemChain,
     PostmortemStatus,
     build_postmortem_chain_prompt,
+    deserialize_postmortem_chain,
     extract_invariant_tags,
     extract_level_context,
     serialize_postmortem_chain,
@@ -446,6 +447,98 @@ def _write_compounding_checkpoint(
         )
 
 
+def _load_compounding_checkpoint(
+    store: Any,
+    *,
+    seed_id: str,
+    session_id: str,
+    resume_session_id: str,
+) -> tuple[PostmortemChain, int]:
+    """Load a compounding checkpoint and deserialize the postmortem chain.
+
+    Attempts to load the checkpoint stored under ``seed_id`` from ``store``.
+    On success, deserializes the saved :class:`PostmortemChain` and returns
+    it along with the ``last_completed_ac_index`` from the checkpoint state.
+
+    On any failure (missing checkpoint, wrong mode, deserialization error),
+    logs a warning and returns an empty chain with ``last_completed_ac_index=-1``
+    so the caller falls back to a fresh run.
+
+    Args:
+        store: :class:`~ouroboros.persistence.checkpoint.CheckpointStore`
+            instance (or any object with a ``load`` method).
+        seed_id: Seed identifier — the key used to look up the checkpoint.
+        session_id: Current session id (used for log context only).
+        resume_session_id: Session id of the run being resumed (log context).
+
+    Returns:
+        ``(chain, last_completed_ac_index)`` where ``chain`` is the
+        deserialized :class:`PostmortemChain` (empty on failure) and
+        ``last_completed_ac_index`` is the 0-based index of the last
+        successfully completed AC (-1 if nothing was found).
+
+    [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+    [[INVARIANT: deserialized chain reflects all postmortems from the prior run up to last_completed_ac_index]]
+    """
+    try:
+        load_result = store.load(seed_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "serial_executor.resume.store_error",
+            session_id=session_id,
+            seed_id=seed_id,
+            resume_session_id=resume_session_id,
+            error=str(exc),
+        )
+        return PostmortemChain(), -1
+
+    if load_result.is_err:
+        log.warning(
+            "serial_executor.resume.no_checkpoint",
+            session_id=session_id,
+            seed_id=seed_id,
+            resume_session_id=resume_session_id,
+            error=str(load_result.error),
+        )
+        return PostmortemChain(), -1
+
+    checkpoint = load_result.value
+
+    try:
+        state = CompoundingCheckpointState.from_dict(checkpoint.state)
+    except (ValueError, KeyError, TypeError) as exc:
+        log.warning(
+            "serial_executor.resume.invalid_checkpoint",
+            session_id=session_id,
+            seed_id=seed_id,
+            resume_session_id=resume_session_id,
+            error=str(exc),
+        )
+        return PostmortemChain(), -1
+
+    try:
+        chain = deserialize_postmortem_chain(state.postmortem_chain)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "serial_executor.resume.deserialize_error",
+            session_id=session_id,
+            seed_id=seed_id,
+            resume_session_id=resume_session_id,
+            error=str(exc),
+        )
+        return PostmortemChain(), -1
+
+    log.info(
+        "serial_executor.resume.checkpoint_loaded",
+        session_id=session_id,
+        seed_id=seed_id,
+        resume_session_id=resume_session_id,
+        last_completed_ac_index=state.last_completed_ac_index,
+        postmortems_in_chain=len(chain.postmortems),
+    )
+    return chain, state.last_completed_ac_index
+
+
 def linearize_execution_plan(execution_plan: "StagedExecutionPlan") -> tuple[int, ...]:
     """Flatten a staged execution plan into a total AC order.
 
@@ -486,6 +579,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         execution_plan: "StagedExecutionPlan | None" = None,
         fail_fast: bool = True,
         externally_satisfied_acs: "dict[int, dict[str, Any]] | None" = None,
+        resume_session_id: str | None = None,
     ) -> ParallelExecutionResult:
         """Execute ACs strictly serially with compounding postmortems.
 
@@ -509,11 +603,22 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             externally_satisfied_acs: Map of AC indices already satisfied
                 externally. When provided, those ACs will be skipped and
                 recorded with SATISFIED_EXTERNALLY outcome.
+            resume_session_id: When provided, attempt to load a saved
+                compounding checkpoint for this seed and deserialize the
+                postmortem chain so that already-completed ACs are skipped.
+                The checkpoint is keyed by ``seed.metadata.seed_id`` —
+                ``resume_session_id`` is used for logging/diagnostics only
+                and does not change the storage key.  If no checkpoint is
+                found or the checkpoint is not a valid compounding checkpoint,
+                a warning is logged and execution continues from the beginning.
 
         Returns:
             ParallelExecutionResult with one stage per AC so downstream
             progress tooling sees a structurally similar shape to the
             parallel path.
+
+        [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
+        [[INVARIANT: deserialized chain is injected before the AC loop so resumed ACs see prior postmortems]]
         """
         if execution_plan is None:
             if dependency_graph is None:
@@ -524,7 +629,21 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         ac_order = linearize_execution_plan(execution_plan)
         start_time = datetime.now(UTC)
 
+        # Q6.2: Checkpoint loading for resume.
+        # When resume_session_id is supplied and a checkpoint store is available,
+        # attempt to load the persisted compounding state so prior ACs are skipped
+        # and their postmortems are injected into the rolling chain immediately.
         chain = PostmortemChain()
+        last_completed_ac_index: int = -1  # -1 means "nothing completed yet"
+
+        if resume_session_id is not None and self._checkpoint_store is not None:
+            chain, last_completed_ac_index = _load_compounding_checkpoint(
+                store=self._checkpoint_store,
+                seed_id=seed.metadata.seed_id,
+                session_id=session_id,
+                resume_session_id=resume_session_id,
+            )
+
         results: list[ACExecutionResult] = []
         stages: list[ParallelExecutionStageResult] = []
         execution_counters = {"messages_count": 0, "tool_calls_count": 0}
@@ -558,6 +677,39 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         results=(blocked,),
                         started=False,
                     )
+                )
+                continue
+
+            # Q6.2: Skip ACs that were already completed in a prior run (checkpoint resume).
+            # The chain is already seeded with their postmortems from deserialization,
+            # so we do NOT add to the chain here — just record the skipped result.
+            if ac_index <= last_completed_ac_index:
+                resumed_result = ACExecutionResult(
+                    ac_index=ac_index,
+                    ac_content=seed.acceptance_criteria[ac_index],
+                    success=True,
+                    final_message=(
+                        f"Skipped via checkpoint resume (session {resume_session_id}); "
+                        f"this AC (index {ac_index}) was already completed in the prior run."
+                    ),
+                    retry_attempt=0,
+                    outcome=ACExecutionOutcome.SATISFIED_EXTERNALLY,
+                )
+                results.append(resumed_result)
+                stages.append(
+                    ParallelExecutionStageResult(
+                        stage_index=position,
+                        ac_indices=(ac_index,),
+                        results=(resumed_result,),
+                        started=False,
+                    )
+                )
+                log.info(
+                    "serial_executor.ac.skipped_via_resume",
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    resume_session_id=resume_session_id,
+                    last_completed_ac_index=last_completed_ac_index,
                 )
                 continue
 
@@ -928,5 +1080,6 @@ __all__ = [
     "linearize_execution_plan",
     "verify_invariants",
     "write_chain_artifact",
+    "_load_compounding_checkpoint",
     "_write_compounding_checkpoint",
 ]

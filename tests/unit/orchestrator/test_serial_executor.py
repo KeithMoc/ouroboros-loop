@@ -1488,3 +1488,448 @@ class TestCheckpointWriting:
         entry = state.postmortem_chain[0]
         summary_data = entry.get("summary", {})
         assert summary_data.get("ac_content") == "Build the auth module"
+
+
+class TestCheckpointResume:
+    """AC-4 (Q6.2) Sub-AC 1: Checkpoint loading and postmortem chain deserialization.
+
+    Verifies that resume_session_id triggers checkpoint loading, the prior
+    postmortem chain is deserialized into memory, and already-completed ACs
+    are skipped (not re-executed).
+
+    Compounding context (from prior ACs):
+    - AC-1 established [[INVARIANT: end-of-run chain artifact exists in
+      docs/brainstorm/chain-*.md]] — checkpoints complement the artifact.
+    - AC-2 established [[INVARIANT: ACPostmortem.sub_postmortems preserves
+      structure in serialized chain]] — the loaded chain includes sub_postmortems.
+    - AC-3 established [[INVARIANT: verify_invariants is called inline-blocking
+      before chain advance]] — verified invariants are present in the loaded chain.
+    - AC-3's per-AC checkpoint writing puts serialized PostmortemChain (with
+      Invariant objects) into the checkpoint payload used by resume.
+
+    [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
+    [[INVARIANT: deserialized chain is injected before the AC loop so resumed ACs see prior postmortems]]
+    [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+    [[INVARIANT: deserialized chain reflects all postmortems from the prior run up to last_completed_ac_index]]
+    """
+
+    def _make_executor_with_real_store(
+        self, tmp_path: Path
+    ) -> tuple[SerialCompoundingExecutor, Any]:
+        """Build an executor with a real CheckpointStore backed by tmp_path."""
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, store
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_already_completed_acs(self, tmp_path: Path) -> None:
+        """When resume_session_id is provided, ACs already in the checkpoint are skipped.
+
+        Setup: write a checkpoint for AC 0 (index 0, last_completed_ac_index=0).
+        Run execute_serial with resume_session_id set.
+        Expect: AC 0's _execute_single_ac is NOT called; AC 1's IS called.
+
+        Compounding reference: the checkpoint payload includes the PostmortemChain
+        serialized by _write_compounding_checkpoint (AC-3), which now stores
+        ACPostmortem.sub_postmortems (AC-2, B-prime) and Invariant objects (AC-3).
+
+        [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+
+        seed = _make_seed("AC 0 already done", "AC 1 to be executed")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Pre-write a checkpoint as if AC 0 had already completed.
+        summary_ac0 = ACContextSummary(
+            ac_index=0,
+            ac_content="AC 0 already done",
+            success=True,
+            files_modified=("src/ac0.py",),
+        )
+        pm_ac0 = ACPostmortem(summary=summary_ac0, status="pass", gotchas=("ac0 gotcha",))
+        prior_chain = PostmortemChain(postmortems=(pm_ac0,))
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_session",
+            ac_index=0,
+            chain=prior_chain,
+        )
+
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_session",
+            execution_id="exec_resume_skip",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session",
+        )
+
+        # AC 0 was already done — not re-executed.
+        assert 0 not in executed_indices, (
+            f"AC 0 should have been skipped via checkpoint resume; executed: {executed_indices}"
+        )
+        # AC 1 was executed normally.
+        assert 1 in executed_indices, (
+            f"AC 1 should have been executed after skip; executed: {executed_indices}"
+        )
+        # Both ACs appear in results — AC 0 as SATISFIED_EXTERNALLY, AC 1 as SUCCEEDED.
+        assert len(result.results) == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_injects_prior_chain_into_resumed_ac_context(
+        self, tmp_path: Path
+    ) -> None:
+        """The resumed AC's context_override contains postmortems from the loaded chain.
+
+        After checkpoint loading, AC 1 should see AC 0's postmortem in its
+        context_override, even though AC 0 was not re-executed.
+
+        Compounding reference: AC-1 established [[INVARIANT: end-of-run chain
+        artifact exists in docs/brainstorm/chain-*.md]] which confirmed the chain
+        serialization round-trip works. This test relies on the same deserialization.
+
+        [[INVARIANT: deserialized chain is injected before the AC loop so resumed ACs see prior postmortems]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+
+        seed = _make_seed("AC 0 done", "AC 1 resumed")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Write a checkpoint with AC 0 done and a specific gotcha in its postmortem.
+        summary_ac0 = ACContextSummary(
+            ac_index=0,
+            ac_content="AC 0 done",
+            success=True,
+            files_modified=("src/module_alpha.py",),
+        )
+        pm_ac0 = ACPostmortem(
+            summary=summary_ac0,
+            status="pass",
+            gotchas=("important_gotcha_from_prior_run",),
+        )
+        prior_chain = PostmortemChain(postmortems=(pm_ac0,))
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_session_x",
+            ac_index=0,
+            chain=prior_chain,
+        )
+
+        captured_overrides: list[str] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="new_session_y",
+            execution_id="exec_chain_inject",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_x",
+        )
+
+        # AC 1's context_override should reference the prior chain's content.
+        # captured_overrides[0] belongs to AC 1 (AC 0 was skipped — no _execute_single_ac call).
+        assert len(captured_overrides) == 1, (
+            f"Only AC 1 should have been executed (AC 0 skipped). "
+            f"Got {len(captured_overrides)} overrides."
+        )
+        ac1_override = captured_overrides[0]
+        assert "Prior AC Postmortems" in ac1_override, (
+            "AC 1 context must include the postmortem chain section"
+        )
+        assert "AC 0 done" in ac1_override, (
+            "AC 1 context must include AC 0's postmortem content from the loaded chain"
+        )
+        assert "important_gotcha_from_prior_run" in ac1_override, (
+            "AC 1 context must include gotchas from the deserialized chain"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_without_checkpoint_store_runs_fresh(self) -> None:
+        """When no checkpoint store is provided, resume_session_id is safely ignored.
+
+        All ACs are executed from the beginning even though resume_session_id is set.
+
+        [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+        """
+        seed = _make_seed("AC 0", "AC 1")
+        # Use default executor — no checkpoint store.
+        executor = _make_executor()
+        assert executor._checkpoint_store is None
+
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            executed_indices.append(int(kwargs["ac_index"]))
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_no_store",
+            execution_id="exec_no_store",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="nonexistent_prior",
+        )
+
+        # Both ACs should have been executed (no skip because no store).
+        assert executed_indices == [0, 1]
+        assert result.success_count == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_with_missing_checkpoint_runs_fresh(
+        self, tmp_path: Path
+    ) -> None:
+        """When resume_session_id is set but no checkpoint file exists, start fresh.
+
+        [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+        """
+        seed = _make_seed("AC 0", "AC 1")
+        executor, _store = self._make_executor_with_real_store(tmp_path)
+        # Note: no checkpoint is written — store is empty.
+
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            executed_indices.append(int(kwargs["ac_index"]))
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_fresh",
+            execution_id="exec_fresh",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="no_such_session",
+        )
+
+        # All ACs executed from the start (checkpoint not found → fallback).
+        assert executed_indices == [0, 1]
+        assert result.success_count == 2
+
+    def test_load_compounding_checkpoint_returns_chain_and_index(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_compounding_checkpoint returns the deserialized chain and index.
+
+        Compounding reference: this function uses deserialize_postmortem_chain
+        (verified round-trip in AC-2 tests) and CompoundingCheckpointState
+        (established by AC-3 checkpoint writing tests).
+
+        [[INVARIANT: deserialized chain reflects all postmortems from the prior run up to last_completed_ac_index]]
+        [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _load_compounding_checkpoint,
+            _write_compounding_checkpoint,
+        )
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+
+        # Write a two-AC chain.
+        summary0 = ACContextSummary(ac_index=0, ac_content="AC zero", success=True)
+        summary1 = ACContextSummary(
+            ac_index=1,
+            ac_content="AC one",
+            success=True,
+            files_modified=("src/f1.py",),
+        )
+        pm0 = ACPostmortem(summary=summary0, status="pass", gotchas=("g0",))
+        pm1 = ACPostmortem(summary=summary1, status="pass")
+        chain = PostmortemChain(postmortems=(pm0, pm1))
+
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id="seed_resume_direct",
+            session_id="s_old",
+            ac_index=1,
+            chain=chain,
+        )
+
+        loaded_chain, last_idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="seed_resume_direct",
+            session_id="s_new",
+            resume_session_id="s_old",
+        )
+
+        assert last_idx == 1, f"Expected last_completed_ac_index=1, got {last_idx}"
+        assert len(loaded_chain.postmortems) == 2, (
+            f"Expected 2 postmortems in loaded chain, got {len(loaded_chain.postmortems)}"
+        )
+        assert loaded_chain.postmortems[0].summary.ac_content == "AC zero"
+        assert loaded_chain.postmortems[1].summary.ac_content == "AC one"
+        assert "g0" in loaded_chain.postmortems[0].gotchas
+        assert "src/f1.py" in loaded_chain.postmortems[1].summary.files_modified
+
+    def test_load_compounding_checkpoint_returns_empty_on_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_compounding_checkpoint returns (empty_chain, -1) when no checkpoint.
+
+        [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+        """
+        from ouroboros.orchestrator.serial_executor import _load_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "empty_checkpoints")
+        store.initialize()
+
+        chain, idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="nonexistent_seed",
+            session_id="s_new",
+            resume_session_id="s_old",
+        )
+
+        assert idx == -1, f"Expected -1 (no checkpoint), got {idx}"
+        assert len(chain.postmortems) == 0, (
+            f"Expected empty chain, got {len(chain.postmortems)} postmortems"
+        )
+
+    def test_load_compounding_checkpoint_returns_empty_on_wrong_mode(
+        self, tmp_path: Path
+    ) -> None:
+        """_load_compounding_checkpoint returns (empty_chain, -1) for non-compounding checkpoints.
+
+        [[INVARIANT: _load_compounding_checkpoint returns empty chain and -1 on failure]]
+        """
+        from ouroboros.orchestrator.serial_executor import _load_compounding_checkpoint
+        from ouroboros.persistence.checkpoint import CheckpointData, CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "wrong_mode_checkpoints")
+        store.initialize()
+
+        # Write a checkpoint with the wrong mode (not "compounding").
+        wrong_mode_ckpt = CheckpointData.create(
+            seed_id="seed_wrong_mode",
+            phase="planning",
+            state={"mode": "parallel", "some_key": "some_value"},
+        )
+        store.save(wrong_mode_ckpt)
+
+        chain, idx = _load_compounding_checkpoint(
+            store=store,
+            seed_id="seed_wrong_mode",
+            session_id="s_new",
+            resume_session_id="s_old",
+        )
+
+        assert idx == -1, f"Expected -1 for wrong mode, got {idx}"
+        assert len(chain.postmortems) == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_session_id_none_does_not_load_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """When resume_session_id is None, checkpoints are NOT loaded even if present.
+
+        This ensures resume opt-in: callers that don't pass resume_session_id
+        always get a fresh run, not an accidental resume.
+
+        [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import _write_compounding_checkpoint
+
+        seed = _make_seed("AC 0", "AC 1")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Pre-write a checkpoint for AC 0.
+        summary = ACContextSummary(ac_index=0, ac_content="AC 0", success=True)
+        pm = ACPostmortem(summary=summary, status="pass")
+        prior_chain = PostmortemChain(postmortems=(pm,))
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_session",
+            ac_index=0,
+            chain=prior_chain,
+        )
+
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            executed_indices.append(int(kwargs["ac_index"]))
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="fresh_session",
+            execution_id="exec_no_resume",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            # NOTE: resume_session_id intentionally NOT passed (defaults to None).
+        )
+
+        # Both ACs should be executed: no resume without explicit resume_session_id.
+        assert executed_indices == [0, 1], (
+            f"Both ACs should run from scratch; executed: {executed_indices}"
+        )
+        assert result.success_count == 2
