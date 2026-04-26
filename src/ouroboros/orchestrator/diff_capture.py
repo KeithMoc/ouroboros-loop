@@ -66,14 +66,16 @@ def _diff_capture_enabled() -> bool:
     return raw not in {"false", "0", ""}
 
 
-def _resolve_file_cap(file_cap: int) -> int:
+def _resolve_file_cap(file_cap: int | None) -> int:
     """Resolve the effective file cap.
 
-    When the caller passes the default (``_DEFAULT_FILE_CAP``), check
-    ``OUROBOROS_DIFF_SUMMARY_FILE_CAP`` and use that if it parses as a
-    positive int.  Invalid values fall back silently.
+    ``None`` means "caller did not specify — consult
+    ``OUROBOROS_DIFF_SUMMARY_FILE_CAP`` and fall back to
+    :data:`_DEFAULT_FILE_CAP`."  Any explicit int (including a value
+    equal to the default constant) is honored as a hard override.
+    Invalid env-var values fall back silently.
     """
-    if file_cap != _DEFAULT_FILE_CAP:
+    if file_cap is not None:
         return file_cap
     raw = os.environ.get("OUROBOROS_DIFF_SUMMARY_FILE_CAP", "").strip()
     if raw:
@@ -86,9 +88,12 @@ def _resolve_file_cap(file_cap: int) -> int:
     return _DEFAULT_FILE_CAP
 
 
-def _resolve_char_budget(char_budget: int) -> int:
-    """Resolve the effective char budget (mirror of :func:`_resolve_file_cap`)."""
-    if char_budget != _DEFAULT_CHAR_BUDGET:
+def _resolve_char_budget(char_budget: int | None) -> int:
+    """Resolve the effective char budget (mirror of :func:`_resolve_file_cap`).
+
+    ``None`` defers to env or default; any explicit int wins.
+    """
+    if char_budget is not None:
         return char_budget
     raw = os.environ.get("OUROBOROS_DIFF_SUMMARY_CHAR_BUDGET", "").strip()
     if raw:
@@ -301,14 +306,16 @@ def _truncate_stat(raw_stat: str, *, file_cap: int, char_budget: int) -> str:
     truncated_more_line = ""
     total_files = len(file_lines)
     if total_files > file_cap:
-        # Pair each line with its churn for a stable sort by churn desc.
-        scored = [(idx, _churn_for_stat_line(ln), ln) for idx, ln in enumerate(file_lines)]
+        # Pair each original index with its churn for a stable sort by churn desc.
+        # Filter by index (not value) so byte-identical rows can't sneak past the
+        # cap — `git diff --stat` rows are normally unique per path, but a future
+        # format change or contrived test could produce collisions.
+        scored = [(idx, _churn_for_stat_line(ln)) for idx, ln in enumerate(file_lines)]
         # Stable sort: primary key churn desc, secondary original index asc.
         scored.sort(key=lambda t: (-t[1], t[0]))
-        kept = [ln for _, _, ln in scored[:file_cap]]
+        kept_indices = {idx for idx, _ in scored[:file_cap]}
         # Restore original document order for the kept lines.
-        kept_set = set(kept)
-        file_lines = [ln for ln in file_lines if ln in kept_set]
+        file_lines = [ln for idx, ln in enumerate(file_lines) if idx in kept_indices]
         truncated_more_line = f"... and {total_files - file_cap} more files"
 
     parts: list[str] = list(file_lines)
@@ -353,8 +360,8 @@ def compute_diff_summary(
     pre_sha: str | None,
     workspace_root: Path,
     *,
-    file_cap: int = _DEFAULT_FILE_CAP,
-    char_budget: int = _DEFAULT_CHAR_BUDGET,
+    file_cap: int | None = None,
+    char_budget: int | None = None,
 ) -> str:
     """Compute a truncated ``git diff --stat`` between ``pre_sha`` and a fresh post snapshot.
 
@@ -369,12 +376,13 @@ def compute_diff_summary(
     Args:
         pre_sha: SHA returned by :func:`capture_pre_ac_snapshot`.
         workspace_root: Directory where the AC ran.
-        file_cap: Keep at most this many file rows by churn.  When the
-            caller leaves it at the default, ``OUROBOROS_DIFF_SUMMARY_FILE_CAP``
-            overrides at call time.
-        char_budget: Hard cap on the returned string length.  When the
-            caller leaves it at the default, ``OUROBOROS_DIFF_SUMMARY_CHAR_BUDGET``
-            overrides at call time.
+        file_cap: Keep at most this many file rows by churn.  ``None`` (the
+            default) defers to ``OUROBOROS_DIFF_SUMMARY_FILE_CAP`` and then to
+            :data:`_DEFAULT_FILE_CAP`.  Any explicit int (including a value
+            equal to the default constant) is honored as a hard override.
+        char_budget: Hard cap on the returned string length.  ``None`` (the
+            default) defers to ``OUROBOROS_DIFF_SUMMARY_CHAR_BUDGET`` and then
+            to :data:`_DEFAULT_CHAR_BUDGET`.  Any explicit int wins.
 
     Returns:
         Truncated ``--stat`` text, or ``""`` on any failure / disabled / no-op.

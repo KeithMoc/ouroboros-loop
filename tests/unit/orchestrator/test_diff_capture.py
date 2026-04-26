@@ -360,3 +360,60 @@ class TestTruncateStat:
         assert len(out) <= budget
         assert "2 files changed" in out
         assert "[truncated]" in out
+
+    def test_file_cap_filters_by_index_not_value(self) -> None:
+        # Regression: PR #4 review (CodeRabbit) — set-based filtering would
+        # over-include byte-identical stat lines past the cap. Index-based
+        # filtering must keep at most file_cap rows even when duplicates exist.
+        # Construct two identical rows + a unique third row; cap=2 keeps the
+        # two identical rows ONCE each plus the unique row would exceed cap.
+        # With cap=1, only the highest-churn row should survive.
+        raw = (
+            " src/foo.py | 50 ++++++++++++++++++++++++++++++++++++++++++++\n"
+            " src/foo.py | 50 ++++++++++++++++++++++++++++++++++++++++++++\n"
+            " src/bar.py |  5 ++--\n"
+            " 3 files changed, 105 insertions(+), 0 deletions(-)\n"
+        )
+        out = diff_capture._truncate_stat(raw, file_cap=1, char_budget=4000)
+        # Cap=1 means exactly one file row plus the truncation marker plus the
+        # summary footer. Even though two rows are byte-identical, only ONE
+        # should survive.
+        file_rows = [
+            ln
+            for ln in out.split("\n")
+            if "|" in ln and "more files" not in ln
+        ]
+        assert len(file_rows) == 1, f"expected 1 file row, got {file_rows}"
+        assert "... and 2 more files" in out
+
+
+class TestEnvOverrideSemantics:
+    """Regression: PR #4 review (CodeRabbit) — file_cap/char_budget=None means
+    'consult env'; any explicit int is a hard override regardless of value.
+    """
+
+    def test_explicit_default_value_overrides_env(self, monkeypatch) -> None:
+        # Caller passes file_cap=20 (the default constant). Env var says 999.
+        # Explicit value MUST win over env.
+        monkeypatch.setenv("OUROBOROS_DIFF_SUMMARY_FILE_CAP", "999")
+        assert diff_capture._resolve_file_cap(20) == 20
+
+    def test_none_consults_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("OUROBOROS_DIFF_SUMMARY_FILE_CAP", "5")
+        assert diff_capture._resolve_file_cap(None) == 5
+
+    def test_none_falls_back_to_default_when_env_unset(self, monkeypatch) -> None:
+        monkeypatch.delenv("OUROBOROS_DIFF_SUMMARY_FILE_CAP", raising=False)
+        assert diff_capture._resolve_file_cap(None) == 20  # _DEFAULT_FILE_CAP
+
+    def test_none_falls_back_to_default_on_invalid_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("OUROBOROS_DIFF_SUMMARY_FILE_CAP", "not-a-number")
+        assert diff_capture._resolve_file_cap(None) == 20
+
+    def test_explicit_int_wins_over_env_for_char_budget(self, monkeypatch) -> None:
+        monkeypatch.setenv("OUROBOROS_DIFF_SUMMARY_CHAR_BUDGET", "999")
+        assert diff_capture._resolve_char_budget(4000) == 4000
+
+    def test_none_consults_char_budget_env(self, monkeypatch) -> None:
+        monkeypatch.setenv("OUROBOROS_DIFF_SUMMARY_CHAR_BUDGET", "100")
+        assert diff_capture._resolve_char_budget(None) == 100
