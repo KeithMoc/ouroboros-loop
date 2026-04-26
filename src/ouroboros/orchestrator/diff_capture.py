@@ -330,6 +330,14 @@ def _truncate_stat(raw_stat: str, *, file_cap: int, char_budget: int) -> str:
     marker_block = "\n" + _TRUNCATED_MARKER
     overhead = len(footer_block) + len(marker_block)
 
+    # Tight-budget fallback: when the footer+marker alone busts the budget,
+    # there's no room for body content.  Return whatever subset fits,
+    # preferring summary > marker, and HARD-CAP at char_budget so the
+    # contract is never violated.
+    if overhead >= char_budget:
+        fallback_parts = [p for p in (summary_line, _TRUNCATED_MARKER) if p]
+        return "\n".join(fallback_parts)[:char_budget]
+
     # Body gets whatever's left of the budget.  Without a summary, we still
     # reserve room for the marker.
     body_budget = max(0, char_budget - overhead)

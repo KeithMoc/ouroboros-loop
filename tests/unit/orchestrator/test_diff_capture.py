@@ -322,3 +322,41 @@ class TestTruncateStat:
 
     def test_empty_input_returns_empty(self) -> None:
         assert diff_capture._truncate_stat("", file_cap=20, char_budget=4000) == ""
+
+    def test_tight_budget_smaller_than_overhead_respects_cap(self) -> None:
+        # Regression: PR #4 review (CodeRabbit) — when footer+marker overhead
+        # alone exceeds char_budget, the previous code returned body+footer+
+        # marker and blew past the budget.  The tight-budget fallback must
+        # hard-cap the output at char_budget regardless of what's available
+        # to render.
+        raw = (
+            " src/foo.py | 50 +++++++++++++++++++++++++++++++++++++++++++++++\n"
+            " 1 file changed, 50 insertions(+), 0 deletions(-)\n"
+        )
+        out = diff_capture._truncate_stat(raw, file_cap=20, char_budget=8)
+        assert len(out) <= 8
+
+    def test_tight_budget_no_summary_still_respects_cap(self) -> None:
+        # No summary line in input ("changed," missing) — fallback should
+        # still respect the cap and at minimum surface the truncated marker
+        # if it fits.
+        raw = " src/foo.py | 50 +++++++++++++++++++++\n src/bar.py | 30 ++++++++\n"
+        out = diff_capture._truncate_stat(raw, file_cap=20, char_budget=5)
+        assert len(out) <= 5
+
+    def test_tight_budget_prefers_summary_over_body(self) -> None:
+        # When budget fits the summary plus marker but not the file rows,
+        # the fallback returns "<summary>\n[truncated]" (truncated to budget).
+        raw = (
+            " src/foo.py | 50 +++++++++++++++++++++++++++++++++++++++++++++++\n"
+            " src/bar.py | 30 ++++++++\n"
+            " 2 files changed, 80 insertions(+), 0 deletions(-)\n"
+        )
+        # Big enough for summary + marker, too small for file rows + footer.
+        budget = len(" 2 files changed, 80 insertions(+), 0 deletions(-)") + len(
+            "\n[truncated]"
+        )
+        out = diff_capture._truncate_stat(raw, file_cap=20, char_budget=budget)
+        assert len(out) <= budget
+        assert "2 files changed" in out
+        assert "[truncated]" in out
