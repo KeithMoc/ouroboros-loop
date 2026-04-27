@@ -6902,3 +6902,1190 @@ class TestDiffSummaryRoundTrip:
         assert rt_pm.status == pm.status
         assert rt_pm.duration_seconds == pm.duration_seconds
         assert rt_pm.ac_native_session_id == pm.ac_native_session_id
+
+
+# =============================================================================
+# Q4 — Inline QA integration tests for SerialCompoundingExecutor
+# =============================================================================
+
+
+def _make_qa_ok_result(
+    loop_action: str = "pass",
+    score: float = 0.9,
+    verdict: str = "pass",
+    differences: list[str] | None = None,
+    suggestions: list[str] | None = None,
+    reasoning: str = "Looks good.",
+) -> Any:
+    """Build a fake Ok(MCPToolResult) for QAHandler.handle returns."""
+    from ouroboros.core.types import Result
+    from ouroboros.mcp.types import MCPToolResult
+
+    meta = {
+        "loop_action": loop_action,
+        "score": score,
+        "verdict": verdict,
+        "dimensions": {},
+        "differences": differences or [],
+        "suggestions": suggestions or [],
+        "reasoning": reasoning,
+    }
+    return Result.ok(MCPToolResult(meta=meta))
+
+
+def _make_qa_err_result() -> Any:
+    """Build a fake Err(MCPToolError) for QAHandler.handle returns."""
+    from ouroboros.core.types import Result
+    from ouroboros.mcp.errors import MCPToolError
+
+    return Result.err(MCPToolError(tool_name="ouroboros_qa", message="QA failed"))
+
+
+def _make_qa_delegated_result() -> Any:
+    """Build a fake delegated_to_subagent Ok result."""
+    from ouroboros.core.types import Result
+    from ouroboros.mcp.types import MCPToolResult
+
+    return Result.ok(MCPToolResult(meta={"status": "delegated_to_subagent"}))
+
+
+def _attach_fake_qa(executor: SerialCompoundingExecutor, results: list[Any]) -> list[Any]:
+    """Attach a fake QAHandler.handle to the executor.
+
+    ``results`` is consumed left-to-right on each .handle() call.
+    Returns the call-args list for assertions.
+    """
+    call_args: list[Any] = []
+
+    async def fake_handle(arguments: dict[str, Any]) -> Any:
+        call_args.append(arguments)
+        if results:
+            return results.pop(0)
+        return _make_qa_ok_result()
+
+    executor._qa_handler.handle = fake_handle  # type: ignore[method-assign]
+    return call_args
+
+
+class TestInlineQAIntegration:
+    """Integration tests for Q4 inline-QA in SerialCompoundingExecutor.execute_serial.
+
+    These tests verify:
+    - inline_qa=False (default): zero QA calls; qa_* fields untouched
+    - inline_qa=True, PASS on first attempt: 1 QA call, qa_status="passed"
+    - inline_qa=True, REVISE-then-PASS: 2 QA calls, qa_status="passed"
+    - inline_qa=True, FAIL × budget: qa_status="exhausted", chain advances
+    - pre_sha captured ONCE across QA retries (regression guard)
+    - Failed/externally-satisfied ACs skip QA
+    - QA event emitted per attempt
+    - delegated_to_subagent path → qa_status="skipped_delegated"
+    - QA handler error → qa_status="skipped_delegated"
+    """
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_off_default_no_qa_calls(self) -> None:
+        """1. inline_qa=False (default): zero QA calls; qa_* fields remain None/0."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        call_args = _attach_fake_qa(executor, [])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s1",
+            execution_id="e1",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=False,
+        )
+
+        assert result.success_count == 1
+        # Zero QA calls
+        assert len(call_args) == 0
+        # postmortem has default qa_ fields
+        from ouroboros.orchestrator.level_context import deserialize_postmortem_chain
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        assert len(events) == 1
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") is None
+        assert pm_data.get("qa_verdict") is None
+        assert pm_data.get("qa_attempts", 0) == 0
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_pass_first_attempt(self) -> None:
+        """2. inline_qa=True, PASS on first attempt: 1 QA call, qa_status='passed', qa_attempts=1."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="pass", score=0.95, verdict="pass"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s2",
+            execution_id="e2",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 1
+        assert len(call_args) == 1  # 1 QA evaluation
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "passed"
+        assert pm_data.get("qa_attempts") == 1
+        assert pm_data.get("qa_verdict") is not None
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_revise_then_pass(self) -> None:
+        """3. REVISE on first attempt, PASS on second: 2 QA calls, qa_status='passed', qa_attempts=2."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(
+                loop_action="revise", score=0.65, verdict="revise",
+                differences=["Missing docstring"], suggestions=["Add docstring"],
+            ),
+            _make_qa_ok_result(loop_action="pass", score=0.90, verdict="pass"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s3",
+            execution_id="e3",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 1
+        assert len(call_args) == 2  # 2 QA evaluations
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "passed"
+        assert pm_data.get("qa_attempts") == 2
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_exhausted_soft_pass(self) -> None:
+        """4. FAIL × (max+1): qa_status='exhausted', chain advances, success_count=1."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        # max_qa_retries=1 → 2 total attempts, both fail
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="fail", score=0.30, verdict="fail"),
+            _make_qa_ok_result(loop_action="fail", score=0.25, verdict="fail"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s4",
+            execution_id="e4",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Soft-pass: chain still advances, result.outcome == SUCCEEDED
+        assert result.success_count == 1
+        assert len(call_args) == 2  # 2 QA evaluations
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "exhausted"
+        assert pm_data.get("qa_attempts") == 2
+        # qa_verdict holds the last attempt's dict
+        assert pm_data.get("qa_verdict") is not None
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_exhausted_max_retries_zero(self) -> None:
+        """5. max_qa_retries=0 → only 1 QA evaluation; FAIL → immediate exhausted soft-pass."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        # max_qa_retries=0 → only 1 total attempt allowed; no retries
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="fail", score=0.20, verdict="fail"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s4b",
+            execution_id="e4b",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=0,  # Zero retries → 1 attempt total
+        )
+
+        # Soft-pass: chain advances; result.outcome == SUCCEEDED even on QA exhaustion
+        assert result.success_count == 1
+        assert len(call_args) == 1  # exactly 1 QA evaluation (no retries)
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "exhausted"
+        assert pm_data.get("qa_attempts") == 1  # 1 attempt with 0 retries
+        # qa_verdict holds the single attempt's dict
+        assert pm_data.get("qa_verdict") is not None
+        assert pm_data["qa_verdict"]["verdict"] == "fail"
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_pre_sha_captured_once(self) -> None:
+        """6. pre_sha is captured ONCE per AC even with QA retries (regression guard for Q2.1)."""
+        import unittest.mock as _mock
+        from ouroboros.orchestrator import serial_executor as _se_mod
+
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        # 2 total attempts
+        _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="revise", score=0.6, verdict="revise"),
+            _make_qa_ok_result(loop_action="pass", score=0.9, verdict="pass"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        capture_calls: list[Any] = []
+        original_capture = _se_mod.capture_pre_ac_snapshot
+
+        def spy_capture(workspace: Any) -> Any:
+            capture_calls.append(workspace)
+            return original_capture(workspace)
+
+        with _mock.patch.object(_se_mod, "capture_pre_ac_snapshot", side_effect=spy_capture):
+            plan = _make_plan((0,))
+            await executor.execute_serial(
+                seed=seed,
+                session_id="s5",
+                execution_id="e5",
+                tools=[],
+                system_prompt="SYS",
+                execution_plan=plan,
+                inline_qa=True,
+                max_qa_retries=1,
+            )
+
+        # pre_sha must be captured exactly ONCE per AC (not per QA retry)
+        assert len(capture_calls) == 1, (
+            f"pre_sha must be captured once; captured {len(capture_calls)} times. "
+            "Regression guard for Q2.1 lesson."
+        )
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_skips_failed_ac(self) -> None:
+        """6. Failed AC → zero QA calls (QA only runs on SUCCEEDED outcomes)."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        call_args = _attach_fake_qa(executor, [])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return ACExecutionResult(
+                ac_index=int(kwargs["ac_index"]),
+                ac_content=str(kwargs["ac_content"]),
+                success=False,
+                error="execution failed",
+                outcome=ACExecutionOutcome.FAILED,
+            )
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="s6",
+            execution_id="e6",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+            fail_fast=False,
+        )
+
+        assert len(call_args) == 0
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_skips_externally_satisfied(self) -> None:
+        """7. Externally-satisfied AC → zero QA calls."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        call_args = _attach_fake_qa(executor, [])
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="s7",
+            execution_id="e7",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+            externally_satisfied_acs={0: {"reason": "pre-done", "commit": "abc123"}},
+        )
+
+        assert len(call_args) == 0
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_feedback_injected_into_retry_context(self) -> None:
+        """8. REVISE → feedback section injected into second attempt's context_override."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        _attach_fake_qa(executor, [
+            _make_qa_ok_result(
+                loop_action="revise", score=0.60, verdict="revise",
+                differences=["No tests"], suggestions=["Add unit tests"],
+                reasoning="Tests are missing.",
+            ),
+            _make_qa_ok_result(loop_action="pass", score=0.92, verdict="pass"),
+        ])
+
+        captured_contexts: list[str] = []
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            ctx = kwargs.get("context_override", "")
+            captured_contexts.append(ctx or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="s8",
+            execution_id="e8",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Two executions should have occurred
+        assert len(captured_contexts) == 2
+        first_ctx, second_ctx = captured_contexts
+        # First context has no QA feedback
+        assert "QA verdict on previous attempt" not in first_ctx
+        # Second context must have the injected QA feedback
+        assert "QA verdict on previous attempt" in second_ctx
+        assert "No tests" in second_ctx
+        assert "Add unit tests" in second_ctx
+        assert "kept on the branch" in second_ctx
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_event_emitted_per_attempt(self) -> None:
+        """9. QA event emitted for each QA call (2 on REVISE-then-PASS)."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="revise", score=0.65, verdict="revise"),
+            _make_qa_ok_result(loop_action="pass", score=0.90, verdict="pass"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="s9",
+            execution_id="e9",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        qa_events = [
+            e for e in executor._event_store._appended
+            if e.type == "execution.ac.qa.evaluated"
+        ]
+        assert len(qa_events) == 2
+
+        # First event: revise, not passed
+        evt1 = qa_events[0]
+        assert evt1.data["ac_index"] == 0
+        assert evt1.data["qa_attempt"] == 1
+        assert evt1.data["loop_action"] == "revise"
+        assert evt1.data["passed"] is False
+        assert evt1.data["score"] == pytest.approx(0.65)
+
+        # Second event: pass
+        evt2 = qa_events[1]
+        assert evt2.data["qa_attempt"] == 2
+        assert evt2.data["loop_action"] == "pass"
+        assert evt2.data["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_delegated_skipped(self) -> None:
+        """10. delegated_to_subagent path → qa_status='skipped_delegated', no retry."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        # Only one call expected (no retry on delegated)
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_delegated_result(),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s10",
+            execution_id="e10",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=2,  # high budget — should not retry
+        )
+
+        assert result.success_count == 1
+        assert len(call_args) == 1  # no retry
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "skipped_delegated"
+        assert pm_data.get("qa_attempts") == 1
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_handler_error_skipped_error(self) -> None:
+        """11. QAHandler returns Err → qa_status='skipped_error', no retry, run continues.
+
+        Handler-level failures are tagged 'skipped_error' so postmortem
+        auditing can tell them apart from the intentional opencode
+        plugin-dispatch path ('skipped_delegated').  Both bypass retries
+        without blocking the run.
+        """
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_err_result(),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s11",
+            execution_id="e11",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 1
+        assert len(call_args) == 1
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "skipped_error"
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_multi_ac_independent_qa_per_ac(self) -> None:
+        """12. Multi-AC seed: each AC gets its own QA evaluation independently."""
+        seed = _make_seed("AC0", "AC1")
+        executor = _make_executor()
+        # AC0: pass, AC1: pass
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="pass", score=0.92, verdict="pass"),
+            _make_qa_ok_result(loop_action="pass", score=0.88, verdict="pass"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))  # sequential: AC0 then AC1
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s12",
+            execution_id="e12",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 2
+        assert len(call_args) == 2  # one QA call per AC
+
+        pm_events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        assert len(pm_events) == 2
+        for evt in pm_events:
+            assert evt.data["postmortem"].get("qa_status") == "passed"
+
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_decomposed_ac_parent_only(self) -> None:
+        """10. Decomposed AC: QA runs once on parent, not per sub-AC. Sub-postmortems qa_status=None.
+
+        QA is called PARENT-AC only: sub-results are already aggregated into
+        parent.sub_postmortems by _build_postmortem_from_result; only the
+        parent-level QA evaluation runs once.
+        """
+        seed = _make_seed("Decomposed AC with 3 sub-ACs")
+        executor = _make_executor()
+
+        # Only one QA call expected (parent AC only)
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="pass", score=0.90, verdict="pass"),
+        ])
+
+        # Build three sub-results
+        sub0 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 0",
+            success=True,
+            final_message="sub0 done",
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub0",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub0.py"}},
+                ),
+            ),
+        )
+        sub1 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 1",
+            success=True,
+            final_message="sub1 done",
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub1",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub1.py"}},
+                ),
+            ),
+        )
+        sub2 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 2",
+            success=True,
+            final_message="sub2 done",
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub2",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub2.py"}},
+                ),
+            ),
+        )
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return ACExecutionResult(
+                ac_index=int(kwargs["ac_index"]),
+                ac_content=str(kwargs["ac_content"]),
+                success=True,
+                is_decomposed=True,
+                sub_results=(sub0, sub1, sub2),
+                final_message="parent done",
+            )
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s_decomp",
+            execution_id="e_decomp",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=2,  # high budget — must still be exactly 1 call
+        )
+
+        assert result.success_count == 1
+        # Exactly 1 QA call (parent only, not 3 sub-AC calls)
+        assert len(call_args) == 1, (
+            f"Expected 1 QA call (parent only), got {len(call_args)}."
+            " QA must NOT run per sub-AC."
+        )
+
+        # Parent postmortem should have qa_status="passed"
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        assert len(events) == 1
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "passed"
+        assert pm_data.get("qa_attempts") == 1
+
+        # Sub-postmortems inside the parent must have qa_status=None / qa_attempts=0
+        sub_pms = pm_data.get("sub_postmortems", [])
+        assert len(sub_pms) == 3, f"Expected 3 sub_postmortems, got {len(sub_pms)}"
+        for i, sub_pm in enumerate(sub_pms):
+            assert sub_pm.get("qa_status") is None, (
+                f"sub_postmortem[{i}].qa_status should be None, got {sub_pm.get('qa_status')!r}"
+            )
+            assert sub_pm.get("qa_attempts", 0) == 0, (
+                f"sub_postmortem[{i}].qa_attempts should be 0, got {sub_pm.get('qa_attempts', 0)}"
+            )
+
+    def test_run_inline_qa_outside_compounding_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """11. --inline-qa outside --compounding: warning emitted, _run_orchestrator called with inline_qa=False.
+
+        The `run.inline_qa.ignored_outside_compounding` warning is logged and
+        printed when --inline-qa is passed without --compounding.  The executor
+        is then called without inline_qa so parallel mode is unchanged.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from typer.testing import CliRunner as TCliRunner
+
+        from ouroboros.cli.main import app as main_app
+
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text(
+            "goal: test\nacceptance_criteria:\n  - Do something\n"
+        )
+
+        mock_run_orch = AsyncMock()
+
+        with patch("ouroboros.cli.commands.run._run_orchestrator", new=mock_run_orch):
+            cli_runner = TCliRunner()
+            result = cli_runner.invoke(
+                main_app,
+                [
+                    "run",
+                    "workflow",
+                    str(seed_file),
+                    "--orchestrator",
+                    "--inline-qa",
+                    # NOTE: --compounding is NOT passed, so inline_qa should be ignored
+                ],
+            )
+
+        # The warning text should appear in the CLI output
+        combined_output = result.output
+        assert "no effect" in combined_output.lower() or "ignored" in combined_output.lower(), (
+            f"Expected warning about --inline-qa outside --compounding in output:\n{combined_output}"
+        )
+
+        # _run_orchestrator must have been awaited exactly once with inline_qa=False
+        assert result.exit_code == 0, (
+            f"CLI invocation should succeed; got exit_code={result.exit_code}, output={result.output}"
+        )
+        mock_run_orch.assert_awaited_once()
+        call_kw = mock_run_orch.await_args.kwargs
+        assert "inline_qa" in call_kw, (
+            f"_run_orchestrator must receive inline_qa kwarg; got kwargs={list(call_kw)}"
+        )
+        assert call_kw["inline_qa"] is False, (
+            f"Expected inline_qa=False when --compounding is absent; got {call_kw['inline_qa']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_propagates_through_chain_to_next_ac(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """12. qa_status from AC-1 propagates through chain digest to AC-2's context_override.
+
+        With k_full=0 (all postmortems rendered as digests), the 'QA: passed'
+        suffix from AC-1's to_digest() must appear in AC-2's context_override
+        (i.e., the chain context that AC-2 sees).
+        """
+        # Force all chain entries to digest form so to_digest() is called
+        # (default k_full=3 would render AC-1 as full_text without qa_status).
+        monkeypatch.setenv("OUROBOROS_POSTMORTEM_FULL_K", "0")
+
+        seed = _make_seed("AC-1 gets QA pass", "AC-2 should see QA status")
+        executor = _make_executor()
+
+        # AC-1 gets QA pass; AC-2 also gets QA pass
+        _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="pass", score=0.86, verdict="pass"),
+            _make_qa_ok_result(loop_action="pass", score=0.90, verdict="pass"),
+        ])
+
+        captured_overrides: list[str] = []
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s_prop",
+            execution_id="e_prop",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 2
+        assert len(captured_overrides) == 2
+
+        # AC-1 (index 0) sees empty chain — no prior postmortems
+        ac1_override = captured_overrides[0]
+        # AC-2 (index 1) sees AC-1's postmortem digest with "QA: passed" suffix
+        ac2_override = captured_overrides[1]
+
+        assert "Prior AC Postmortems" in ac2_override, (
+            "AC-2 must see chain context from AC-1."
+        )
+        # Both stubbed QA results in this test return PASS, so the digest line
+        # for AC-1 must contain exactly "QA: passed" — accepting "QA: exhausted"
+        # would mask a bug where the executor mis-finalizes the postmortem.
+        assert "QA: passed" in ac2_override, (
+            f"AC-2's context_override must include 'QA: passed' from AC-1's digest. "
+            f"Override was:\n{ac2_override[:800]}"
+        )
+        assert "QA: exhausted" not in ac2_override, (
+            f"AC-2's context_override unexpectedly contains 'QA: exhausted' — "
+            f"both stubbed verdicts were PASS. Override was:\n{ac2_override[:800]}"
+        )
+
+
+class TestCreateAcQaEvaluatedEventFactory:
+    """Unit tests for create_ac_qa_evaluated_event event factory."""
+
+    def test_event_fields_correct(self) -> None:
+        """Event has correct type, aggregate, and data fields."""
+        from ouroboros.orchestrator.events import create_ac_qa_evaluated_event
+
+        event = create_ac_qa_evaluated_event(
+            session_id="sess-x",
+            execution_id="exec-y",
+            ac_index=2,
+            qa_attempt=1,
+            score=0.87,
+            verdict_label="pass",
+            loop_action="pass",
+            passed=True,
+        )
+
+        assert event.type == "execution.ac.qa.evaluated"
+        assert event.aggregate_type == "execution"
+        assert event.aggregate_id == "ac_2"
+        assert event.data["session_id"] == "sess-x"
+        assert event.data["execution_id"] == "exec-y"
+        assert event.data["ac_index"] == 2
+        assert event.data["qa_attempt"] == 1
+        assert event.data["score"] == pytest.approx(0.87)
+        assert event.data["verdict_label"] == "pass"
+        assert event.data["loop_action"] == "pass"
+        assert event.data["passed"] is True
+        assert "timestamp" in event.data
+
+    def test_event_revise_fields(self) -> None:
+        """Event for REVISE verdict has passed=False."""
+        from ouroboros.orchestrator.events import create_ac_qa_evaluated_event
+
+        event = create_ac_qa_evaluated_event(
+            session_id="s",
+            execution_id="e",
+            ac_index=0,
+            qa_attempt=1,
+            score=0.55,
+            verdict_label="revise",
+            loop_action="revise",
+            passed=False,
+        )
+
+        assert event.data["passed"] is False
+        assert event.data["loop_action"] == "revise"
+        assert event.data["score"] == pytest.approx(0.55)
+
+
+# =============================================================================
+# Q4 — Renderer tests: ### QA block in _render_chain_as_markdown
+# =============================================================================
+
+
+class TestRenderChainMarkdownQABlock:
+    """Tests for the ### QA section added to _render_chain_as_markdown in Q4.
+
+    Verifies three properties:
+    1. QA block is emitted when qa_status is set on the postmortem.
+    2. QA block is omitted when qa_status is None (default / --inline-qa off).
+    3. Dynamic-fence defence grows the fence when suggestions contain backticks.
+    """
+
+    def _make_pm_with_qa(
+        self,
+        qa_status: str,
+        score: float = 0.86,
+        verdict: str = "pass",
+        qa_attempts: int = 1,
+        suggestions: list[str] | None = None,
+    ) -> "ACPostmortem":
+        """Helper: build an ACPostmortem with qa_* fields set."""
+        from ouroboros.orchestrator.level_context import ACContextSummary, ACPostmortem
+
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Implement feature",
+            success=True,
+        )
+        return ACPostmortem(
+            summary=summary,
+            status="pass",
+            qa_status=qa_status,
+            qa_verdict={
+                "score": score,
+                "verdict": verdict,
+                "dimensions": {},
+                "differences": [],
+                "suggestions": suggestions or [],
+                "reasoning": "Looks good.",
+            },
+            qa_attempts=qa_attempts,
+        )
+
+    def _render(self, pm: "ACPostmortem") -> str:
+        """Render a single-postmortem chain and return the markdown string."""
+        from ouroboros.orchestrator.level_context import PostmortemChain
+        from ouroboros.orchestrator.serial_executor import _render_chain_as_markdown
+
+        chain = PostmortemChain(postmortems=(pm,))
+        return _render_chain_as_markdown(chain, session_id="test-sess", execution_id="test-exec")
+
+    def test_render_chain_markdown_emits_qa_block_when_qa_status_set(self) -> None:
+        """QA block is rendered when postmortem has qa_status set.
+
+        Verifies all three required fields: Status, Score, Suggestions.
+        """
+        pm = self._make_pm_with_qa(
+            qa_status="passed",
+            score=0.86,
+            verdict="pass",
+            qa_attempts=1,
+            suggestions=["Add type hints to the new module"],
+        )
+        content = self._render(pm)
+
+        # Section header must appear
+        assert "### QA" in content
+
+        # Status line with attempt count
+        assert "- Status: passed (attempt 1)" in content
+
+        # Score line with verdict label
+        assert "- Score: 0.86 / 1.00 — pass" in content
+
+        # Suggestions block must be present
+        assert "- Suggestions:" in content
+        assert "Add type hints to the new module" in content
+
+    def test_render_chain_markdown_omits_qa_block_when_qa_status_none(self) -> None:
+        """QA block is omitted when qa_status is None (default / --inline-qa off).
+
+        Runs without --inline-qa must produce byte-identical artifacts to the
+        pre-Q4 baseline — the only allowed difference is the absence of the
+        ### QA section.
+        """
+        from ouroboros.orchestrator.level_context import ACContextSummary, ACPostmortem
+
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Implement feature",
+            success=True,
+        )
+        # Default qa_status=None
+        pm = ACPostmortem(summary=summary, status="pass")
+        content = self._render(pm)
+
+        assert "### QA" not in content
+        assert "qa_status" not in content
+        assert "Score:" not in content
+        assert "Suggestions:" not in content
+
+    def test_render_chain_markdown_qa_block_uses_dynamic_fence(self) -> None:
+        """Suggestions in a fenced block use a fence longer than backtick runs in text.
+
+        When suggestion text contains triple backticks (e.g. "use ```code```"),
+        the fence must grow to 4+ backticks to prevent premature block closure.
+        """
+        # A suggestion that contains a triple-backtick run
+        nasty_suggestion = "Replace ```old_call()``` with the new API"
+        pm = self._make_pm_with_qa(
+            qa_status="exhausted",
+            score=0.55,
+            verdict="revise",
+            qa_attempts=2,
+            suggestions=[nasty_suggestion],
+        )
+        content = self._render(pm)
+
+        # The fence used must be at least 4 backticks (content has 3-backtick run)
+        assert "````" in content, (
+            "Expected at least 4-backtick fence when suggestion contains ``` runs; "
+            f"got:\n{content}"
+        )
+
+        # The suggestion text itself must still appear
+        assert nasty_suggestion in content
+
+        # The ### QA block itself must be present
+        assert "### QA" in content
+
+
+# =============================================================================
+# Q4 — End-to-end regression test: QA retry loop with commit-per-AC
+# =============================================================================
+
+
+class TestInlineQAEndToEnd:
+    """End-to-end regression test for Q4 inline-QA with real git commits.
+
+    Analogous to TestSerialExecutorDiffCapture.test_diff_summary_flows_end_to_end_*
+    but for the full QA-retry loop: REVISE on attempt 1 → commit 1 → feedback
+    injected → PASS on attempt 2 → commit 2.  Asserts 7 invariants.
+
+    [[INVARIANT: pre_sha is captured exactly once per AC before the QA retry loop]]
+    [[INVARIANT: diff_summary spans all QA retry commits pre_sha to HEAD]]
+    [[INVARIANT: qa_status='passed' when the final QA verdict is PASS]]
+    """
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_flows_end_to_end_with_commit_per_ac(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: REVISE-then-PASS QA retry with real commits per attempt.
+
+        Regression net for the Q2.1 lesson (commit-per-AC design): ensures
+        that the QA retry loop never re-captures pre_sha between attempts so
+        the cumulative diff always spans from the AC-start commit to HEAD.
+
+        7 conditions verified:
+        1. QA call count == 2 (REVISE on attempt 1, PASS on attempt 2)
+        2. pre_sha captured exactly once per AC (before retry loop)
+        3. Final postmortem: qa_status='passed', qa_attempts=2, verdict='pass'
+        4. diff_summary spans both attempts' commits (two files committed)
+        5. On-disk chain markdown contains ### QA block (direct file read)
+        6. context_override for retry (attempt 2) contains QA feedback text
+        7. Chain serialized with qa_status in postmortem event data
+        """
+        import re as _re
+        import subprocess as _sp
+        import unittest.mock as _mock
+
+        from ouroboros.orchestrator import serial_executor as _se_mod
+
+        # Pin chain artifact dir so we can read the file directly
+        artifact_dir = tmp_path / "chain_artifacts"
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir))
+
+        _init_test_repo(tmp_path)
+        seed = _make_seed("Add QA-verified feature")
+        executor = _make_executor_with_cwd(tmp_path)
+
+        git_env = {
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(tmp_path),
+        }
+
+        # Condition 1: fake QA returns REVISE on attempt 1, PASS on attempt 2
+        qa_call_args = _attach_fake_qa(
+            executor,
+            [
+                _make_qa_ok_result(
+                    loop_action="revise",
+                    score=0.55,
+                    verdict="revise",
+                    differences=["Missing docstring"],
+                    suggestions=["Add a module-level docstring"],
+                    reasoning="Module lacks documentation.",
+                ),
+                _make_qa_ok_result(loop_action="pass", score=0.92, verdict="pass"),
+            ],
+        )
+
+        # Track context_override per attempt for condition 6
+        captured_contexts: list[str] = []
+        attempt_counter = 0
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            nonlocal attempt_counter
+            captured_contexts.append(kwargs.get("context_override") or "")
+            # Each attempt commits a distinct file so diff spans both commits
+            fname = f"impl_v{attempt_counter}.py"
+            (tmp_path / fname).write_text(
+                f"def impl_v{attempt_counter}():\n    return {attempt_counter}\n"
+            )
+            _sp.run(["git", "add", fname], cwd=str(tmp_path), env=git_env, check=True)
+            _sp.run(
+                ["git", "commit", "-q", "-m", f"feat: impl_v{attempt_counter}"],
+                cwd=str(tmp_path),
+                env=git_env,
+                check=True,
+            )
+            ac_index = int(kwargs["ac_index"])
+            ac_content = str(kwargs["ac_content"])
+            attempt_counter += 1
+            return _ok_result(ac_index, ac_content, files_written=(fname,))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        # Condition 2: spy on capture_pre_ac_snapshot to verify called exactly once
+        capture_calls: list[Any] = []
+        original_capture = _se_mod.capture_pre_ac_snapshot
+
+        def spy_capture(workspace: Any) -> Any:
+            capture_calls.append(workspace)
+            return original_capture(workspace)
+
+        with _mock.patch.object(_se_mod, "capture_pre_ac_snapshot", side_effect=spy_capture):
+            plan = _make_plan((0,))
+            result = await executor.execute_serial(
+                seed=seed,
+                session_id="sess_qa_e2e",
+                execution_id="exec_qa_e2e",
+                tools=[],
+                system_prompt="SYSTEM",
+                execution_plan=plan,
+                inline_qa=True,
+                max_qa_retries=1,
+            )
+
+        # ── Condition 1: QA call count ─────────────────────────────────────
+        assert len(qa_call_args) == 2, (
+            f"Expected 2 QA calls (REVISE + PASS); got {len(qa_call_args)}"
+        )
+
+        # ── Condition 2: pre_sha captured exactly once ──────────────────────
+        assert len(capture_calls) == 1, (
+            f"pre_sha must be captured once per AC, not once per QA retry; "
+            f"captured {len(capture_calls)} times.  Regression guard for Q2.1."
+        )
+
+        # ── Condition 3: final postmortem fields ────────────────────────────
+        assert result.success_count == 1
+        pm_events = [
+            e
+            for e in executor._event_store._appended
+            if e.type == "execution.ac.postmortem.captured"
+        ]
+        assert len(pm_events) == 1
+        pm_data = pm_events[0].data["postmortem"]
+
+        assert pm_data.get("qa_status") == "passed", (
+            f"Expected qa_status='passed'; got {pm_data.get('qa_status')!r}"
+        )
+        assert pm_data.get("qa_attempts") == 2, (
+            f"Expected qa_attempts=2 (REVISE + PASS); got {pm_data.get('qa_attempts')}"
+        )
+        assert pm_data.get("qa_verdict") is not None, "qa_verdict must be set"
+        assert pm_data["qa_verdict"]["verdict"] == "pass"
+        assert pm_data["qa_verdict"]["score"] == pytest.approx(0.92)
+
+        # ── Condition 7: qa_status in serialized on-disk postmortem data ────
+        # (pm_data IS the serialized dict written to the event store — same as
+        #  the dict that ends up in the chain artifact checkpoint)
+        assert "qa_status" in pm_data, "qa_status key must appear in serialized postmortem"
+
+        # ── Condition 4: diff_summary spans both commits ────────────────────
+        diff_summary = pm_data.get("diff_summary", "")
+        assert diff_summary, (
+            "diff_summary must be non-empty; impl_v0.py and impl_v1.py were committed"
+        )
+        # Both files committed across the two attempts must appear in the stat
+        has_both_files = "impl_v0.py" in diff_summary and "impl_v1.py" in diff_summary
+        has_multi_change = bool(_re.search(r"2 files? changed", diff_summary))
+        assert has_both_files or has_multi_change, (
+            f"diff_summary must span both attempts' commits (impl_v0.py + impl_v1.py). "
+            f"Got:\n{diff_summary}"
+        )
+
+        # ── Conditions 5: on-disk chain markdown verified by direct file read
+        artifacts = list(artifact_dir.glob("chain-sess_qa_e2e-*.md"))
+        assert len(artifacts) == 1, f"expected 1 chain artifact, got: {artifacts}"
+        content = artifacts[0].read_text(encoding="utf-8")
+
+        # Condition 5: ### QA block present in on-disk markdown
+        assert "### QA" in content, (
+            f"Chain markdown must contain '### QA' block.\n{content[:2000]}"
+        )
+        assert "passed" in content, "QA status 'passed' must appear in rendered markdown"
+        assert "0.92" in content, "QA score '0.92' must appear in rendered markdown"
+
+        # ── Condition 6: context_override injection for retry ───────────────
+        assert len(captured_contexts) == 2, (
+            f"Expected 2 execution attempts (REVISE + PASS); got {len(captured_contexts)}"
+        )
+        first_ctx, second_ctx = captured_contexts
+        assert "QA verdict on previous attempt" not in first_ctx, (
+            "First attempt must not have QA feedback in context_override"
+        )
+        assert "QA verdict on previous attempt" in second_ctx, (
+            f"Second attempt must have QA feedback injected into context_override.\n"
+            f"Got:\n{second_ctx[:500]}"
+        )
+        assert "Missing docstring" in second_ctx, (
+            "QA differences must appear in the retry context_override"
+        )
+        assert "Add a module-level docstring" in second_ctx, (
+            "QA suggestions must appear in the retry context_override"
+        )

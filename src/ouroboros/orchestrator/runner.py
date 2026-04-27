@@ -1580,6 +1580,8 @@ class OrchestratorRunner:
         externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
         mode: str | None = None,
         resume_session_id: str | None = None,
+        inline_qa: bool = False,
+        max_qa_retries: int = 1,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute seed via Claude Agent.
 
@@ -1620,6 +1622,9 @@ class OrchestratorRunner:
             execute_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
         if resume_session_id is not None:
             execute_kwargs["resume_session_id"] = resume_session_id
+        if inline_qa:
+            execute_kwargs["inline_qa"] = inline_qa
+            execute_kwargs["max_qa_retries"] = max_qa_retries
 
         return await self.execute_precreated_session(**execute_kwargs)
 
@@ -1675,6 +1680,8 @@ class OrchestratorRunner:
         externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
         mode: str | None = None,
         resume_session_id: str | None = None,
+        inline_qa: bool = False,
+        max_qa_retries: int = 1,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute a seed using an already-persisted orchestrator session.
 
@@ -1795,6 +1802,12 @@ class OrchestratorRunner:
                 # never bound in scope).
                 if resume_session_id is not None:
                     parallel_kwargs["resume_session_id"] = resume_session_id
+                # Thread inline_qa / max_qa_retries through to the compounding executor.
+                # Only meaningful when mode == "compounding"; _execute_parallel
+                # passes them straight to _serial_kwargs and is otherwise inert.
+                if inline_qa:
+                    parallel_kwargs["inline_qa"] = inline_qa
+                    parallel_kwargs["max_qa_retries"] = max_qa_retries
 
                 return await self._execute_parallel(**parallel_kwargs)
         except asyncio.CancelledError:
@@ -2238,6 +2251,8 @@ class OrchestratorRunner:
         externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
         mode: str = "parallel",
         resume_session_id: str | None = None,
+        inline_qa: bool = False,
+        max_qa_retries: int = 1,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute seed with parallel AC execution.
 
@@ -2367,6 +2382,8 @@ class OrchestratorRunner:
                 "tool_catalog": tool_catalog.tools,
                 "system_prompt": system_prompt,
                 "externally_satisfied_acs": externally_satisfied_acs,
+                "inline_qa": inline_qa,
+                "max_qa_retries": max_qa_retries,
             }
             if resume_session_id is not None:
                 _serial_kwargs["resume_session_id"] = resume_session_id

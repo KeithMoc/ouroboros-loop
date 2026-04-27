@@ -778,3 +778,166 @@ class TestLoadSeedIdFromYamlSizeGuard:
         )
         # Compounding resume session ID must be forwarded to _run_orchestrator.
         assert captured.get("compounding_resume_session_id") == "orch_abc123"
+
+
+class TestInlineQAFlags:
+    """Tests for --inline-qa and --max-qa-retries CLI wiring (Q4 / Sub-AC 1)."""
+
+    def test_inline_qa_compounding_propagates_to_run_orchestrator(
+        self, tmp_path: Path
+    ) -> None:
+        """--inline-qa --compounding passes inline_qa=True to _run_orchestrator."""
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding", "--inline-qa"],
+            )
+        assert result.exit_code == 0, result.output
+        assert captured.get("inline_qa") is True
+
+    def test_max_qa_retries_propagates_to_run_orchestrator(
+        self, tmp_path: Path
+    ) -> None:
+        """--max-qa-retries N --inline-qa --compounding passes max_qa_retries=N."""
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                [
+                    "workflow",
+                    str(seed_path),
+                    "--compounding",
+                    "--inline-qa",
+                    "--max-qa-retries",
+                    "3",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert captured.get("max_qa_retries") == 3
+
+    def test_inline_qa_outside_compounding_warns_and_ignores(
+        self, tmp_path: Path
+    ) -> None:
+        """--inline-qa without --compounding emits a warning and passes inline_qa=False."""
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--inline-qa"],
+            )
+        assert result.exit_code == 0, result.output
+        # Warning should appear in output
+        assert "inline-qa" in result.output.lower() or "no effect" in result.output.lower()
+        # inline_qa must be coerced to False (or absent from kwargs)
+        assert captured.get("inline_qa", False) is False
+
+    def test_max_qa_retries_without_inline_qa_warns(
+        self, tmp_path: Path
+    ) -> None:
+        """--max-qa-retries without --inline-qa emits a warning."""
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding", "--max-qa-retries", "2"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "max-qa-retries" in result.output.lower() or "no effect" in result.output.lower()
+
+    def test_default_run_has_inline_qa_false(self, tmp_path: Path) -> None:
+        """Default run (no --inline-qa) passes inline_qa=False."""
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(run_app, ["workflow", str(seed_path), "--compounding"])
+        assert result.exit_code == 0, result.output
+        assert captured.get("inline_qa", False) is False
+
+    def test_default_max_qa_retries_is_one(self, tmp_path: Path) -> None:
+        """Default run forwards max_qa_retries=1 to _run_orchestrator.
+
+        Asserts the kwarg is *present* — `captured.get(..., 1)` would
+        otherwise return the same value when the kwarg is absent entirely,
+        masking a regression where the CLI fails to forward it.
+        """
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding", "--inline-qa"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "max_qa_retries" in captured, (
+            f"_run_orchestrator must receive max_qa_retries kwarg; got kwargs={list(captured)}"
+        )
+        assert captured["max_qa_retries"] == 1
+
+    def test_inline_qa_not_in_execute_kwargs_when_disabled(
+        self, tmp_path: Path
+    ) -> None:
+        """When --inline-qa is off, execute_kwargs must NOT contain inline_qa=True."""
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding"],
+            )
+        assert result.exit_code == 0, result.output
+        # inline_qa should not be True when flag is absent
+        assert not captured.get("inline_qa", False)

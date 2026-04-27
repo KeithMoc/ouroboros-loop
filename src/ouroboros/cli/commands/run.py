@@ -422,6 +422,8 @@ async def _run_orchestrator(
     skip_completed: str | None = None,
     mode: str | None = None,
     compounding_resume_session_id: str | None = None,
+    inline_qa: bool = False,
+    max_qa_retries: int = 1,
 ) -> None:
     """Run workflow via orchestrator mode.
 
@@ -442,6 +444,12 @@ async def _run_orchestrator(
             passed through to ``execute_serial`` as ``resume_session_id`` so
             checkpoint-based resume kicks in.  Mutually exclusive with
             ``skip_completed``.
+        inline_qa: When True (and mode == "compounding"), run per-AC inline QA
+            evaluation after each AC's postmortem is built.  Ignored outside
+            compounding mode.  Default: False.
+        max_qa_retries: Budget for QA-triggered retries per AC (separate from
+            stall-retries).  Only meaningful when ``inline_qa`` is True.
+            Default: 1 (2 total attempts per AC).
     """
     from ouroboros.core.seed import Seed
     from ouroboros.orchestrator import OrchestratorRunner, create_agent_runtime
@@ -600,6 +608,25 @@ async def _run_orchestrator(
                 execute_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
             if compounding_resume_session_id is not None:
                 execute_kwargs["resume_session_id"] = compounding_resume_session_id
+            if mode == "compounding" and inline_qa:
+                # Compounding requires >1 AC to enter the serial-loop path;
+                # a single-AC seed routes to the streaming branch which never
+                # consults inline_qa.  Warn explicitly so the user isn't left
+                # wondering why their --inline-qa flag had no effect.
+                if len(seed.acceptance_criteria) <= 1:
+                    log.warning(
+                        "run.inline_qa.ignored_single_ac_seed",
+                        ac_count=len(seed.acceptance_criteria),
+                    )
+                    print_warning(
+                        "--inline-qa requires a seed with more than one acceptance "
+                        "criterion (compounding executes per-AC). Single-AC seeds "
+                        "route to the streaming path; inline-QA will be ignored "
+                        "for this run."
+                    )
+                else:
+                    execute_kwargs["inline_qa"] = inline_qa
+                    execute_kwargs["max_qa_retries"] = max_qa_retries
             result = await runner.execute_seed(**execute_kwargs)
 
         # Handle result
@@ -770,6 +797,29 @@ def workflow(
             ),
         ),
     ] = None,
+    inline_qa: Annotated[
+        bool,
+        typer.Option(
+            "--inline-qa",
+            help=(
+                "Run per-AC QA evaluation in compounding mode. Captures verdict in "
+                "the postmortem chain. Roughly doubles model calls. No effect outside "
+                "--compounding mode."
+            ),
+        ),
+    ] = False,
+    max_qa_retries: Annotated[
+        int,
+        typer.Option(
+            "--max-qa-retries",
+            min=0,
+            help=(
+                "Max retries when QA verdict is REVISE/FAIL (separate from --max-stall-retries). "
+                "Default 1 → 2 total QA-judged attempts per AC. Budget-only; QA never blocks "
+                "the run on exhaustion (verdict captured in postmortem)."
+            ),
+        ),
+    ] = 1,
 ) -> None:
     """Execute a workflow from a seed file.
 
@@ -827,6 +877,21 @@ def workflow(
     if compounding and sequential:
         print_error("--compounding and --sequential are mutually exclusive; pick one.")
         raise typer.Exit(1)
+
+    # --inline-qa outside --compounding: warn and ignore.
+    if inline_qa and not compounding:
+        log.warning("run.inline_qa.ignored_outside_compounding")
+        print_warning(
+            "--inline-qa has no effect outside --compounding mode; flag ignored."
+        )
+        inline_qa = False
+
+    # --max-qa-retries without --inline-qa: warn and ignore.
+    if max_qa_retries != 1 and not inline_qa:
+        log.warning("run.max_qa_retries.ignored_without_inline_qa")
+        print_warning(
+            "--max-qa-retries has no effect without --inline-qa; flag ignored."
+        )
 
     execution_mode = "compounding" if compounding else None
 
@@ -895,6 +960,8 @@ def workflow(
                     skip_completed=skip_completed,
                     mode=execution_mode,
                     compounding_resume_session_id=compounding_resume,
+                    inline_qa=inline_qa,
+                    max_qa_retries=max_qa_retries,
                 )
             )
         except (ValueError, NotImplementedError) as e:
