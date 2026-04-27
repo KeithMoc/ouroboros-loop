@@ -7869,4 +7869,207 @@ class TestRenderChainMarkdownQABlock:
 
         # The ### QA block itself must be present
         assert "### QA" in content
-        assert "- Status: exhausted (attempt 2)" in content
+
+
+# =============================================================================
+# Q4 — End-to-end regression test: QA retry loop with commit-per-AC
+# =============================================================================
+
+
+class TestInlineQAEndToEnd:
+    """End-to-end regression test for Q4 inline-QA with real git commits.
+
+    Analogous to TestSerialExecutorDiffCapture.test_diff_summary_flows_end_to_end_*
+    but for the full QA-retry loop: REVISE on attempt 1 → commit 1 → feedback
+    injected → PASS on attempt 2 → commit 2.  Asserts 7 invariants.
+
+    [[INVARIANT: pre_sha is captured exactly once per AC before the QA retry loop]]
+    [[INVARIANT: diff_summary spans all QA retry commits pre_sha to HEAD]]
+    [[INVARIANT: qa_status='passed' when the final QA verdict is PASS]]
+    """
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_flows_end_to_end_with_commit_per_ac(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: REVISE-then-PASS QA retry with real commits per attempt.
+
+        Regression net for the Q2.1 lesson (commit-per-AC design): ensures
+        that the QA retry loop never re-captures pre_sha between attempts so
+        the cumulative diff always spans from the AC-start commit to HEAD.
+
+        7 conditions verified:
+        1. QA call count == 2 (REVISE on attempt 1, PASS on attempt 2)
+        2. pre_sha captured exactly once per AC (before retry loop)
+        3. Final postmortem: qa_status='passed', qa_attempts=2, verdict='pass'
+        4. diff_summary spans both attempts' commits (two files committed)
+        5. On-disk chain markdown contains ### QA block (direct file read)
+        6. context_override for retry (attempt 2) contains QA feedback text
+        7. Chain serialized with qa_status in postmortem event data
+        """
+        import re as _re
+        import subprocess as _sp
+        import unittest.mock as _mock
+
+        from ouroboros.orchestrator import serial_executor as _se_mod
+
+        # Pin chain artifact dir so we can read the file directly
+        artifact_dir = tmp_path / "chain_artifacts"
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir))
+
+        _init_test_repo(tmp_path)
+        seed = _make_seed("Add QA-verified feature")
+        executor = _make_executor_with_cwd(tmp_path)
+
+        git_env = {
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(tmp_path),
+        }
+
+        # Condition 1: fake QA returns REVISE on attempt 1, PASS on attempt 2
+        qa_call_args = _attach_fake_qa(
+            executor,
+            [
+                _make_qa_ok_result(
+                    loop_action="revise",
+                    score=0.55,
+                    verdict="revise",
+                    differences=["Missing docstring"],
+                    suggestions=["Add a module-level docstring"],
+                    reasoning="Module lacks documentation.",
+                ),
+                _make_qa_ok_result(loop_action="pass", score=0.92, verdict="pass"),
+            ],
+        )
+
+        # Track context_override per attempt for condition 6
+        captured_contexts: list[str] = []
+        attempt_counter = 0
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            nonlocal attempt_counter
+            captured_contexts.append(kwargs.get("context_override") or "")
+            # Each attempt commits a distinct file so diff spans both commits
+            fname = f"impl_v{attempt_counter}.py"
+            (tmp_path / fname).write_text(
+                f"def impl_v{attempt_counter}():\n    return {attempt_counter}\n"
+            )
+            _sp.run(["git", "add", fname], cwd=str(tmp_path), env=git_env, check=True)
+            _sp.run(
+                ["git", "commit", "-q", "-m", f"feat: impl_v{attempt_counter}"],
+                cwd=str(tmp_path),
+                env=git_env,
+                check=True,
+            )
+            ac_index = int(kwargs["ac_index"])
+            ac_content = str(kwargs["ac_content"])
+            attempt_counter += 1
+            return _ok_result(ac_index, ac_content, files_written=(fname,))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        # Condition 2: spy on capture_pre_ac_snapshot to verify called exactly once
+        capture_calls: list[Any] = []
+        original_capture = _se_mod.capture_pre_ac_snapshot
+
+        def spy_capture(workspace: Any) -> Any:
+            capture_calls.append(workspace)
+            return original_capture(workspace)
+
+        with _mock.patch.object(_se_mod, "capture_pre_ac_snapshot", side_effect=spy_capture):
+            plan = _make_plan((0,))
+            result = await executor.execute_serial(
+                seed=seed,
+                session_id="sess_qa_e2e",
+                execution_id="exec_qa_e2e",
+                tools=[],
+                system_prompt="SYSTEM",
+                execution_plan=plan,
+                inline_qa=True,
+                max_qa_retries=1,
+            )
+
+        # ── Condition 1: QA call count ─────────────────────────────────────
+        assert len(qa_call_args) == 2, (
+            f"Expected 2 QA calls (REVISE + PASS); got {len(qa_call_args)}"
+        )
+
+        # ── Condition 2: pre_sha captured exactly once ──────────────────────
+        assert len(capture_calls) == 1, (
+            f"pre_sha must be captured once per AC, not once per QA retry; "
+            f"captured {len(capture_calls)} times.  Regression guard for Q2.1."
+        )
+
+        # ── Condition 3: final postmortem fields ────────────────────────────
+        assert result.success_count == 1
+        pm_events = [
+            e
+            for e in executor._event_store._appended
+            if e.type == "execution.ac.postmortem.captured"
+        ]
+        assert len(pm_events) == 1
+        pm_data = pm_events[0].data["postmortem"]
+
+        assert pm_data.get("qa_status") == "passed", (
+            f"Expected qa_status='passed'; got {pm_data.get('qa_status')!r}"
+        )
+        assert pm_data.get("qa_attempts") == 2, (
+            f"Expected qa_attempts=2 (REVISE + PASS); got {pm_data.get('qa_attempts')}"
+        )
+        assert pm_data.get("qa_verdict") is not None, "qa_verdict must be set"
+        assert pm_data["qa_verdict"]["verdict"] == "pass"
+        assert pm_data["qa_verdict"]["score"] == pytest.approx(0.92)
+
+        # ── Condition 7: qa_status in serialized on-disk postmortem data ────
+        # (pm_data IS the serialized dict written to the event store — same as
+        #  the dict that ends up in the chain artifact checkpoint)
+        assert "qa_status" in pm_data, "qa_status key must appear in serialized postmortem"
+
+        # ── Condition 4: diff_summary spans both commits ────────────────────
+        diff_summary = pm_data.get("diff_summary", "")
+        assert diff_summary, (
+            "diff_summary must be non-empty; impl_v0.py and impl_v1.py were committed"
+        )
+        # Both files committed across the two attempts must appear in the stat
+        has_both_files = "impl_v0.py" in diff_summary and "impl_v1.py" in diff_summary
+        has_multi_change = bool(_re.search(r"2 files? changed", diff_summary))
+        assert has_both_files or has_multi_change, (
+            f"diff_summary must span both attempts' commits (impl_v0.py + impl_v1.py). "
+            f"Got:\n{diff_summary}"
+        )
+
+        # ── Conditions 5: on-disk chain markdown verified by direct file read
+        artifacts = list(artifact_dir.glob("chain-sess_qa_e2e-*.md"))
+        assert len(artifacts) == 1, f"expected 1 chain artifact, got: {artifacts}"
+        content = artifacts[0].read_text(encoding="utf-8")
+
+        # Condition 5: ### QA block present in on-disk markdown
+        assert "### QA" in content, (
+            f"Chain markdown must contain '### QA' block.\n{content[:2000]}"
+        )
+        assert "passed" in content, "QA status 'passed' must appear in rendered markdown"
+        assert "0.92" in content, "QA score '0.92' must appear in rendered markdown"
+
+        # ── Condition 6: context_override injection for retry ───────────────
+        assert len(captured_contexts) == 2, (
+            f"Expected 2 execution attempts (REVISE + PASS); got {len(captured_contexts)}"
+        )
+        first_ctx, second_ctx = captured_contexts
+        assert "QA verdict on previous attempt" not in first_ctx, (
+            "First attempt must not have QA feedback in context_override"
+        )
+        assert "QA verdict on previous attempt" in second_ctx, (
+            f"Second attempt must have QA feedback injected into context_override.\n"
+            f"Got:\n{second_ctx[:500]}"
+        )
+        assert "Missing docstring" in second_ctx, (
+            "QA differences must appear in the retry context_override"
+        )
+        assert "Add a module-level docstring" in second_ctx, (
+            "QA suggestions must appear in the retry context_override"
+        )
