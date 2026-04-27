@@ -980,6 +980,8 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         fail_fast: bool = True,
         externally_satisfied_acs: "dict[int, dict[str, Any]] | None" = None,
         resume_session_id: str | None = None,
+        inline_qa: bool = False,
+        max_qa_retries: int = 1,
     ) -> ParallelExecutionResult:
         """Execute ACs strictly serially with compounding postmortems.
 
@@ -1011,6 +1013,14 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 and does not change the storage key.  If no checkpoint is
                 found or the checkpoint is not a valid compounding checkpoint,
                 a warning is logged and execution continues from the beginning.
+            inline_qa: When True, run per-AC inline QA evaluation after each
+                AC's postmortem is built.  QA verdict is stored in the
+                postmortem chain.  On REVISE/FAIL, the AC is re-executed with
+                QA feedback injected; retries are bounded by ``max_qa_retries``.
+                Default: False (gated behind --inline-qa CLI flag).
+            max_qa_retries: Budget for QA-triggered retries per AC, separate
+                from stall-retries.  Default 1 → up to 2 QA-judged attempts.
+                On exhaustion, the AC soft-passes (qa_status='exhausted').
 
         Returns:
             ParallelExecutionResult with one stage per AC so downstream
