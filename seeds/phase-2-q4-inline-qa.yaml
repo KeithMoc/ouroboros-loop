@@ -1,0 +1,717 @@
+# Phase-2 Dogfood Seed — Q4: Inline QA in Serial-Compounding Mode
+#
+# Three ACs.  Wires QAHandler (mcp/tools/qa.py:397) into
+# SerialCompoundingExecutor's per-AC body so each AC's claim is judged
+# against its actual diff with an LLM verdict (pass | revise | fail).
+# Recoverable verdicts trigger a budgeted retry loop with QA feedback
+# injected into the next attempt's prompt.
+#
+# This is the second non-self-referential dogfood run.  Q2 (ccfc479)
+# shipped per-AC diff capture; Q2.1 (4f0b044) hotfixed two bugs the
+# unit suite missed but a real --compounding run surfaced.  The lesson
+# from Q2.1 — design *with* the orchestrator's commit-per-AC pattern,
+# not against it — is baked into AC-2's retry mechanics (add-on
+# commits, pre_sha captured ONCE outside the retry loop) and into
+# AC-3's mandatory end-to-end test.
+#
+# Run:
+#   ooo run workflow seeds/phase-2-q4-inline-qa.yaml --compounding
+#
+# Full reasoning:
+#   docs/brainstorm/phase-2-q4-inline-qa-design.md
+#   docs/brainstorm/serial-compounding-open-questions.md (Q4 section)
+
+goal: "Implement Q4 (inline QA in serial-compounding mode) for Ouroboros: per-AC, after diff_summary is captured and the postmortem is built, call QAHandler with the agent's final_message + diff_summary as `artifact` and the AC text + seed.goal as `quality_bar`. On REVISE/FAIL, re-execute the AC with QA feedback injected into context_override; pre_sha is captured ONCE per AC so the cumulative diff spans all attempts. Budget retries via a new --max-qa-retries flag (default 1, separate from --max-stall-retries). On budget exhaustion, soft-pass: keep the last attempt's postmortem with qa_status='exhausted' so a flaky LLM judge cannot nuke a long compounding chain. The whole feature is gated behind --inline-qa (default off — roughly doubles model cost per AC). Externally-satisfied ACs and failed/stalled executions skip QA entirely."
+
+constraints:
+  - "Python 3.10+ (matches existing codebase)"
+  - "Keep the full existing test suite green (`uv run pytest tests/unit/` before committing each AC)"
+  - "Parallel mode (`mode='parallel'`) must remain byte-identical to pre-change — parallel_executor.py and its tests are NOT touched"
+  - "`--inline-qa` and `--max-qa-retries` are SerialCompoundingExecutor-only behavior; ParallelACExecutor must not see them"
+  - "Inline QA NEVER blocks the run on retry exhaustion — always soft-pass with qa_status='exhausted' regardless of fail_fast.  fail_fast governs only execution failures, not QA verdicts."
+  - "pre_sha (capture_pre_ac_snapshot) must be captured EXACTLY ONCE per AC, BEFORE the QA-retry loop. compute_diff_summary runs per attempt and naturally spans pre→HEAD, covering all retry commits per Q3=B add-on-commits design."
+  - "QA is NEVER called when result.outcome != ACExecutionOutcome.SUCCEEDED. Failed/stalled ACs continue through the existing FAILED-path untouched."
+  - "QA is NEVER called for externally-satisfied ACs (the line ~1186 path).  External-completed ACs skip the entire QA loop."
+  - "QA is called PARENT-AC only on decomposed ACs.  Sub-postmortems are already aggregated into parent.sub_postmortems; do NOT run QA per sub-AC."
+  - "If QAHandler.handle returns the opencode-mode plugin-dispatch shape (`status: 'delegated_to_subagent'` in meta — see qa.py:539-553), record qa_status='skipped_delegated' and break the retry loop. Do NOT treat this as PASS or FAIL."
+  - "Phase-1.5 + Q2 invariants are NOT regressed: end-of-run chain artifact still written, sub-postmortems still flattened in prompts, invariant tags still verified by Haiku, per-AC checkpoint still written, resume still works, diff_summary still populated and rendered in the markdown artifact under each AC bullet."
+  - "ACPostmortem is a frozen dataclass — adding fields preserves immutability semantics; rebuild via positional/keyword construction in the executor (matches existing pattern at serial_executor.py:1444)."
+  - "ACExecutionOutcome enum is UNCHANGED — no new states.  qa_status lives on ACPostmortem only."
+  - "Use `--inline-qa` outside `--compounding`: log a warning (`run.inline_qa.ignored_outside_compounding`) and ignore.  Same for `--max-qa-retries` without `--inline-qa`."
+  - "Use a conventional-commit message for each AC's commit (`feat(compounding): Q4 — <AC scope>`)."
+  - "Before starting, read docs/brainstorm/phase-2-q4-inline-qa-design.md for the full design and locked decisions."
+  - "Emit at least one [[INVARIANT: ...]] tag per AC's final message so Q3's verifier can score the work."
+
+acceptance_criteria:
+  - |
+    AC-1 (Q4 / part 1) — Inline-QA module + ACPostmortem schema + serializer round-trip
+
+    Deliverable: a fully tested `inline_qa.py` module + the three new
+    `ACPostmortem` fields, with no executor wiring yet.  This AC is
+    purely additive — running existing tests and a `--compounding`
+    run WITHOUT `--inline-qa` must be byte-identical pre/post this AC.
+
+    REQUIREMENTS:
+
+    - Create new module `src/ouroboros/orchestrator/inline_qa.py` with:
+
+        * `_assemble_qa_artifact(result: ACExecutionResult, postmortem: ACPostmortem) -> str`
+            Returns:
+              "## Agent's final message\n{final_message_or_(empty)}\n\n"
+              "## Diff summary (`git diff --stat`, pre-AC → post-AC)\n"
+              "```\n{diff_summary_or_(no changes detected)}\n```"
+            The "(empty)" / "(no changes detected)" sentinels are
+            intentional — they ARE the QA-detectable signal.
+
+        * `_assemble_qa_quality_bar(ac_index: int, ac_content: str, seed_goal: str) -> str`
+            Returns:
+              "Acceptance criterion AC-{ac_index + 1}: {ac_content}\n\n"
+              "Seed goal: {seed_goal}"
+            DO NOT include seed.quality_bar (that's used by post-execution
+            QA, kept distinct).  DO NOT include chain invariants.
+
+        * `_format_qa_feedback_section(verdict_dict: dict, attempt_number: int, max_attempts: int) -> str`
+            Builds the prompt-injection block appended to the next
+            retry attempt's context_override.  Format:
+
+              "\n\n## QA verdict on previous attempt "
+              "(attempt {attempt_number} of {max_attempts})\n\n"
+              "Score: {score:.2f} / 1.00 — {verdict_label_upper}\n\n"
+              "### Differences flagged\n"
+              "- {differences[0]}\n- {differences[1]}\n...\n\n"
+              "### Suggested revisions\n"
+              "- {suggestions[0]}\n- {suggestions[1]}\n...\n\n"
+              "### Reasoning\n{reasoning}\n\n"
+              "The previous attempt's commits are **kept on the branch**. "
+              "Build on them — do NOT revert. Address the differences and "
+              "suggestions above in a follow-up commit.\n"
+
+            Empty differences/suggestions lists render as "- (none)".
+            verdict_label_upper is verdict_dict.get("verdict","").upper().
+
+        * `_serialize_qa_verdict(verdict: QAVerdict) -> dict[str, Any]`
+            Converts a parsed QAVerdict to a JSON-safe dict for storage
+            in postmortem.qa_verdict.  Schema:
+              {"score": float, "verdict": str, "dimensions": dict,
+               "differences": list, "suggestions": list, "reasoning": str}
+
+        * `@dataclass(frozen=True, slots=True) InlineQAOutcome`
+            Fields:
+              loop_action: str  # "pass" | "revise" | "fail" | "skipped_delegated"
+              score: float
+              verdict_dict: dict[str, Any] | None  # None when skipped_delegated
+              qa_session_id: str
+
+        * `async def run_inline_qa(qa_handler: QAHandler, *, postmortem: ACPostmortem, ac_index: int, ac_content: str, seed: Seed, qa_session_id: str | None = None) -> InlineQAOutcome`
+            - Composes a synthetic ACExecutionResult-shaped artifact-input
+              from the postmortem (NOTE: the executor passes the *result*
+              directly so the helper takes both — but for a self-contained
+              unit-testable surface, the helper signature accepts
+              `postmortem` and reconstructs the artifact from
+              `postmortem.summary.key_output` (final_message proxy) +
+              `postmortem.diff_summary`).
+            - Calls qa_handler.handle({...}) with artifact, quality_bar,
+              artifact_type="code", seed_content=yaml.dump(...) of seed,
+              pass_threshold=0.80, qa_session_id=qa_session_id (or
+              auto-generated if None).
+            - Detects the opencode plugin-dispatch path: if the returned
+              MCPToolResult has `meta["status"] == "delegated_to_subagent"`,
+              return InlineQAOutcome(loop_action="skipped_delegated",
+              score=0.0, verdict_dict=None, qa_session_id=...).
+            - Detects qa_handler returning Err: log
+              `inline_qa.handle_failed` and return
+              InlineQAOutcome(loop_action="skipped_delegated",
+              score=0.0, verdict_dict=None, qa_session_id=...) so
+              executor falls through cleanly (no retries).
+            - On Ok: read `meta` for score, verdict label, loop_action,
+              dimensions, differences, suggestions, reasoning; return
+              an InlineQAOutcome with verdict_dict populated by the
+              same _serialize_qa_verdict-shaped subset.
+
+      The module imports:
+        from dataclasses import dataclass, field
+        from typing import Any
+        from ouroboros.mcp.tools.qa import QAHandler, QAVerdict
+        from ouroboros.orchestrator.level_context import ACPostmortem
+        from ouroboros.orchestrator.parallel_executor_models import ACExecutionResult
+        from ouroboros.observability.logging import get_logger
+        # Seed type imported for type hints — use TYPE_CHECKING guard
+        # if circular.  yaml.dump used for seed_content arg.
+
+    - Add three new fields to ACPostmortem (level_context.py:581 area)
+      — frozen dataclass field defaults preserve forward compat:
+
+        qa_verdict: dict[str, Any] | None = None
+        qa_status: str | None = None  # None | "passed" | "exhausted" | "skipped_delegated"
+        qa_attempts: int = 0
+
+      Update `_deserialize_postmortem` (level_context.py:1150) to read
+      these via `d.get("qa_verdict")`, `d.get("qa_status")`,
+      `d.get("qa_attempts", 0)` so old serialized chains hydrate
+      cleanly with defaults.  No changes to `serialize_postmortem_chain`
+      (it uses asdict, which auto-includes the new fields).
+
+      Update `to_digest` (level_context.py:606) to append a "QA: passed"
+      / "QA: exhausted (score=0.62)" / "QA: skipped" suffix to the
+      digest line when qa_status is not None.  Suffix format:
+          ` | QA: {qa_status}` for "passed" / "skipped_delegated"
+          ` | QA: exhausted (score={qa_verdict.score:.2f})` when "exhausted"
+      Place after the existing `files: ...` / `gotcha: ...` parts.
+
+      DO NOT modify `to_full_text` for this AC — Q4's render lives in
+      the markdown chain artifact (AC-3) and the digest line.  Full-form
+      rendering can wait.
+
+    TESTS (required) in NEW file `tests/unit/orchestrator/test_inline_qa.py`:
+
+      Pure helpers:
+       1. _assemble_qa_artifact: empty final_message, empty diff_summary,
+          both empty (assert "(empty)" and "(no changes detected)" appear).
+       2. _assemble_qa_artifact: multiline final_message + multi-file diff
+          stat; output preserves both blocks under correct headings.
+       3. _assemble_qa_quality_bar: ac_index=0 produces "AC-1:" prefix
+          (1-based for display).
+       4. _assemble_qa_quality_bar: multiline AC content + multiline seed
+          goal preserved verbatim.
+       5. _format_qa_feedback_section: REVISE verdict with 2 differences +
+          3 suggestions renders all bullets, score, verdict label uppercase,
+          and the "kept on the branch" footer.
+       6. _format_qa_feedback_section: FAIL verdict renders identically
+          structurally; verdict label is "FAIL".
+       7. _format_qa_feedback_section: empty differences AND empty
+          suggestions render "- (none)" placeholder under each heading.
+       8. _format_qa_feedback_section: suggestion text containing backticks
+          is rendered verbatim (markdown safety is the renderer's job in
+          AC-3, not this helper's).
+       9. _serialize_qa_verdict: round-trips score/verdict/reasoning; tuple
+          fields (differences, suggestions) become lists; dimensions dict
+          preserved.
+
+      InlineQAOutcome:
+      10. Construction with explicit None verdict_dict; assert frozen
+          (cannot mutate fields).
+
+      run_inline_qa (uses a fake QAHandler with monkeypatched .handle):
+      11. Happy path: fake handler returns Ok(MCPToolResult) with full
+          meta (score=0.9, verdict="pass", loop_action="pass", ...);
+          assert returned InlineQAOutcome.loop_action == "pass",
+          score == 0.9, verdict_dict has all 6 keys.
+      12. REVISE path: meta loop_action="revise"; outcome carries through.
+      13. FAIL path: meta loop_action="fail"; outcome carries through.
+      14. Plugin-dispatch path: fake handler returns Ok with
+          meta["status"] == "delegated_to_subagent"; outcome is
+          loop_action="skipped_delegated", verdict_dict is None.
+      15. Err path: fake handler returns Err(MCPToolError); outcome is
+          loop_action="skipped_delegated", verdict_dict is None.  Verify
+          a `inline_qa.handle_failed` log was emitted (caplog).
+      16. qa_session_id=None: outcome.qa_session_id is non-empty
+          auto-generated string starting with "qa-ac".
+      17. qa_session_id="qa-fixed-1": outcome.qa_session_id == that exact
+          value.
+
+      Schema additions in tests/unit/orchestrator/test_level_context.py:
+      18. ACPostmortem(summary=...) constructs with default qa_verdict=None,
+          qa_status=None, qa_attempts=0.
+      19. serialize_postmortem_chain → deserialize_postmortem_chain
+          round-trip preserves qa_verdict (dict), qa_status (str),
+          qa_attempts (int).
+      20. _deserialize_postmortem with a dict missing all three qa_* keys
+          (forward-compat: old serialized chain) yields ACPostmortem with
+          the defaults.
+      21. to_digest with qa_status="passed" appends " | QA: passed".
+      22. to_digest with qa_status="exhausted" + qa_verdict={"score": 0.62}
+          appends " | QA: exhausted (score=0.62)".
+      23. to_digest with qa_status=None (default) appends nothing.
+
+    GOTCHAS TO NOTE FOR FUTURE ACs:
+    - [[INVARIANT: inline_qa.py contains zero direct references to
+      SerialCompoundingExecutor — the helpers must remain unit-testable
+      without instantiating the executor]]
+    - [[INVARIANT: ACPostmortem qa_* fields default to None/0 so existing
+      callers and serialized chains remain forward-compatible]]
+    - [[INVARIANT: opencode plugin-dispatch path is detected by
+      meta["status"] == "delegated_to_subagent" and returns
+      loop_action="skipped_delegated"]]
+
+  - |
+    AC-2 (Q4 / part 2) — Wire into SerialCompoundingExecutor + CLI flags + integration tests
+
+    Deliverable: `--inline-qa` and `--max-qa-retries` CLI flags drive a
+    QA-retry loop in `execute_serial`.  AC-1's helpers become
+    load-bearing; the executor calls `run_inline_qa` per AC and injects
+    feedback into retries via `context_override`.
+
+    REQUIREMENTS:
+
+    - Add two new kwargs to `SerialCompoundingExecutor.execute_serial`
+      (around serial_executor.py:969):
+        inline_qa: bool = False,
+        max_qa_retries: int = 1,
+      (Both default-off / default-budget so untouched callers behave
+      identically — AC-1's "no behavior change without --inline-qa"
+      guarantee is preserved here.)
+
+    - Wrap the per-AC body currently spanning serial_executor.py:1330
+      (capture_pre_ac_snapshot) through :1391
+      (_build_postmortem_from_result) in a QA-retry loop.  Pre-AC
+      snapshot stays OUTSIDE the loop; the executor body inside the
+      loop computes a fresh diff_summary per attempt but the same
+      pre_sha is reused.  Pseudocode (full file diff applies — this is
+      the canonical patch structure):
+
+        pre_sha = ... (existing capture, untouched)
+
+        qa_verdict_for_feedback: dict[str, Any] | None = None
+        qa_attempts_used = 0
+        final_postmortem: ACPostmortem | None = None
+
+        for qa_attempt in range(max_qa_retries + 1):
+            ctx_for_attempt = context_section
+            if qa_verdict_for_feedback is not None:
+                ctx_for_attempt = ctx_for_attempt + _format_qa_feedback_section(
+                    qa_verdict_for_feedback,
+                    attempt_number=qa_attempt + 1,
+                    max_attempts=max_qa_retries + 1,
+                )
+
+            try:
+                result = await self._execute_single_ac(
+                    ...,  # all existing kwargs UNCHANGED except:
+                    context_override=ctx_for_attempt,
+                    retry_attempt=qa_attempt,
+                )
+            except Exception as exc:
+                # Existing wrap UNCHANGED
+                ...
+                break  # don't QA-loop on hard execution failure
+
+            try:
+                diff_summary = compute_diff_summary(pre_sha, workspace_for_diff)
+            except Exception as exc:
+                ...
+                diff_summary = ""
+
+            postmortem = self._build_postmortem_from_result(
+                result, workspace_root=self._task_cwd, diff_summary=diff_summary,
+            )
+            final_postmortem = postmortem
+
+            # Skip QA on disabled flag, non-success, externally-satisfied
+            if not inline_qa or result.outcome != ACExecutionOutcome.SUCCEEDED:
+                break
+
+            outcome = await run_inline_qa(
+                self._qa_handler,
+                postmortem=postmortem,
+                ac_index=ac_index,
+                ac_content=ac_content,
+                seed=seed,
+                qa_session_id=f"qa-ac{ac_index}-{session_id[:8]}-{qa_attempt}",
+            )
+            qa_attempts_used = qa_attempt + 1
+
+            await self._safe_emit_event(
+                create_ac_qa_evaluated_event(
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    ac_index=ac_index,
+                    qa_attempt=qa_attempts_used,
+                    score=outcome.score,
+                    verdict_label=(outcome.verdict_dict or {}).get("verdict", ""),
+                    loop_action=outcome.loop_action,
+                    passed=(outcome.loop_action == "pass"),
+                )
+            )
+
+            # Rebuild postmortem with QA verdict embedded
+            final_postmortem = ACPostmortem(
+                summary=postmortem.summary,
+                diff_summary=postmortem.diff_summary,
+                tool_trace_digest=postmortem.tool_trace_digest,
+                gotchas=postmortem.gotchas,
+                qa_suggestions=postmortem.qa_suggestions,
+                invariants_established=postmortem.invariants_established,
+                retry_attempts=postmortem.retry_attempts,
+                status=postmortem.status,
+                duration_seconds=postmortem.duration_seconds,
+                ac_native_session_id=postmortem.ac_native_session_id,
+                sub_postmortems=postmortem.sub_postmortems,
+                qa_verdict=outcome.verdict_dict,
+                qa_attempts=qa_attempts_used,
+                qa_status=("passed" if outcome.loop_action == "pass"
+                           else "skipped_delegated" if outcome.loop_action == "skipped_delegated"
+                           else None),
+            )
+
+            if outcome.loop_action in ("pass", "skipped_delegated"):
+                break
+
+            qa_verdict_for_feedback = outcome.verdict_dict
+            # Loop continues — next iteration injects feedback into ctx_for_attempt
+
+        else:
+            # Loop exhausted without break (REVISE/FAIL on every attempt)
+            # Q4=B soft-pass: keep last attempt's postmortem, mark exhausted
+            final_postmortem = ACPostmortem(
+                summary=final_postmortem.summary,
+                diff_summary=final_postmortem.diff_summary,
+                tool_trace_digest=final_postmortem.tool_trace_digest,
+                gotchas=final_postmortem.gotchas,
+                qa_suggestions=final_postmortem.qa_suggestions,
+                invariants_established=final_postmortem.invariants_established,
+                retry_attempts=final_postmortem.retry_attempts,
+                status=final_postmortem.status,
+                duration_seconds=final_postmortem.duration_seconds,
+                ac_native_session_id=final_postmortem.ac_native_session_id,
+                sub_postmortems=final_postmortem.sub_postmortems,
+                qa_verdict=qa_verdict_for_feedback,
+                qa_attempts=qa_attempts_used,
+                qa_status="exhausted",
+            )
+
+        # Existing invariant-extraction / chain-append code resumes here,
+        # but reads from final_postmortem instead of `postmortem`.
+        # Replace `postmortem` with `final_postmortem` in lines 1393-1503
+        # (or refactor the variable name in that whole block).
+
+    - The for/else construct above is intentional: if the loop runs to
+      its natural end without `break`, the `else` block executes —
+      that's the Q4=B soft-pass exhaustion path.  Python guarantees
+      `else` runs only after no-break exit.
+
+    - `self._qa_handler` is a NEW instance attribute on
+      SerialCompoundingExecutor.  Initialize lazily in __init__ via:
+
+        from ouroboros.mcp.tools.qa import QAHandler
+        self._qa_handler: QAHandler = QAHandler(
+            llm_adapter=None,  # let it create its own
+            llm_backend=None,
+            event_store=event_store,  # the same one the executor uses
+            agent_runtime_backend=agent_runtime_backend,  # propagate from runner
+            opencode_mode=opencode_mode,  # propagate from runner
+        )
+
+      The runtime/opencode args propagate through the existing
+      runner-→executor wiring; check serial_executor.py's
+      `__init__` signature for the exact attribute names used.
+
+    - Add the two CLI flags in `cli/commands/run.py`'s `workflow`
+      subcommand (around line 745, near the existing `--no-qa`):
+
+        inline_qa: Annotated[
+            bool,
+            typer.Option(
+                "--inline-qa",
+                help=(
+                    "Run per-AC QA evaluation in compounding mode. Captures "
+                    "verdict in the postmortem chain. Roughly doubles model "
+                    "calls. No effect outside --compounding mode."
+                ),
+            ),
+        ] = False,
+        max_qa_retries: Annotated[
+            int,
+            typer.Option(
+                "--max-qa-retries",
+                min=0,
+                help=(
+                    "Max retries when QA verdict is REVISE/FAIL "
+                    "(separate from --max-stall-retries). Default 1 "
+                    "(2 total QA-judged attempts per AC). Budget-only; "
+                    "QA never blocks the run on exhaustion."
+                ),
+            ),
+        ] = 1,
+
+      Add validation: if `inline_qa` is set but `not compounding`, log
+      `run.inline_qa.ignored_outside_compounding` warning and force
+      inline_qa=False.  Same for `max_qa_retries != 1` without
+      `inline_qa`: warn and continue.
+
+    - Propagate to `execute_serial` via the existing execute_kwargs dict
+      around cli/commands/run.py:601.  Add:
+        if mode == "compounding":
+            execute_kwargs["inline_qa"] = inline_qa
+            execute_kwargs["max_qa_retries"] = max_qa_retries
+
+    INTEGRATION TESTS (required) extending
+    `tests/unit/orchestrator/test_serial_executor.py` — use the project's
+    existing fake adapter / fake QA handler patterns:
+
+     1. test_serial_executor_inline_qa_off_zero_qa_calls — default
+        inline_qa=False; assert no calls to run_inline_qa (monkeypatch
+        with a counter); postmortem.qa_status is None, qa_attempts=0,
+        qa_verdict is None.
+
+     2. test_serial_executor_inline_qa_first_attempt_pass — inline_qa=True
+        with a fake QA handler returning loop_action="pass" on the first
+        call; assert exactly 1 QA call; qa_status="passed";
+        qa_attempts=1; the executor did NOT re-invoke _execute_single_ac
+        (single execution).
+
+     3. test_serial_executor_inline_qa_revise_then_pass — fake QA handler
+        returns "revise" on attempt 1, "pass" on attempt 2; assert 2
+        QA calls + 2 _execute_single_ac calls; qa_attempts=2;
+        qa_status="passed"; the second _execute_single_ac call's
+        context_override contains the QA-feedback section header text
+        ("## QA verdict on previous attempt").
+
+     4. test_serial_executor_inline_qa_exhausted_soft_pass — fake QA
+        handler always returns "fail"; max_qa_retries=1; assert 2 QA
+        calls + 2 _execute_single_ac calls; qa_attempts=2;
+        qa_status="exhausted"; the AC's overall result.outcome is still
+        SUCCEEDED (soft-pass — the run continues to the next AC).
+
+     5. test_serial_executor_inline_qa_exhausted_max_retries_zero — same
+        as above but max_qa_retries=0; assert exactly 1 QA call + 1
+        _execute_single_ac call; qa_attempts=1; qa_status="exhausted".
+
+     6. test_serial_executor_pre_sha_captured_once_across_qa_retries —
+        spy on capture_pre_ac_snapshot; run with revise-then-pass; assert
+        capture_pre_ac_snapshot was called EXACTLY ONCE for that AC, not
+        once per attempt.  This is the explicit Q2.1-lesson regression
+        test (commit-per-AC pattern).
+
+     7. test_serial_executor_inline_qa_skipped_for_externally_satisfied —
+        AC marked in external_completed; inline_qa=True; assert zero
+        QA calls + the existing externally-satisfied ACPostmortem path
+        is unchanged (qa_status stays None, qa_attempts=0).
+
+     8. test_serial_executor_inline_qa_skipped_on_failed_execution — fake
+        adapter that returns success=False; inline_qa=True; assert zero
+        QA calls.
+
+     9. test_serial_executor_inline_qa_plugin_dispatch_skips —
+        QAHandler returns delegated_to_subagent meta on first call; assert
+        exactly 1 QA call; qa_status="skipped_delegated"; no retry
+        despite max_qa_retries=2 (skip terminates loop).
+
+    10. test_serial_executor_inline_qa_decomposed_ac_parent_only — a
+        decomposed AC with 3 sub-ACs; inline_qa=True; assert exactly
+        1 QA call (parent), 0 sub-AC QA calls.  qa_status on the
+        parent's ACPostmortem is set; sub-postmortem qa_status fields
+        are all None.
+
+    11. test_run_inline_qa_outside_compounding_warns — drive run.workflow
+        with --inline-qa but mode=parallel (omit --compounding); assert
+        the `run.inline_qa.ignored_outside_compounding` log was emitted
+        and execute_parallel was called WITHOUT inline_qa kwarg
+        (parallel executor signature is unchanged).
+
+    12. test_serial_executor_inline_qa_propagates_through_chain_to_next_ac
+        — 2-AC run, inline_qa=True, fake QA handler returns "pass" on
+        AC-1 with score=0.86; assert AC-2's context_override (built
+        from chain.to_prompt_text) contains "QA: passed" or
+        "QA: exhausted" (i.e., the digest QA suffix from AC-1 reaches
+        the next AC's prompt).
+
+    GOTCHAS TO NOTE FOR FUTURE ACs:
+    - [[INVARIANT: pre_sha (capture_pre_ac_snapshot) is called exactly once per AC, before the QA retry loop]]
+    - [[INVARIANT: --inline-qa default is False — runs without the flag are byte-identical pre/post Q4]]
+    - [[INVARIANT: QA exhaustion is soft-pass — the run never halts on QA verdict, only on execution failure]]
+    - [[INVARIANT: opencode plugin-dispatch path terminates the QA retry loop after 1 call]]
+    - [[INVARIANT: external_completed ACs and result.outcome != SUCCEEDED ACs skip the QA loop entirely]]
+
+  - |
+    AC-3 (Q4 / part 3) — Markdown chain artifact rendering + qa-evaluated event factory + e2e regression test
+
+    Deliverable: the new postmortem fields are visible in the
+    `chain-<session>.md` artifact, a structured event is emitted on
+    every QA call, and an end-to-end test pins the commit-per-AC
+    flow (the Q2.1 lesson made manifest).
+
+    REQUIREMENTS:
+
+    - In `_render_chain_as_markdown` (currently in serial_executor.py
+      — search for the function that produces the chain artifact),
+      add a `### QA` section per AC bullet, BELOW the existing
+      `### Diff summary` block (added in PR #5).  Render only when
+      `pm.qa_status is not None`.
+
+      Format:
+
+        ### QA
+        - Status: {qa_status} (attempt {qa_attempts} of {max_attempts_seen})
+        - Score: {qa_verdict.score:.2f} / 1.00 — {qa_verdict.verdict}
+        {if qa_verdict.suggestions:}
+        - Suggestions:
+          - {sug[0]}
+          - ...
+
+      `{max_attempts_seen}` is the chain-level max(qa_attempts) — for
+      first cycle, render `qa_attempts of qa_attempts` (always equal)
+      to keep the renderer self-contained.
+
+      DEFEND against backticks / pathological characters in suggestion
+      text by using the same dynamic-fence selection PR #5 added to
+      the diff_summary block.  (Find the existing
+      `_pick_fence_for_text` or equivalent — if PR #5 inlined it, lift
+      it into a small helper module-level function and reuse.)
+
+      The `### QA` block is omitted entirely when `pm.qa_status is None`
+      (the inline_qa-off case).
+
+    - Add a new event factory in
+      `src/ouroboros/orchestrator/events.py`:
+
+        def create_ac_qa_evaluated_event(
+            *,
+            session_id: str,
+            execution_id: str,
+            ac_index: int,
+            qa_attempt: int,
+            score: float,
+            verdict_label: str,
+            loop_action: str,
+            passed: bool,
+        ) -> Event:
+            ...
+
+      Mirror `create_ac_postmortem_captured_event`'s shape exactly —
+      same Event class, same envelope fields, payload keys at top level.
+      Event name: `ac.qa.evaluated`.
+
+      Export the factory from the module's `__all__` list.
+
+    - Add unit tests in `tests/unit/orchestrator/test_events.py`:
+       1. test_create_ac_qa_evaluated_event_payload_shape — the returned
+          Event has type=`ac.qa.evaluated`, payload contains all 6
+          arguments at top level, session_id/execution_id in envelope.
+       2. test_create_ac_qa_evaluated_event_passed_false — passed=False
+          for revise/fail loop_action; payload reflects.
+
+    - Add a renderer test in test_serial_executor.py:
+       test_render_chain_markdown_emits_qa_block_when_qa_status_set
+       — build a chain with one AC whose pm.qa_status="passed" and
+       qa_verdict={"score": 0.86, "verdict": "pass",
+       "suggestions": ["use type hints"], ...}; render the chain;
+       assert the markdown contains the `### QA` heading, the
+       `Status: passed` line, the `Score: 0.86 / 1.00 — pass` line,
+       and the suggestion bullet.
+
+    - Add a renderer test:
+       test_render_chain_markdown_omits_qa_block_when_qa_status_none —
+       chain with one AC whose pm.qa_status=None; assert the rendered
+       markdown does NOT contain `### QA` anywhere.
+
+    - Add a renderer test:
+       test_render_chain_markdown_qa_block_uses_dynamic_fence — chain
+       with a suggestion containing 4 backticks (e.g.,
+       "see ````block```` here"); assert the rendered markdown contains
+       a fence with at least 5 backticks (or equivalent dynamic-fence
+       behavior matching PR #5's diff_summary fence policy).
+
+    - Add the END-TO-END regression test in test_serial_executor.py
+      (this is the analogue of PR #5's
+      test_diff_summary_flows_end_to_end_with_commit_per_ac):
+
+       async def test_inline_qa_flows_end_to_end_with_commit_per_ac(
+           tmp_path, monkeypatch, fake_adapter, ...
+       ):
+           '''Drive execute_serial with a real-ish commit-per-AC pattern.
+
+           A fake adapter that:
+             1. On the first AC attempt, modifies a file and commits it.
+             2. On the second AC attempt (after QA REVISE), modifies a
+                second file and commits it.
+           A fake QAHandler that returns REVISE on attempt 1, PASS on
+           attempt 2.
+
+           Asserts:
+             - run_inline_qa was called exactly 2 times for AC-1.
+             - capture_pre_ac_snapshot was called exactly ONCE.
+             - The final postmortem.qa_attempts == 2.
+             - The final postmortem.qa_status == "passed".
+             - The final postmortem.diff_summary contains BOTH file
+               names (cumulative diff across the two commits).
+             - The rendered chain markdown contains the `### QA` block
+               with Status: passed (attempt 2 of 2).
+             - The second _execute_single_ac call's context_override
+               argument contains the substring "## QA verdict on previous
+               attempt".
+           '''
+
+      The test should set up a real git repo in tmp_path (the same
+      pattern PR #5's e2e test uses for diff_summary), use
+      `monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(tmp_path))`,
+      and verify the on-disk chain markdown via direct file read.
+
+    - The full suite (`uv run pytest tests/unit/`) stays green;
+      expect ~5660 tests passing post-cycle (current 5635 + ~25 new
+      tests across the three ACs).
+
+    GOTCHAS TO NOTE FOR FUTURE ACs:
+    - [[INVARIANT: chain markdown render emits the QA block iff qa_status is not None]]
+    - [[INVARIANT: ac.qa.evaluated event is emitted exactly once per QA call (one per attempt, not one per AC)]]
+    - [[INVARIANT: e2e test test_inline_qa_flows_end_to_end_with_commit_per_ac is the regression net for the Q2.1 lesson — pre_sha-once + cumulative-diff under commit-per-AC]]
+
+ontology_schema:
+  name: "SerialCompoundingPhase2_Q4"
+  description: "Narrowed ontology for the inline-QA work item"
+  fields:
+    - name: "QAHandler"
+      field_type: "service"
+      description: "Existing QA judge (mcp/tools/qa.py:397) — receives artifact + quality_bar + seed_content; returns MCPToolResult with structured verdict in meta"
+    - name: "QAVerdict"
+      field_type: "entity"
+      description: "Parsed verdict (qa.py:85) — score, verdict, dimensions, differences, suggestions, reasoning"
+    - name: "InlineQAOutcome"
+      field_type: "entity"
+      description: "New frozen dataclass in inline_qa.py — wraps loop_action, score, verdict_dict, qa_session_id"
+    - name: "inline_qa_module"
+      field_type: "module"
+      description: "New src/ouroboros/orchestrator/inline_qa.py — helpers + run_inline_qa async entrypoint"
+    - name: "ACPostmortem"
+      field_type: "entity"
+      description: "Existing per-AC postmortem (level_context.py:581) — gains qa_verdict, qa_status, qa_attempts fields"
+    - name: "qa_verdict"
+      field_type: "field"
+      description: "dict[str,Any] | None on ACPostmortem — serialized last-attempt QAVerdict"
+    - name: "qa_status"
+      field_type: "field"
+      description: "str | None on ACPostmortem — None | passed | exhausted | skipped_delegated"
+    - name: "qa_attempts"
+      field_type: "field"
+      description: "int on ACPostmortem — count of QA evaluations performed for this AC"
+    - name: "SerialCompoundingExecutor"
+      field_type: "entity"
+      description: "Existing per-AC orchestrator (serial_executor.py) — gains a QA-retry loop wrapping the per-AC body"
+    - name: "execute_serial"
+      field_type: "service"
+      description: "Existing entrypoint (serial_executor.py:969) — gains inline_qa: bool and max_qa_retries: int kwargs"
+    - name: "create_ac_qa_evaluated_event"
+      field_type: "service"
+      description: "New event factory in events.py — emitted per QA call, mirrors create_ac_postmortem_captured_event"
+    - name: "_render_chain_as_markdown"
+      field_type: "service"
+      description: "Existing markdown renderer in serial_executor.py — gains a per-AC ### QA block when qa_status is not None"
+    - name: "--inline-qa"
+      field_type: "flag"
+      description: "New CLI flag on `ooo run workflow` — gates per-AC QA in compounding mode"
+    - name: "--max-qa-retries"
+      field_type: "flag"
+      description: "New CLI flag on `ooo run workflow` — budget for QA-judged retries (default 1, separate from stall counter)"
+
+evaluation_principles:
+  - name: "backward_compatibility"
+    description: "Parallel mode behavior remains byte-identical. context_override=None path untouched. Runs without --inline-qa produce exactly the same chain artifact as pre-Q4 (qa_status field defaults to None, omitted from markdown render). All Phase-1.5 + Q2 invariants hold."
+  - name: "soft_pass_safety"
+    description: "QA exhaustion never blocks the run. A flaky LLM judge returning FAIL on every attempt produces qa_status='exhausted' on the postmortem; the chain still advances; result.outcome stays SUCCEEDED; the next AC executes normally."
+  - name: "commit_per_ac_alignment"
+    description: "pre_sha is captured ONCE per AC, BEFORE the QA-retry loop. The cumulative diff_summary spans pre_sha → HEAD across all retry attempts. The end-to-end test pins this behavior; PR #5's lesson is hardcoded into the test as a regression guard."
+  - name: "graceful_degradation"
+    description: "QAHandler returning Err, the opencode plugin-dispatch path returning delegated_to_subagent, and any unexpected meta shape all degrade to qa_status='skipped_delegated' without raising into the executor loop. Inline QA is best-effort, never a run-blocker."
+  - name: "test_coverage"
+    description: "AC-1 adds ~23 unit tests. AC-2 adds ~12 integration tests. AC-3 adds ~5 render/event/e2e tests. Full suite (`uv run pytest tests/unit/`) stays green; expect ~5660 tests passing."
+  - name: "isolation"
+    description: "inline_qa.py contains zero imports of SerialCompoundingExecutor — helpers stay unit-testable. ACExecutionOutcome enum is unchanged (no migrations)."
+  - name: "invariant_emission"
+    description: "Each AC's final message emits at least one [[INVARIANT: ...]] tag so Q3's Haiku verifier scores the work on real output."
+
+metadata:
+  seed_id: "phase-2-q4-inline-qa"
+  parent_seed: null
+  ambiguity_score: 0.10
+  expected_decomposition_depth: 0
+  source_brainstorm: "docs/brainstorm/phase-2-q4-inline-qa-design.md"
+  execution_mode_required: "compounding"
