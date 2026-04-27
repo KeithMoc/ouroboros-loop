@@ -624,7 +624,58 @@ class TestChainArtifact:
         # File rows + summary footer must all flow through unchanged.
         assert "feature.py" in content
         assert "tests/test_x.py" in content
-        assert "2 files changed, 17 insertions(+), 4 deletions(-)" in content
+        footer = "2 files changed, 17 insertions(+), 4 deletions(-)"
+        assert footer in content
+
+        # Structural check: the bullet is followed by a fenced code block,
+        # the file rows + footer live inside the fence, and the fence
+        # closes after the footer.  Order in the rendered output is:
+        #   "- Diff summary:" -> "```text" -> rows -> footer -> "```"
+        bullet_idx = content.index("- Diff summary:")
+        open_fence_idx = content.index("```text", bullet_idx)
+        footer_idx = content.index(footer, open_fence_idx)
+        close_fence_idx = content.index("```", footer_idx)
+        assert bullet_idx < open_fence_idx < footer_idx < close_fence_idx
+
+    def test_artifact_uses_dynamic_fence_when_diff_summary_contains_backticks(
+        self, tmp_path: Path
+    ) -> None:
+        """Pathological diff_summary content (e.g. file names containing
+        triple backticks) must not prematurely close the fenced block.
+
+        The renderer scans for the longest backtick run and picks a fence
+        at least one backtick longer.
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        # Three consecutive backticks inside the diff would close a
+        # vanilla ```text fence.  Force the renderer to upgrade.
+        nasty = "```nasty.py | 5 +++++\n 1 file changed, 5 insertions(+)"
+        summary = ACContextSummary(ac_index=0, ac_content="Edge case", success=True)
+        pm = ACPostmortem(summary=summary, status="pass", diff_summary=nasty)
+        chain = PostmortemChain(postmortems=(pm,))
+
+        path = write_chain_artifact(
+            chain,
+            session_id="s_diff_fence",
+            execution_id="e_diff_fence",
+            artifact_dir=str(tmp_path),
+        )
+        content = path.read_text(encoding="utf-8")
+        # Renderer must use a fence with strictly more backticks than the
+        # longest run inside the content.  The content has a 3-run, so the
+        # opening fence must be at least 4 backticks long.
+        bullet_idx = content.index("- Diff summary:")
+        # First fence after the bullet must be `````` or longer.
+        assert "````" in content[bullet_idx:], content
+        # And the 3-backtick payload must NOT terminate the fence early —
+        # we should still see the file row inside the block.
+        assert "nasty.py" in content
+        assert "1 file changed, 5 insertions(+)" in content
 
     def test_artifact_omits_diff_summary_when_empty(
         self, tmp_path: Path
@@ -6708,7 +6759,7 @@ class TestSerialExecutorDiffCapture:
 
     @pytest.mark.asyncio
     async def test_diff_summary_flows_end_to_end_with_commit_per_ac(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """End-to-end: commit-per-AC workflow → diff_summary captured →
         rendered in chain artifact.
@@ -6722,6 +6773,11 @@ class TestSerialExecutorDiffCapture:
         """
         import re as _re
         import subprocess as _sp
+
+        # Pin the chain artifact dir explicitly rather than relying on the
+        # conftest autouse redirect — keeps this test self-documenting.
+        artifact_dir = tmp_path / "chain_artifacts"
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir))
 
         _init_test_repo(tmp_path)
         seed = _make_seed("Add a feature with a real commit")
@@ -6775,9 +6831,8 @@ class TestSerialExecutorDiffCapture:
         )
         assert result.success_count == 1
 
-        # The chain artifact lands under the per-test redirect from
-        # conftest.py (OUROBOROS_CHAIN_ARTIFACT_DIR → tmp_path/chain_artifacts).
-        artifact_dir = tmp_path / "chain_artifacts"
+        # The chain artifact lands under the env override pinned at the
+        # top of the test.
         artifacts = list(artifact_dir.glob("chain-sess_e2e_commit-*.md"))
         assert len(artifacts) == 1, f"expected 1 chain artifact, got: {artifacts}"
         content = artifacts[0].read_text(encoding="utf-8")

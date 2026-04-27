@@ -346,11 +346,26 @@ def _render_chain_as_markdown(
         # associated with the bullet under CommonMark.  Empty diff_summary
         # is suppressed entirely to keep no-op-AC artifacts terse.
         if diff_summary:
+            # Pick a fence at least one backtick longer than any run in
+            # the content, so a pathological file name like ```weird.py
+            # cannot prematurely close the block.  Default to 3 backticks
+            # when the content is well-behaved.
+            longest_backtick_run = 0
+            current_run = 0
+            for ch in diff_summary:
+                if ch == "`":
+                    current_run += 1
+                    if current_run > longest_backtick_run:
+                        longest_backtick_run = current_run
+                else:
+                    current_run = 0
+            fence = "`" * max(3, longest_backtick_run + 1)
+
             lines.append("- Diff summary:")
-            lines.append("  ```text")
+            lines.append(f"  {fence}text")
             for stat_line in diff_summary.split("\n"):
                 lines.append(f"  {stat_line}")
-            lines.append("  ```")
+            lines.append(f"  {fence}")
 
         lines.append("")
 
