@@ -7466,6 +7466,227 @@ class TestInlineQAIntegration:
             assert evt.data["postmortem"].get("qa_status") == "passed"
 
 
+    @pytest.mark.asyncio
+    async def test_inline_qa_decomposed_ac_parent_only(self) -> None:
+        """10. Decomposed AC: QA runs once on parent, not per sub-AC. Sub-postmortems qa_status=None.
+
+        QA is called PARENT-AC only: sub-results are already aggregated into
+        parent.sub_postmortems by _build_postmortem_from_result; only the
+        parent-level QA evaluation runs once.
+        """
+        seed = _make_seed("Decomposed AC with 3 sub-ACs")
+        executor = _make_executor()
+
+        # Only one QA call expected (parent AC only)
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="pass", score=0.90, verdict="pass"),
+        ])
+
+        # Build three sub-results
+        sub0 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 0",
+            success=True,
+            final_message="sub0 done",
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub0",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub0.py"}},
+                ),
+            ),
+        )
+        sub1 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 1",
+            success=True,
+            final_message="sub1 done",
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub1",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub1.py"}},
+                ),
+            ),
+        )
+        sub2 = ACExecutionResult(
+            ac_index=0,
+            ac_content="Sub-AC 2",
+            success=True,
+            final_message="sub2 done",
+            messages=(
+                AgentMessage(
+                    type="tool_use",
+                    content="writing sub2",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "src/sub2.py"}},
+                ),
+            ),
+        )
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return ACExecutionResult(
+                ac_index=int(kwargs["ac_index"]),
+                ac_content=str(kwargs["ac_content"]),
+                success=True,
+                is_decomposed=True,
+                sub_results=(sub0, sub1, sub2),
+                final_message="parent done",
+            )
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s_decomp",
+            execution_id="e_decomp",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=2,  # high budget — must still be exactly 1 call
+        )
+
+        assert result.success_count == 1
+        # Exactly 1 QA call (parent only, not 3 sub-AC calls)
+        assert len(call_args) == 1, (
+            f"Expected 1 QA call (parent only), got {len(call_args)}."
+            " QA must NOT run per sub-AC."
+        )
+
+        # Parent postmortem should have qa_status="passed"
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        assert len(events) == 1
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "passed"
+        assert pm_data.get("qa_attempts") == 1
+
+        # Sub-postmortems inside the parent must have qa_status=None / qa_attempts=0
+        sub_pms = pm_data.get("sub_postmortems", [])
+        assert len(sub_pms) == 3, f"Expected 3 sub_postmortems, got {len(sub_pms)}"
+        for i, sub_pm in enumerate(sub_pms):
+            assert sub_pm.get("qa_status") is None, (
+                f"sub_postmortem[{i}].qa_status should be None, got {sub_pm.get('qa_status')!r}"
+            )
+            assert sub_pm.get("qa_attempts", 0) == 0, (
+                f"sub_postmortem[{i}].qa_attempts should be 0, got {sub_pm.get('qa_attempts', 0)}"
+            )
+
+    def test_run_inline_qa_outside_compounding_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """11. --inline-qa outside --compounding: warning emitted, _run_orchestrator called with inline_qa=False.
+
+        The `run.inline_qa.ignored_outside_compounding` warning is logged and
+        printed when --inline-qa is passed without --compounding.  The executor
+        is then called without inline_qa so parallel mode is unchanged.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from typer.testing import CliRunner as TCliRunner
+
+        from ouroboros.cli.main import app as main_app
+
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text(
+            "goal: test\nacceptance_criteria:\n  - Do something\n"
+        )
+
+        mock_run_orch = AsyncMock()
+
+        with patch("ouroboros.cli.commands.run._run_orchestrator", new=mock_run_orch):
+            cli_runner = TCliRunner()
+            result = cli_runner.invoke(
+                main_app,
+                [
+                    "run",
+                    "workflow",
+                    str(seed_file),
+                    "--orchestrator",
+                    "--inline-qa",
+                    # NOTE: --compounding is NOT passed, so inline_qa should be ignored
+                ],
+            )
+
+        # The warning text should appear in the CLI output
+        combined_output = result.output
+        assert "no effect" in combined_output.lower() or "ignored" in combined_output.lower(), (
+            f"Expected warning about --inline-qa outside --compounding in output:\n{combined_output}"
+        )
+
+        # _run_orchestrator must have been called with inline_qa=False
+        assert mock_run_orch.call_count >= 1, (
+            "_run_orchestrator should have been called (workflow → _run_orchestrator)"
+        )
+        call_kw = mock_run_orch.call_args.kwargs
+        assert call_kw.get("inline_qa") is False, (
+            f"Expected inline_qa=False when --compounding is absent; got {call_kw.get('inline_qa')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_inline_qa_propagates_through_chain_to_next_ac(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """12. qa_status from AC-1 propagates through chain digest to AC-2's context_override.
+
+        With k_full=0 (all postmortems rendered as digests), the 'QA: passed'
+        suffix from AC-1's to_digest() must appear in AC-2's context_override
+        (i.e., the chain context that AC-2 sees).
+        """
+        # Force all chain entries to digest form so to_digest() is called
+        # (default k_full=3 would render AC-1 as full_text without qa_status).
+        monkeypatch.setenv("OUROBOROS_POSTMORTEM_FULL_K", "0")
+
+        seed = _make_seed("AC-1 gets QA pass", "AC-2 should see QA status")
+        executor = _make_executor()
+
+        # AC-1 gets QA pass; AC-2 also gets QA pass
+        _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="pass", score=0.86, verdict="pass"),
+            _make_qa_ok_result(loop_action="pass", score=0.90, verdict="pass"),
+        ])
+
+        captured_overrides: list[str] = []
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            captured_overrides.append(kwargs.get("context_override") or "")
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s_prop",
+            execution_id="e_prop",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 2
+        assert len(captured_overrides) == 2
+
+        # AC-1 (index 0) sees empty chain — no prior postmortems
+        ac1_override = captured_overrides[0]
+        # AC-2 (index 1) sees AC-1's postmortem digest with "QA: passed" suffix
+        ac2_override = captured_overrides[1]
+
+        assert "Prior AC Postmortems" in ac2_override, (
+            "AC-2 must see chain context from AC-1."
+        )
+        # The digest line for AC-1 must include the QA status suffix
+        assert "QA: passed" in ac2_override or "QA: exhausted" in ac2_override, (
+            f"AC-2's context_override must include the QA status from AC-1's digest. "
+            f"Override was:\n{ac2_override[:800]}"
+        )
+
+
 class TestCreateAcQaEvaluatedEventFactory:
     """Unit tests for create_ac_qa_evaluated_event event factory."""
 
