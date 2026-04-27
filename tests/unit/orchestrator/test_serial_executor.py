@@ -589,6 +589,119 @@ class TestChainArtifact:
         assert "# Postmortem Chain" in content
         assert "## AC" not in content  # no AC sections for empty chain
 
+    def test_artifact_emits_diff_summary_when_non_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """write_chain_artifact renders ACPostmortem.diff_summary into the
+        markdown when it is non-empty.
+
+        Pre-fix: the renderer ignored ``diff_summary`` entirely, so even
+        when capture succeeded the field was invisible in the artifact.
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        stat_blob = (
+            " feature.py        | 5 +++++\n"
+            " tests/test_x.py   | 12 ++++++++----\n"
+            " 2 files changed, 17 insertions(+), 4 deletions(-)"
+        )
+        summary = ACContextSummary(ac_index=0, ac_content="Build feature", success=True)
+        pm = ACPostmortem(summary=summary, status="pass", diff_summary=stat_blob)
+        chain = PostmortemChain(postmortems=(pm,))
+
+        path = write_chain_artifact(
+            chain,
+            session_id="s_diff_present",
+            execution_id="e_diff_present",
+            artifact_dir=str(tmp_path),
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "Diff summary" in content, content
+        # File rows + summary footer must all flow through unchanged.
+        assert "feature.py" in content
+        assert "tests/test_x.py" in content
+        footer = "2 files changed, 17 insertions(+), 4 deletions(-)"
+        assert footer in content
+
+        # Structural check: the bullet is followed by a fenced code block,
+        # the file rows + footer live inside the fence, and the fence
+        # closes after the footer.  Order in the rendered output is:
+        #   "- Diff summary:" -> "```text" -> rows -> footer -> "```"
+        bullet_idx = content.index("- Diff summary:")
+        open_fence_idx = content.index("```text", bullet_idx)
+        footer_idx = content.index(footer, open_fence_idx)
+        close_fence_idx = content.index("```", footer_idx)
+        assert bullet_idx < open_fence_idx < footer_idx < close_fence_idx
+
+    def test_artifact_uses_dynamic_fence_when_diff_summary_contains_backticks(
+        self, tmp_path: Path
+    ) -> None:
+        """Pathological diff_summary content (e.g. file names containing
+        triple backticks) must not prematurely close the fenced block.
+
+        The renderer scans for the longest backtick run and picks a fence
+        at least one backtick longer.
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        # Three consecutive backticks inside the diff would close a
+        # vanilla ```text fence.  Force the renderer to upgrade.
+        nasty = "```nasty.py | 5 +++++\n 1 file changed, 5 insertions(+)"
+        summary = ACContextSummary(ac_index=0, ac_content="Edge case", success=True)
+        pm = ACPostmortem(summary=summary, status="pass", diff_summary=nasty)
+        chain = PostmortemChain(postmortems=(pm,))
+
+        path = write_chain_artifact(
+            chain,
+            session_id="s_diff_fence",
+            execution_id="e_diff_fence",
+            artifact_dir=str(tmp_path),
+        )
+        content = path.read_text(encoding="utf-8")
+        # Renderer must use a fence with strictly more backticks than the
+        # longest run inside the content.  The content has a 3-run, so the
+        # opening fence must be at least 4 backticks long.
+        bullet_idx = content.index("- Diff summary:")
+        # First fence after the bullet must be `````` or longer.
+        assert "````" in content[bullet_idx:], content
+        # And the 3-backtick payload must NOT terminate the fence early —
+        # we should still see the file row inside the block.
+        assert "nasty.py" in content
+        assert "1 file changed, 5 insertions(+)" in content
+
+    def test_artifact_omits_diff_summary_when_empty(
+        self, tmp_path: Path
+    ) -> None:
+        """An empty ``diff_summary`` field produces no `Diff summary` line —
+        keeps the artifact terse for no-op or capture-failed ACs.
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+
+        summary = ACContextSummary(ac_index=0, ac_content="No-op AC", success=True)
+        pm = ACPostmortem(summary=summary, status="pass", diff_summary="")
+        chain = PostmortemChain(postmortems=(pm,))
+
+        path = write_chain_artifact(
+            chain,
+            session_id="s_diff_absent",
+            execution_id="e_diff_absent",
+            artifact_dir=str(tmp_path),
+        )
+        content = path.read_text(encoding="utf-8")
+        assert "Diff summary" not in content, content
+
 
 class TestSubPostmortems:
     """AC-2 (Q1, B-prime): Sub-postmortem preservation and flattening.
@@ -6643,6 +6756,92 @@ class TestSerialExecutorDiffCapture:
         assert (
             pm_events[0].data.get("postmortem", {}).get("diff_summary", "") == ""
         )
+
+    @pytest.mark.asyncio
+    async def test_diff_summary_flows_end_to_end_with_commit_per_ac(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End-to-end: commit-per-AC workflow → diff_summary captured →
+        rendered in chain artifact.
+
+        Regression for the dogfood-gap finding where the orchestrator's
+        per-AC commits left ``git stash create`` empty, silently producing
+        empty ``diff_summary`` that never appeared in the markdown
+        artifact.  Without BOTH the HEAD fallback in capture AND the
+        diff_summary block in ``_render_chain_as_markdown``, the asserts
+        below fail.
+        """
+        import re as _re
+        import subprocess as _sp
+
+        # Pin the chain artifact dir explicitly rather than relying on the
+        # conftest autouse redirect — keeps this test self-documenting.
+        artifact_dir = tmp_path / "chain_artifacts"
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir))
+
+        _init_test_repo(tmp_path)
+        seed = _make_seed("Add a feature with a real commit")
+        executor = _make_executor_with_cwd(tmp_path)
+
+        git_env = {
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "HOME": str(tmp_path),
+        }
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            # Mirror the real orchestrator workflow: agent commits per AC,
+            # leaving the working tree clean at AC boundaries.  No
+            # pre-dirtying — the bug-fix path must handle the truly-clean
+            # tree case.
+            ac_index = int(kwargs["ac_index"])
+            (tmp_path / "feature.py").write_text("def feature():\n    return 42\n")
+            _sp.run(
+                ["git", "add", "feature.py"],
+                cwd=str(tmp_path),
+                env=git_env,
+                check=True,
+            )
+            _sp.run(
+                ["git", "commit", "-q", "-m", "feat: add feature"],
+                cwd=str(tmp_path),
+                env=git_env,
+                check=True,
+            )
+            return _ok_result(
+                ac_index,
+                str(kwargs["ac_content"]),
+                files_written=("feature.py",),
+            )
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_e2e_commit",
+            execution_id="exec_e2e_commit",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+        )
+        assert result.success_count == 1
+
+        # The chain artifact lands under the env override pinned at the
+        # top of the test.
+        artifacts = list(artifact_dir.glob("chain-sess_e2e_commit-*.md"))
+        assert len(artifacts) == 1, f"expected 1 chain artifact, got: {artifacts}"
+        content = artifacts[0].read_text(encoding="utf-8")
+
+        # End-to-end: the file name AND a `--stat` summary footer must
+        # reach the rendered artifact.
+        assert "Diff summary" in content, content
+        assert "feature.py" in content, content
+        assert _re.search(r"\d+ files? changed", content), content
 
 
 class TestDiffSummaryRoundTrip:

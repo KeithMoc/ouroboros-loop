@@ -7,11 +7,18 @@ the pre- and post-AC snapshots.
 
 Design notes (see ``docs/brainstorm/phase-2-q2-diff-capture-design.md``):
 
-- ``git stash create`` is the per-AC boundary mechanism. It produces an
-  unreferenced commit SHA without modifying ``.git/refs/stash`` or the
-  working tree, so nothing accumulates across thousands of ACs.
+- ``git stash create`` is the *primary* per-AC boundary mechanism. It
+  produces an unreferenced commit SHA without modifying ``.git/refs/stash``
+  or the working tree, so nothing accumulates across thousands of ACs.
   [[INVARIANT: git stash create produces an unreferenced SHA without
   modifying .git/refs/stash, so stash list stays empty across runs]]
+- ``git stash create`` returns empty stdout on a clean tree.  The
+  SerialCompoundingExecutor's commit-per-AC workflow leaves clean trees
+  at AC boundaries, so the helpers fall back to ``git rev-parse HEAD`` —
+  also a valid tree-ish for ``git diff --stat`` — so committed-only
+  changes are still captured.
+  [[INVARIANT: capture falls back to git rev-parse HEAD when git stash
+  create returns empty (clean tree)]]
 - All git subprocess calls use ``check=False`` and a 5s timeout.  Every
   failure (no ``.git/``, missing binary, timeout, non-zero exit) results in
   an empty ``diff_summary`` plus a structured warning log — the AC
@@ -115,18 +122,135 @@ def _is_git_repo(workspace_root: Path) -> bool:
     return git_path.exists()
 
 
-def capture_pre_ac_snapshot(workspace_root: Path) -> str | None:
-    """Run ``git stash create`` in ``workspace_root``.
+def _run_git(
+    args: list[str],
+    workspace_root: Path,
+    *,
+    phase: str,
+    cmd_name: str,
+    fallback: str | None = None,
+) -> str | None:
+    """Run ``git <args>`` in ``workspace_root``; return stripped stdout
+    on success (returncode == 0) or ``None`` on any failure.
 
-    Returns the resulting 40-char SHA on success, or ``None`` on every
-    failure mode (no ``.git/``, missing git binary, timeout, non-zero exit).
-    Failures emit structured warning logs but do **not** raise.
+    Centralises the four-way error handling shared by every git
+    subprocess call in this module: ``FileNotFoundError`` (binary
+    missing), ``subprocess.TimeoutExpired``, ``OSError`` (defensive),
+    and non-zero returncode.  Each path emits a structured WARNING log
+    with consistent fields so log queries can attribute failures to
+    their pipeline stage.
 
     Args:
-        workspace_root: Directory to invoke ``git stash create`` from.
+        args: ``git`` subcommand args (e.g. ``["stash", "create"]``).
+        workspace_root: Directory to invoke ``git`` from.
+        phase: Logical pipeline phase for telemetry (e.g.
+            ``"pre_snapshot"`` / ``"post_snapshot"`` / ``"diff"``).
+        cmd_name: Short identifier appearing in the log ``reason`` on
+            non-zero exit (``"stash_create"`` → ``"stash_create_exit_<rc>"``).
+        fallback: Optional log key marking this call as a fallback path
+            (e.g. ``"head"`` for the HEAD-after-empty-stash path).
 
     Returns:
-        The stash SHA, or ``None`` on any failure.
+        Stripped stdout on success (may be empty if the command
+        produced no output), or ``None`` on any failure mode.
+    """
+    log_fields: dict[str, str] = {"phase": phase}
+    if fallback is not None:
+        log_fields["fallback"] = fallback
+
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=str(workspace_root),
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except FileNotFoundError:
+        log.warning(
+            "serial_executor.diff_capture.failed",
+            reason="git_binary_missing",
+            **log_fields,
+        )
+        return None
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "serial_executor.diff_capture.failed",
+            reason="timeout",
+            **log_fields,
+        )
+        return None
+    except OSError as exc:  # pragma: no cover — defensive belt
+        log.warning(
+            "serial_executor.diff_capture.failed",
+            reason="os_error",
+            error=str(exc),
+            **log_fields,
+        )
+        return None
+
+    if completed.returncode != 0:
+        log.warning(
+            "serial_executor.diff_capture.failed",
+            reason=f"{cmd_name}_exit_{completed.returncode}",
+            stderr=(completed.stderr or "")[:200],
+            **log_fields,
+        )
+        return None
+
+    return (completed.stdout or "").strip()
+
+
+def _resolve_head(workspace_root: Path, *, phase: str) -> str | None:
+    """Resolve HEAD to a commit SHA, returning ``None`` on any failure.
+
+    Used as a fallback when ``git stash create`` returns empty stdout
+    (clean tree).  ``git rev-parse HEAD`` is also a valid tree-ish for
+    ``git diff --stat``, so the downstream diff is unchanged.
+
+    Args:
+        workspace_root: Directory to run ``git`` from.
+        phase: ``"pre_snapshot"`` or ``"post_snapshot"`` (for telemetry).
+
+    Returns:
+        The HEAD SHA, or ``None`` on any failure (no HEAD, broken repo,
+        timeout, etc.).
+    """
+    sha = _run_git(
+        ["rev-parse", "HEAD"],
+        workspace_root,
+        phase=phase,
+        cmd_name="head_lookup",
+        fallback="head",
+    )
+    if sha is None:
+        return None
+    if not sha:
+        log.warning(
+            "serial_executor.diff_capture.failed",
+            reason="head_lookup_empty",
+            phase=phase,
+            fallback="head",
+        )
+        return None
+    return sha
+
+
+def capture_pre_ac_snapshot(workspace_root: Path) -> str | None:
+    """Capture a tree-ish for the pre-AC working tree state.
+
+    Tries ``git stash create`` first (captures uncommitted changes); if
+    the working tree is clean, falls back to ``git rev-parse HEAD`` so
+    per-AC commits can still be diffed against the next snapshot.
+    Returns ``None`` on every failure mode (no ``.git/``, missing git
+    binary, timeout, non-zero exit, no HEAD).
+
+    Args:
+        workspace_root: Directory to invoke ``git`` from.
+
+    Returns:
+        A tree-ish SHA (stash or HEAD), or ``None`` on any failure.
     """
     if not _is_git_repo(workspace_root):
         log.warning(
@@ -136,113 +260,52 @@ def capture_pre_ac_snapshot(workspace_root: Path) -> str | None:
         )
         return None
 
-    try:
-        completed = subprocess.run(
-            ["git", "stash", "create"],
-            cwd=str(workspace_root),
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="git_binary_missing",
-            workspace_root=str(workspace_root),
-        )
+    sha = _run_git(
+        ["stash", "create"],
+        workspace_root,
+        phase="pre_snapshot",
+        cmd_name="stash_create",
+    )
+    if sha is None:
         return None
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="timeout",
-            phase="pre_snapshot",
-            workspace_root=str(workspace_root),
-        )
-        return None
-    except OSError as exc:  # pragma: no cover — defensive belt
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="os_error",
-            phase="pre_snapshot",
-            error=str(exc),
-            workspace_root=str(workspace_root),
-        )
-        return None
-
-    if completed.returncode != 0:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason=f"stash_create_exit_{completed.returncode}",
-            phase="pre_snapshot",
-            stderr=(completed.stderr or "")[:200],
-        )
-        return None
-
-    sha = (completed.stdout or "").strip()
-    # ``git stash create`` exits 0 with empty stdout when the working tree
-    # is clean and there's nothing to stash.  That's a valid "no-op" baseline
-    # — but downstream we have no SHA to diff against, so treat it as a
-    # capture failure and let ``compute_diff_summary`` short-circuit cleanly.
     if not sha:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="stash_create_empty_sha",
+        # ``git stash create`` exits 0 with empty stdout when the working
+        # tree is clean.  The orchestrator's commit-per-AC workflow
+        # leaves clean trees at AC boundaries, so fall back to HEAD —
+        # also a valid tree-ish for ``git diff --stat`` — to capture
+        # committed changes.
+        log.debug(
+            "serial_executor.diff_capture.head_fallback",
             phase="pre_snapshot",
+            reason="stash_create_empty_sha",
         )
-        return None
+        return _resolve_head(workspace_root, phase="pre_snapshot")
     return sha
 
 
 def _capture_post_snapshot(workspace_root: Path) -> str | None:
-    """Internal: run ``git stash create`` for the post-AC snapshot.
+    """Internal: capture the post-AC tree-ish.
 
-    Mirrors :func:`capture_pre_ac_snapshot` but does NOT log the
-    ``not_a_git_repo`` "skipped" event — by the time we reach the post
-    snapshot the pre snapshot already succeeded, so the repo exists.
+    Mirrors :func:`capture_pre_ac_snapshot`'s stash-then-HEAD logic but
+    does NOT log the ``not_a_git_repo`` "skipped" event — by the time we
+    reach the post snapshot the pre snapshot already succeeded.
     """
-    try:
-        completed = subprocess.run(
-            ["git", "stash", "create"],
-            cwd=str(workspace_root),
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="git_binary_missing",
-            phase="post_snapshot",
-        )
+    sha = _run_git(
+        ["stash", "create"],
+        workspace_root,
+        phase="post_snapshot",
+        cmd_name="stash_create",
+    )
+    if sha is None:
         return None
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="timeout",
+    if not sha:
+        log.debug(
+            "serial_executor.diff_capture.head_fallback",
             phase="post_snapshot",
+            reason="stash_create_empty_sha",
         )
-        return None
-    except OSError as exc:  # pragma: no cover — defensive belt
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="os_error",
-            phase="post_snapshot",
-            error=str(exc),
-        )
-        return None
-
-    if completed.returncode != 0:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason=f"stash_create_exit_{completed.returncode}",
-            phase="post_snapshot",
-            stderr=(completed.stderr or "")[:200],
-        )
-        return None
-
-    return (completed.stdout or "").strip()
+        return _resolve_head(workspace_root, phase="post_snapshot")
+    return sha
 
 
 def _churn_for_stat_line(line: str) -> int:
@@ -403,48 +466,15 @@ def compute_diff_summary(
         )
         return ""
 
-    try:
-        completed = subprocess.run(
-            ["git", "diff", "--stat", pre_sha, post_sha],
-            cwd=str(workspace_root),
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except FileNotFoundError:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="git_binary_missing",
-            phase="diff",
-        )
-        return ""
-    except subprocess.TimeoutExpired:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="timeout",
-            phase="diff",
-        )
-        return ""
-    except OSError as exc:  # pragma: no cover — defensive belt
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason="os_error",
-            phase="diff",
-            error=str(exc),
-        )
+    raw = _run_git(
+        ["diff", "--stat", pre_sha, post_sha],
+        workspace_root,
+        phase="diff",
+        cmd_name="diff",
+    )
+    if raw is None:
         return ""
 
-    if completed.returncode != 0:
-        log.warning(
-            "serial_executor.diff_capture.failed",
-            reason=f"diff_exit_{completed.returncode}",
-            phase="diff",
-            stderr=(completed.stderr or "")[:200],
-        )
-        return ""
-
-    raw = completed.stdout or ""
     effective_file_cap = _resolve_file_cap(file_cap)
     effective_char_budget = _resolve_char_budget(char_budget)
     return _truncate_stat(raw, file_cap=effective_file_cap, char_budget=effective_char_budget)
