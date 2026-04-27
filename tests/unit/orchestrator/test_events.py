@@ -5,6 +5,7 @@ from __future__ import annotations
 from ouroboros.orchestrator.capabilities import build_capability_graph
 from ouroboros.orchestrator.events import (
     create_ac_postmortem_captured_event,
+    create_ac_qa_evaluated_event,
     create_policy_capabilities_evaluated_event,
     create_postmortem_chain_truncated_event,
     create_progress_event,
@@ -491,3 +492,91 @@ class TestPostmortemChainTruncatedEvent:
         """cumulative_invariants_preserved=0 when no above-threshold invariants exist."""
         event = self._call(cumulative_invariants_preserved=0)
         assert event.data["cumulative_invariants_preserved"] == 0
+
+
+class TestACQAEvaluatedEvent:
+    """Tests for execution.ac.qa.evaluated event (Q4 inline-QA).
+
+    Verifies that create_ac_qa_evaluated_event mirrors the
+    create_ac_postmortem_captured_event factory pattern and exposes
+    all 6 payload keys at top level plus session_id/execution_id in
+    the data envelope.
+
+    [[INVARIANT: ac.qa.evaluated event type is execution.ac.qa.evaluated]]
+    [[INVARIANT: ac.qa.evaluated aggregate_id is ac_{ac_index}]]
+    """
+
+    def test_create_ac_qa_evaluated_event_payload_shape(self) -> None:
+        """Verify event shape and all payload keys for a passing QA verdict.
+
+        Checks:
+        - event.type == "execution.ac.qa.evaluated"
+        - aggregate_type == "execution"
+        - aggregate_id == "ac_{ac_index}"
+        - all 6 payload keys present at top level of data
+        - session_id and execution_id in data envelope
+        - passed == True for a pass verdict
+        """
+        event = create_ac_qa_evaluated_event(
+            session_id="sess_qa_1",
+            execution_id="exec_qa_1",
+            ac_index=3,
+            qa_attempt=1,
+            score=0.92,
+            verdict_label="pass",
+            loop_action="pass",
+            passed=True,
+        )
+
+        # Envelope shape
+        assert event.type == "execution.ac.qa.evaluated"
+        assert event.aggregate_type == "execution"
+        assert event.aggregate_id == "ac_3"
+
+        # session_id / execution_id in data envelope
+        assert event.data["session_id"] == "sess_qa_1"
+        assert event.data["execution_id"] == "exec_qa_1"
+
+        # All 6 payload keys at top level
+        assert event.data["ac_index"] == 3
+        assert event.data["qa_attempt"] == 1
+        assert event.data["score"] == 0.92
+        assert event.data["verdict_label"] == "pass"
+        assert event.data["loop_action"] == "pass"
+        assert event.data["passed"] is True
+
+        # Timestamp present (ISO-8601)
+        assert "timestamp" in event.data
+        from datetime import datetime
+        datetime.fromisoformat(event.data["timestamp"])
+
+    def test_create_ac_qa_evaluated_event_passed_false(self) -> None:
+        """Verify passed=False is faithfully stored for REVISE/FAIL verdicts.
+
+        A QA verdict of 'revise' or 'fail' should produce passed=False
+        in the event, while loop_action and verdict_label still reflect
+        the actual judge output.  This test uses loop_action='revise'.
+        """
+        event = create_ac_qa_evaluated_event(
+            session_id="sess_qa_2",
+            execution_id="exec_qa_2",
+            ac_index=0,
+            qa_attempt=2,
+            score=0.55,
+            verdict_label="revise",
+            loop_action="revise",
+            passed=False,
+        )
+
+        assert event.type == "execution.ac.qa.evaluated"
+        assert event.aggregate_type == "execution"
+        assert event.aggregate_id == "ac_0"
+
+        assert event.data["session_id"] == "sess_qa_2"
+        assert event.data["execution_id"] == "exec_qa_2"
+        assert event.data["ac_index"] == 0
+        assert event.data["qa_attempt"] == 2
+        assert event.data["score"] == 0.55
+        assert event.data["verdict_label"] == "revise"
+        assert event.data["loop_action"] == "revise"
+        assert event.data["passed"] is False
