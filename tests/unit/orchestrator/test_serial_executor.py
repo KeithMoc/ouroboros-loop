@@ -7130,8 +7130,47 @@ class TestInlineQAIntegration:
         assert pm_data.get("qa_verdict") is not None
 
     @pytest.mark.asyncio
+    async def test_inline_qa_exhausted_max_retries_zero(self) -> None:
+        """5. max_qa_retries=0 → only 1 QA evaluation; FAIL → immediate exhausted soft-pass."""
+        seed = _make_seed("Write a function")
+        executor = _make_executor()
+        # max_qa_retries=0 → only 1 total attempt allowed; no retries
+        call_args = _attach_fake_qa(executor, [
+            _make_qa_ok_result(loop_action="fail", score=0.20, verdict="fail"),
+        ])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="s4b",
+            execution_id="e4b",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=0,  # Zero retries → 1 attempt total
+        )
+
+        # Soft-pass: chain advances; result.outcome == SUCCEEDED even on QA exhaustion
+        assert result.success_count == 1
+        assert len(call_args) == 1  # exactly 1 QA evaluation (no retries)
+
+        events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
+        pm_data = events[0].data["postmortem"]
+        assert pm_data.get("qa_status") == "exhausted"
+        assert pm_data.get("qa_attempts") == 1  # 1 attempt with 0 retries
+        # qa_verdict holds the single attempt's dict
+        assert pm_data.get("qa_verdict") is not None
+        assert pm_data["qa_verdict"]["verdict"] == "fail"
+
+    @pytest.mark.asyncio
     async def test_inline_qa_pre_sha_captured_once(self) -> None:
-        """5. pre_sha is captured ONCE per AC even with QA retries (regression guard for Q2.1)."""
+        """6. pre_sha is captured ONCE per AC even with QA retries (regression guard for Q2.1)."""
         import unittest.mock as _mock
         from ouroboros.orchestrator import serial_executor as _se_mod
 
