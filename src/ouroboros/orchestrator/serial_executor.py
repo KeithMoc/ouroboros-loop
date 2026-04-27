@@ -350,20 +350,17 @@ def _render_chain_as_markdown(
             # the content, so a pathological file name like ```weird.py
             # cannot prematurely close the block.  Default to 3 backticks
             # when the content is well-behaved.
-            longest_backtick_run = 0
-            current_run = 0
-            for ch in diff_summary:
-                if ch == "`":
-                    current_run += 1
-                    if current_run > longest_backtick_run:
-                        longest_backtick_run = current_run
-                else:
-                    current_run = 0
+            longest_backtick_run = max(
+                (len(m) for m in re.findall(r"`+", diff_summary)), default=0
+            )
             fence = "`" * max(3, longest_backtick_run + 1)
 
             lines.append("- Diff summary:")
             lines.append(f"  {fence}text")
-            for stat_line in diff_summary.split("\n"):
+            # ``splitlines()`` drops the trailing-newline empty element that
+            # ``split("\n")`` produces, so a stat blob ending in ``\n``
+            # doesn't insert a blank line before the closing fence.
+            for stat_line in diff_summary.splitlines():
                 lines.append(f"  {stat_line}")
             lines.append(f"  {fence}")
 
