@@ -1008,15 +1008,26 @@ class SerialCompoundingExecutor(ParallelACExecutor):
     differs.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, qa_handler: QAHandler | None = None, **kwargs: Any) -> None:
         """Initialize executor and create QAHandler for inline-QA.
 
-        All arguments are forwarded to :class:`ParallelACExecutor`.  The
-        ``_qa_handler`` instance is always created; it is only exercised when
+        Args:
+            qa_handler: Optional pre-configured QAHandler.  When omitted, a bare
+                ``QAHandler()`` is constructed which lazily creates its own LLM
+                adapter on first call — fine for the standard subprocess
+                runtime, but callers wanting plugin-dispatch (opencode) or a
+                shared event store should inject a fully-configured handler
+                here (matching the ``QAHandler(llm_adapter=..., llm_backend=...,
+                event_store=..., agent_runtime_backend=..., opencode_mode=...)``
+                construction pattern used by :mod:`ouroboros.mcp.server.adapter`).
+            *args: Forwarded to :class:`ParallelACExecutor`.
+            **kwargs: Forwarded to :class:`ParallelACExecutor`.
+
+        The ``_qa_handler`` instance is always set; it is only exercised when
         ``inline_qa=True`` is passed to :meth:`execute_serial`.
         """
         super().__init__(*args, **kwargs)
-        self._qa_handler: QAHandler = QAHandler()
+        self._qa_handler: QAHandler = qa_handler if qa_handler is not None else QAHandler()
 
     async def execute_serial(
         self,
@@ -1402,9 +1413,21 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             # Q4: QA retry loop — shared state across attempts.
             # qa_verdict_for_feedback accumulates when a REVISE/FAIL verdict is
             # received; it is injected into the next attempt's context_override.
+            # iteration_history accumulates one entry per QA call so the judge
+            # can see what it previously flagged on the same AC.
             qa_verdict_for_feedback: dict | None = None
+            qa_iteration_history: list[dict[str, Any]] = []
+            # Q4: keep last-known QA fields so a retry that fails before reaching
+            # QA does not silently zero them out when we rebuild the postmortem.
+            prior_qa_verdict: dict[str, Any] | None = None
+            prior_qa_attempts: int = 0
+            # Defensive: -1 (or any negative value) would produce an empty range
+            # and leave `postmortem` unbound below; clamp so the loop runs at
+            # least once.  This mirrors the existing max_decomposition_depth
+            # clamp in ParallelACExecutor.__init__.
+            qa_retry_budget = max(0, max_qa_retries)
 
-            for qa_attempt in range(max_qa_retries + 1):
+            for qa_attempt in range(qa_retry_budget + 1):
                 # Build context for this attempt: base chain context plus any
                 # accumulated QA feedback from the PREVIOUS attempt.
                 context_for_attempt = context_section
@@ -1412,7 +1435,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     context_for_attempt = context_section + _format_qa_feedback_section(
                         qa_verdict_for_feedback,
                         attempt_number=qa_attempt,  # 1-based previous attempt number
-                        max_attempts=max_qa_retries + 1,
+                        max_attempts=qa_retry_budget + 1,
                     )
 
                 try:
@@ -1464,6 +1487,29 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     result, workspace_root=self._task_cwd, diff_summary=diff_summary
                 )
 
+                # Q4: preserve any QA fields already accumulated across prior
+                # attempts.  Without this, a retry that rebuilds postmortem
+                # via _build_postmortem_from_result would drop qa_verdict /
+                # qa_attempts even when the executor short-circuits below
+                # (non-success outcome) — leaving downstream consumers blind
+                # to the QA history of earlier attempts on the same AC.
+                if prior_qa_verdict is not None or prior_qa_attempts > 0:
+                    postmortem = ACPostmortem(
+                        summary=postmortem.summary,
+                        diff_summary=postmortem.diff_summary,
+                        tool_trace_digest=postmortem.tool_trace_digest,
+                        gotchas=postmortem.gotchas,
+                        qa_suggestions=postmortem.qa_suggestions,
+                        invariants_established=postmortem.invariants_established,
+                        retry_attempts=postmortem.retry_attempts,
+                        status=postmortem.status,
+                        duration_seconds=postmortem.duration_seconds,
+                        ac_native_session_id=postmortem.ac_native_session_id,
+                        sub_postmortems=postmortem.sub_postmortems,
+                        qa_verdict=prior_qa_verdict,
+                        qa_attempts=prior_qa_attempts,
+                    )
+
                 # Q4: Skip QA when disabled or when the execution itself
                 # failed/stalled.  Failed/stalled ACs follow the existing
                 # FAILED-path below; QA on a stall result would judge out of context.
@@ -1478,6 +1524,29 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     ac_content=ac_content,
                     seed=seed,
                     qa_session_id=f"qa-ac{ac_index}-{session_id[:8]}",
+                    final_message=result.final_message,
+                    iteration_history=qa_iteration_history if qa_iteration_history else None,
+                )
+
+                # Update prior_qa snapshot so the next iteration's
+                # rebuild-after-failure path can preserve it.
+                prior_qa_verdict = inline_qa_outcome.verdict_dict
+                prior_qa_attempts = qa_attempt + 1
+
+                # Append a structured iteration entry so the QA judge sees
+                # what it previously flagged on the same AC.  Match the
+                # MCP QA tool's iteration_history schema.
+                qa_iteration_history.append(
+                    {
+                        "iteration": qa_attempt + 1,
+                        "score": inline_qa_outcome.score,
+                        "verdict": (
+                            inline_qa_outcome.verdict_dict.get("verdict", "")
+                            if inline_qa_outcome.verdict_dict
+                            else ""
+                        ),
+                        "loop_action": inline_qa_outcome.loop_action,
+                    }
                 )
 
                 # Rebuild postmortem with QA verdict + attempt count.
@@ -1546,8 +1615,11 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     )
                     break
 
-                if inline_qa_outcome.loop_action == "skipped_delegated":
-                    # Plugin-dispatch path or handler error — skip QA gracefully.
+                if inline_qa_outcome.loop_action in ("skipped_delegated", "skipped_error"):
+                    # Plugin-dispatch (intentional) or handler/timeout failure
+                    # (unexpected) — both bypass the retry loop without blocking
+                    # the run.  qa_status preserves the distinction so postmortem
+                    # auditing can tell intentional skips from real outages.
                     postmortem = ACPostmortem(
                         summary=postmortem.summary,
                         diff_summary=postmortem.diff_summary,
@@ -1562,7 +1634,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         sub_postmortems=postmortem.sub_postmortems,
                         qa_verdict=postmortem.qa_verdict,
                         qa_attempts=postmortem.qa_attempts,
-                        qa_status="skipped_delegated",
+                        qa_status=inline_qa_outcome.loop_action,
                     )
                     break
 

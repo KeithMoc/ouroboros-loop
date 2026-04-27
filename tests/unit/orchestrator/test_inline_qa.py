@@ -455,8 +455,13 @@ class TestRunInlineQa:
         assert outcome.verdict_dict is None
         assert outcome.score == 0.0
 
-    async def test_err_returns_skipped_delegated_and_logs(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Test 15: Err path → skipped_delegated + inline_qa.handle_failed log."""
+    async def test_err_returns_skipped_error_and_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test 15: Err path → skipped_error (distinct from intentional plugin-dispatch).
+
+        Handler-level failures must be distinguishable from the opencode
+        plugin-dispatch path so postmortem auditing can tell intentional
+        skips from real outages.  See CodeRabbit review on PR #6.
+        """
         import logging
         handler = FakeQAHandler([_make_err_result()])
         seed = FakeSeed()
@@ -470,11 +475,10 @@ class TestRunInlineQa:
                 seed=seed,  # type: ignore[arg-type]
             )
 
-        assert outcome.loop_action == "skipped_delegated"
+        assert outcome.loop_action == "skipped_error"
         assert outcome.verdict_dict is None
         assert outcome.score == 0.0
-        # Check log was emitted — structlog may log to root or named logger
-        # so we check the handler was called at least once
+        # Check the handler was called once and a log was emitted
         assert handler._call_count == 1
 
     async def test_auto_generated_session_id_starts_with_qa_ac(self) -> None:
@@ -511,3 +515,99 @@ class TestRunInlineQa:
         )
 
         assert outcome.qa_session_id == "qa-fixed-1"
+
+    async def test_explicit_final_message_overrides_key_output(self) -> None:
+        """Caller-provided final_message replaces postmortem.summary.key_output."""
+        meta = _make_ok_meta()
+        handler = FakeQAHandler([_make_ok_result(meta)])
+        seed = FakeSeed()
+
+        await run_inline_qa(
+            handler,  # type: ignore[arg-type]
+            postmortem=self._pm(key_output="SHORT EXCERPT"),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+            final_message="The agent's full unabridged final reply.",
+        )
+
+        artifact = handler._call_args[0]["artifact"]
+        assert "The agent's full unabridged final reply." in artifact
+        assert "SHORT EXCERPT" not in artifact
+
+    async def test_iteration_history_forwarded_to_handler(self) -> None:
+        """When iteration_history is provided, it is passed through to QAHandler."""
+        meta = _make_ok_meta()
+        handler = FakeQAHandler([_make_ok_result(meta)])
+        seed = FakeSeed()
+
+        history = [{"iteration": 1, "score": 0.62, "verdict": "revise", "loop_action": "revise"}]
+        await run_inline_qa(
+            handler,  # type: ignore[arg-type]
+            postmortem=self._pm(),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+            iteration_history=history,
+        )
+
+        assert handler._call_args[0]["iteration_history"] == history
+
+    async def test_timeout_returns_skipped_error(self) -> None:
+        """When QAHandler.handle hangs past timeout_s → loop_action='skipped_error'."""
+        import asyncio
+
+        class HangingHandler:
+            async def handle(self, arguments: dict) -> Result:
+                await asyncio.sleep(10)
+                return _make_ok_result(_make_ok_meta())
+
+        seed = FakeSeed()
+        outcome = await run_inline_qa(
+            HangingHandler(),  # type: ignore[arg-type]
+            postmortem=self._pm(),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+            timeout_s=0.01,
+        )
+
+        assert outcome.loop_action == "skipped_error"
+        assert outcome.verdict_dict is None
+        assert outcome.score == 0.0
+
+    async def test_missing_loop_action_short_circuits_to_skipped_delegated(self) -> None:
+        """Malformed meta missing loop_action → skipped_delegated, not 'fail'.
+
+        A 'fail' default would burn unnecessary retries on garbage payloads.
+        """
+        meta = _make_ok_meta()
+        meta.pop("loop_action")  # simulate malformed payload
+        handler = FakeQAHandler([_make_ok_result(meta)])
+        seed = FakeSeed()
+
+        outcome = await run_inline_qa(
+            handler,  # type: ignore[arg-type]
+            postmortem=self._pm(),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+        )
+
+        assert outcome.loop_action == "skipped_delegated"
+
+    async def test_unexpected_loop_action_normalized_to_skipped_delegated(self) -> None:
+        """Unexpected loop_action values are short-circuited so the executor doesn't retry on garbage."""
+        meta = _make_ok_meta(loop_action="not-a-real-action")
+        handler = FakeQAHandler([_make_ok_result(meta)])
+        seed = FakeSeed()
+
+        outcome = await run_inline_qa(
+            handler,  # type: ignore[arg-type]
+            postmortem=self._pm(),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+        )
+
+        assert outcome.loop_action == "skipped_delegated"

@@ -609,8 +609,24 @@ async def _run_orchestrator(
             if compounding_resume_session_id is not None:
                 execute_kwargs["resume_session_id"] = compounding_resume_session_id
             if mode == "compounding" and inline_qa:
-                execute_kwargs["inline_qa"] = inline_qa
-                execute_kwargs["max_qa_retries"] = max_qa_retries
+                # Compounding requires >1 AC to enter the serial-loop path;
+                # a single-AC seed routes to the streaming branch which never
+                # consults inline_qa.  Warn explicitly so the user isn't left
+                # wondering why their --inline-qa flag had no effect.
+                if len(seed.acceptance_criteria) <= 1:
+                    log.warning(
+                        "run.inline_qa.ignored_single_ac_seed",
+                        ac_count=len(seed.acceptance_criteria),
+                    )
+                    print_warning(
+                        "--inline-qa requires a seed with more than one acceptance "
+                        "criterion (compounding executes per-AC). Single-AC seeds "
+                        "route to the streaming path; inline-QA will be ignored "
+                        "for this run."
+                    )
+                else:
+                    execute_kwargs["inline_qa"] = inline_qa
+                    execute_kwargs["max_qa_retries"] = max_qa_retries
             result = await runner.execute_seed(**execute_kwargs)
 
         # Handle result

@@ -873,21 +873,28 @@ def create_ac_qa_evaluated_event(
     verdict_label: str,
     loop_action: str,
     passed: bool,
+    ac_id: str | None = None,
 ) -> BaseEvent:
     """Create event emitted after each inline-QA evaluation in compounding mode.
 
     Mirrors ``create_ac_postmortem_captured_event``'s naming convention.
-    Emitted on every QA call (pass, revise, fail, and skipped_delegated).
+    Emitted on every QA call (pass, revise, fail, skipped_delegated, and
+    skipped_error).
 
     Args:
         session_id: Parent session id.
         execution_id: Execution id for event tracking.
         ac_index: 0-based AC index.
         qa_attempt: 1-based QA attempt number for this AC.
-        score: QA score (0.0 when skipped/delegated).
+        score: QA score (0.0 when skipped/delegated/errored).
         verdict_label: Raw verdict string from the QA judge (e.g. "pass", "revise").
-        loop_action: Loop-control action ("pass", "revise", "fail", "skipped_delegated").
+        loop_action: Loop-control action — one of "pass", "revise", "fail",
+            "skipped_delegated", "skipped_error".
         passed: True when loop_action == "pass".
+        ac_id: Optional caller-provided aggregate id (e.g. ``"ac_3.1"`` for
+            sub-AC scoping).  When omitted the id is derived from ``ac_index``
+            as ``f"ac_{ac_index}"``, matching the legacy convention used by
+            top-level AC postmortems.
 
     Returns:
         BaseEvent for the QA evaluation.
@@ -895,7 +902,7 @@ def create_ac_qa_evaluated_event(
     return BaseEvent(
         type="execution.ac.qa.evaluated",
         aggregate_type="execution",
-        aggregate_id=f"ac_{ac_index}",
+        aggregate_id=ac_id if ac_id is not None else f"ac_{ac_index}",
         data={
             "session_id": session_id,
             "execution_id": execution_id,

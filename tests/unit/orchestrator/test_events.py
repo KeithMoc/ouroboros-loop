@@ -580,3 +580,41 @@ class TestACQAEvaluatedEvent:
         assert event.data["verdict_label"] == "revise"
         assert event.data["loop_action"] == "revise"
         assert event.data["passed"] is False
+
+    def test_explicit_ac_id_overrides_default_aggregate_id(self) -> None:
+        """ac_id kwarg overrides the default f"ac_{ac_index}" derivation.
+
+        Sub-AC events need a caller-provided id like "ac_3.1" so AC-scoped
+        aggregation can distinguish parent-AC verdicts from sub-AC verdicts
+        that share the same ac_index.
+        """
+        event = create_ac_qa_evaluated_event(
+            session_id="sess",
+            execution_id="exec",
+            ac_index=3,
+            qa_attempt=1,
+            score=0.86,
+            verdict_label="pass",
+            loop_action="pass",
+            passed=True,
+            ac_id="ac_3.1",
+        )
+
+        assert event.aggregate_id == "ac_3.1"
+        # ac_index payload still reflects the AC index
+        assert event.data["ac_index"] == 3
+
+    def test_default_ac_id_falls_back_to_legacy_format(self) -> None:
+        """When ac_id is omitted, aggregate_id derives from ac_index unchanged."""
+        event = create_ac_qa_evaluated_event(
+            session_id="sess",
+            execution_id="exec",
+            ac_index=7,
+            qa_attempt=1,
+            score=0.9,
+            verdict_label="pass",
+            loop_action="pass",
+            passed=True,
+        )
+
+        assert event.aggregate_id == "ac_7"

@@ -15,9 +15,11 @@ Key public surface:
 
 from __future__ import annotations
 
-import uuid
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING, Any
+import uuid
 
 import yaml
 
@@ -29,7 +31,32 @@ from ouroboros.orchestrator.parallel_executor_models import ACExecutionResult
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
 
-log = get_logger()
+log = get_logger(__name__)
+
+# Default per-call timeout for QAHandler.handle.  Configurable via env var
+# OUROBOROS_INLINE_QA_TIMEOUT_S; values <= 0 disable the timeout.  Chosen
+# to be larger than typical LLM round-trips but short enough that a hung
+# adapter cannot block a whole compounding run indefinitely.
+DEFAULT_INLINE_QA_TIMEOUT_S: float = 120.0
+
+
+def _resolve_qa_timeout() -> float | None:
+    """Return the QA call timeout in seconds, or None when disabled."""
+    raw = os.environ.get("OUROBOROS_INLINE_QA_TIMEOUT_S")
+    if raw is None or raw == "":
+        return DEFAULT_INLINE_QA_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_INLINE_QA_TIMEOUT_S
+    return value if value > 0 else None
+
+
+# Set of loop_action values that the executor recognizes.  Anything outside
+# this set is treated as malformed and short-circuited to skipped_delegated.
+_VALID_LOOP_ACTIONS: frozenset[str] = frozenset(
+    {"pass", "revise", "fail", "skipped_delegated", "skipped_error"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +158,12 @@ def _serialize_qa_verdict(verdict: QAVerdict) -> dict[str, Any]:
 
     Tuple fields (``differences``, ``suggestions``) become lists.
 
+    Intended for callers that already hold a parsed :class:`QAVerdict`
+    dataclass — :func:`run_inline_qa` reads the same fields directly off
+    ``MCPToolResult.meta`` and does not flow through this helper, which is
+    deliberate: ``meta`` is already a JSON-shaped dict, so an extra
+    serialization round-trip would be wasted work.
+
     Args:
         verdict: The QAVerdict dataclass instance.
 
@@ -158,15 +191,18 @@ class InlineQAOutcome:
     """Outcome of a single inline-QA evaluation.
 
     Attributes:
-        loop_action: One of "pass", "revise", "fail", "skipped_delegated".
-        score: QA score (0.0 when skipped/delegated).
+        loop_action: One of "pass", "revise", "fail", "skipped_delegated",
+            "skipped_error". The two skipped variants distinguish intentional
+            opencode plugin-dispatch (delegated_to_subagent) from handler /
+            timeout failures, which simplifies postmortem auditing.
+        score: QA score (0.0 when skipped/delegated/errored).
         verdict_dict: Serialized verdict dict, or None when skipped.
         qa_session_id: Session ID used for the QA call.
     """
 
-    loop_action: str  # "pass" | "revise" | "fail" | "skipped_delegated"
+    loop_action: str  # see class docstring for the closed enum
     score: float
-    verdict_dict: dict[str, Any] | None  # None when skipped_delegated
+    verdict_dict: dict[str, Any] | None  # None when skipped/errored
     qa_session_id: str
 
 
@@ -181,26 +217,43 @@ async def run_inline_qa(
     postmortem: ACPostmortem,
     ac_index: int,
     ac_content: str,
-    seed: "Seed",
+    seed: Seed,
     qa_session_id: str | None = None,
+    final_message: str | None = None,
+    iteration_history: list[dict[str, Any]] | None = None,
+    timeout_s: float | None = None,
 ) -> InlineQAOutcome:
     """Run a single inline-QA evaluation against QAHandler.
 
-    Uses ``postmortem.summary.key_output`` as the final-message proxy and
-    ``postmortem.diff_summary`` for the diff block, since the executor only
-    passes ``postmortem`` (not the raw ``ACExecutionResult``) to this helper.
+    Builds the artifact from ``final_message`` (the agent's full output for the
+    AC's last attempt) when provided, or falls back to
+    ``postmortem.summary.key_output`` (a short excerpt) when the executor cannot
+    thread the raw message — the full text gives the QA judge much better
+    context, since key_output is a summarization of the same data.
 
-    Degrades gracefully on all error paths — returns
-    ``loop_action="skipped_delegated"`` so the executor falls through
-    without retrying and without blocking the run.
+    Degrades gracefully on every error path — handler failures and timeouts
+    return ``loop_action="skipped_error"`` so the executor distinguishes them
+    from the intentional opencode plugin-dispatch path
+    (``loop_action="skipped_delegated"``); both bypass the retry loop without
+    blocking the run.
 
     Args:
         qa_handler: The QAHandler instance to call.
         postmortem: The AC postmortem to evaluate.
         ac_index: 0-based AC index.
         ac_content: The acceptance criterion text.
-        seed: The Seed object (serialized as YAML for seed_content arg).
+        seed: The Seed object (serialized as YAML for ``seed_content`` arg).
         qa_session_id: Optional explicit session ID; auto-generated when None.
+        final_message: Optional agent's full final-message text for this attempt;
+            recommended whenever the caller has it (the executor passes it
+            from the latest ``ACExecutionResult``).
+        iteration_history: Optional list of prior verdicts for the same AC,
+            forwarded to the QA judge so its multi-iteration loop has context.
+            Each entry should match the QA tool's ``iteration_history`` schema
+            (typically the previous attempts' meta dicts).
+        timeout_s: Per-call timeout override; ``None`` consults
+            ``OUROBOROS_INLINE_QA_TIMEOUT_S`` and falls back to
+            :data:`DEFAULT_INLINE_QA_TIMEOUT_S`.
 
     Returns:
         InlineQAOutcome describing what the QA judge decided.
@@ -208,19 +261,28 @@ async def run_inline_qa(
     # Auto-generate session ID if not provided
     effective_session_id = qa_session_id or f"qa-ac{ac_index}-{uuid.uuid4().hex[:8]}"
 
-    # Build artifact using postmortem.summary.key_output as final_message proxy
+    # Prefer the caller-supplied full final_message; key_output is a
+    # short summarization fallback used only when threading isn't possible.
+    final_text = (
+        final_message if final_message is not None else postmortem.summary.key_output
+    )
     synthetic_result = ACExecutionResult(
         ac_index=postmortem.summary.ac_index,
         ac_content=postmortem.summary.ac_content,
         success=postmortem.summary.success,
-        final_message=postmortem.summary.key_output,
+        final_message=final_text,
     )
     artifact = _assemble_qa_artifact(synthetic_result, postmortem)
     quality_bar = _assemble_qa_quality_bar(ac_index, ac_content, seed.goal)
 
     try:
         seed_content = yaml.dump(seed.model_dump(), allow_unicode=True, sort_keys=False)
-    except Exception:
+    except (AttributeError, TypeError, ValueError, yaml.YAMLError) as exc:
+        log.warning(
+            "inline_qa.seed_serialize_failed",
+            qa_session_id=effective_session_id,
+            error=str(exc),
+        )
         seed_content = None
 
     arguments: dict[str, Any] = {
@@ -232,10 +294,32 @@ async def run_inline_qa(
     }
     if seed_content is not None:
         arguments["seed_content"] = seed_content
+    if iteration_history:
+        arguments["iteration_history"] = iteration_history
 
-    result = await qa_handler.handle(arguments)
+    effective_timeout = timeout_s if timeout_s is not None else _resolve_qa_timeout()
 
-    # --- Error path ---
+    try:
+        if effective_timeout is None:
+            result = await qa_handler.handle(arguments)
+        else:
+            result = await asyncio.wait_for(
+                qa_handler.handle(arguments), timeout=effective_timeout
+            )
+    except TimeoutError:
+        log.warning(
+            "inline_qa.handle_timeout",
+            qa_session_id=effective_session_id,
+            timeout_s=effective_timeout,
+        )
+        return InlineQAOutcome(
+            loop_action="skipped_error",
+            score=0.0,
+            verdict_dict=None,
+            qa_session_id=effective_session_id,
+        )
+
+    # --- Handler-level error: distinct from intentional plugin-dispatch ---
     if result.is_err:
         log.warning(
             "inline_qa.handle_failed",
@@ -243,7 +327,7 @@ async def run_inline_qa(
             error=str(result.error),
         )
         return InlineQAOutcome(
-            loop_action="skipped_delegated",
+            loop_action="skipped_error",
             score=0.0,
             verdict_dict=None,
             qa_session_id=effective_session_id,
@@ -262,8 +346,18 @@ async def run_inline_qa(
             qa_session_id=effective_session_id,
         )
 
-    # Extract verdict fields from meta
-    loop_action: str = meta.get("loop_action", "fail")
+    # Extract verdict fields from meta.  Default to skipped_delegated on
+    # missing/unexpected loop_action so malformed payloads don't masquerade
+    # as a recoverable FAIL and burn unnecessary retries.
+    raw_loop_action = meta.get("loop_action", "skipped_delegated")
+    if raw_loop_action not in _VALID_LOOP_ACTIONS:
+        log.warning(
+            "inline_qa.unexpected_loop_action",
+            qa_session_id=effective_session_id,
+            raw=str(raw_loop_action),
+        )
+        raw_loop_action = "skipped_delegated"
+    loop_action: str = raw_loop_action
     score: float = float(meta.get("score", 0.0))
 
     verdict_dict: dict[str, Any] = {

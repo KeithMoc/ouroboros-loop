@@ -7397,8 +7397,14 @@ class TestInlineQAIntegration:
         assert pm_data.get("qa_attempts") == 1
 
     @pytest.mark.asyncio
-    async def test_inline_qa_handler_error_skipped_delegated(self) -> None:
-        """11. QAHandler returns Err → qa_status='skipped_delegated', no retry, run continues."""
+    async def test_inline_qa_handler_error_skipped_error(self) -> None:
+        """11. QAHandler returns Err → qa_status='skipped_error', no retry, run continues.
+
+        Handler-level failures are tagged 'skipped_error' so postmortem
+        auditing can tell them apart from the intentional opencode
+        plugin-dispatch path ('skipped_delegated').  Both bypass retries
+        without blocking the run.
+        """
         seed = _make_seed("Write a function")
         executor = _make_executor()
         call_args = _attach_fake_qa(executor, [
@@ -7427,7 +7433,7 @@ class TestInlineQAIntegration:
 
         events = [e for e in executor._event_store._appended if e.type == "execution.ac.postmortem.captured"]
         pm_data = events[0].data["postmortem"]
-        assert pm_data.get("qa_status") == "skipped_delegated"
+        assert pm_data.get("qa_status") == "skipped_error"
 
     @pytest.mark.asyncio
     async def test_inline_qa_multi_ac_independent_qa_per_ac(self) -> None:
@@ -7617,13 +7623,17 @@ class TestInlineQAIntegration:
             f"Expected warning about --inline-qa outside --compounding in output:\n{combined_output}"
         )
 
-        # _run_orchestrator must have been called with inline_qa=False
-        assert mock_run_orch.call_count >= 1, (
-            "_run_orchestrator should have been called (workflow → _run_orchestrator)"
+        # _run_orchestrator must have been awaited exactly once with inline_qa=False
+        assert result.exit_code == 0, (
+            f"CLI invocation should succeed; got exit_code={result.exit_code}, output={result.output}"
         )
-        call_kw = mock_run_orch.call_args.kwargs
-        assert call_kw.get("inline_qa") is False, (
-            f"Expected inline_qa=False when --compounding is absent; got {call_kw.get('inline_qa')!r}"
+        mock_run_orch.assert_awaited_once()
+        call_kw = mock_run_orch.await_args.kwargs
+        assert "inline_qa" in call_kw, (
+            f"_run_orchestrator must receive inline_qa kwarg; got kwargs={list(call_kw)}"
+        )
+        assert call_kw["inline_qa"] is False, (
+            f"Expected inline_qa=False when --compounding is absent; got {call_kw['inline_qa']!r}"
         )
 
     @pytest.mark.asyncio
@@ -7680,10 +7690,16 @@ class TestInlineQAIntegration:
         assert "Prior AC Postmortems" in ac2_override, (
             "AC-2 must see chain context from AC-1."
         )
-        # The digest line for AC-1 must include the QA status suffix
-        assert "QA: passed" in ac2_override or "QA: exhausted" in ac2_override, (
-            f"AC-2's context_override must include the QA status from AC-1's digest. "
+        # Both stubbed QA results in this test return PASS, so the digest line
+        # for AC-1 must contain exactly "QA: passed" — accepting "QA: exhausted"
+        # would mask a bug where the executor mis-finalizes the postmortem.
+        assert "QA: passed" in ac2_override, (
+            f"AC-2's context_override must include 'QA: passed' from AC-1's digest. "
             f"Override was:\n{ac2_override[:800]}"
+        )
+        assert "QA: exhausted" not in ac2_override, (
+            f"AC-2's context_override unexpectedly contains 'QA: exhausted' — "
+            f"both stubbed verdicts were PASS. Override was:\n{ac2_override[:800]}"
         )
 
 

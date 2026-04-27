@@ -894,7 +894,12 @@ class TestInlineQAFlags:
         assert captured.get("inline_qa", False) is False
 
     def test_default_max_qa_retries_is_one(self, tmp_path: Path) -> None:
-        """Default run passes max_qa_retries=1 to _run_orchestrator."""
+        """Default run forwards max_qa_retries=1 to _run_orchestrator.
+
+        Asserts the kwarg is *present* — `captured.get(..., 1)` would
+        otherwise return the same value when the kwarg is absent entirely,
+        masking a regression where the CLI fails to forward it.
+        """
         seed_path = _write_seed(tmp_path)
         captured: dict = {}
 
@@ -910,7 +915,10 @@ class TestInlineQAFlags:
                 ["workflow", str(seed_path), "--compounding", "--inline-qa"],
             )
         assert result.exit_code == 0, result.output
-        assert captured.get("max_qa_retries", 1) == 1
+        assert "max_qa_retries" in captured, (
+            f"_run_orchestrator must receive max_qa_retries kwarg; got kwargs={list(captured)}"
+        )
+        assert captured["max_qa_retries"] == 1
 
     def test_inline_qa_not_in_execute_kwargs_when_disabled(
         self, tmp_path: Path
