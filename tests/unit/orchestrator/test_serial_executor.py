@@ -7736,3 +7736,137 @@ class TestCreateAcQaEvaluatedEventFactory:
         assert event.data["passed"] is False
         assert event.data["loop_action"] == "revise"
         assert event.data["score"] == pytest.approx(0.55)
+
+
+# =============================================================================
+# Q4 — Renderer tests: ### QA block in _render_chain_as_markdown
+# =============================================================================
+
+
+class TestRenderChainMarkdownQABlock:
+    """Tests for the ### QA section added to _render_chain_as_markdown in Q4.
+
+    Verifies three properties:
+    1. QA block is emitted when qa_status is set on the postmortem.
+    2. QA block is omitted when qa_status is None (default / --inline-qa off).
+    3. Dynamic-fence defence grows the fence when suggestions contain backticks.
+    """
+
+    def _make_pm_with_qa(
+        self,
+        qa_status: str,
+        score: float = 0.86,
+        verdict: str = "pass",
+        qa_attempts: int = 1,
+        suggestions: list[str] | None = None,
+    ) -> "ACPostmortem":
+        """Helper: build an ACPostmortem with qa_* fields set."""
+        from ouroboros.orchestrator.level_context import ACContextSummary, ACPostmortem
+
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Implement feature",
+            success=True,
+        )
+        return ACPostmortem(
+            summary=summary,
+            status="pass",
+            qa_status=qa_status,
+            qa_verdict={
+                "score": score,
+                "verdict": verdict,
+                "dimensions": {},
+                "differences": [],
+                "suggestions": suggestions or [],
+                "reasoning": "Looks good.",
+            },
+            qa_attempts=qa_attempts,
+        )
+
+    def _render(self, pm: "ACPostmortem") -> str:
+        """Render a single-postmortem chain and return the markdown string."""
+        from ouroboros.orchestrator.level_context import PostmortemChain
+        from ouroboros.orchestrator.serial_executor import _render_chain_as_markdown
+
+        chain = PostmortemChain(postmortems=(pm,))
+        return _render_chain_as_markdown(chain, session_id="test-sess", execution_id="test-exec")
+
+    def test_render_chain_markdown_emits_qa_block_when_qa_status_set(self) -> None:
+        """QA block is rendered when postmortem has qa_status set.
+
+        Verifies all three required fields: Status, Score, Suggestions.
+        """
+        pm = self._make_pm_with_qa(
+            qa_status="passed",
+            score=0.86,
+            verdict="pass",
+            qa_attempts=1,
+            suggestions=["Add type hints to the new module"],
+        )
+        content = self._render(pm)
+
+        # Section header must appear
+        assert "### QA" in content
+
+        # Status line with attempt count
+        assert "- Status: passed (attempt 1)" in content
+
+        # Score line with verdict label
+        assert "- Score: 0.86 / 1.00 — pass" in content
+
+        # Suggestions block must be present
+        assert "- Suggestions:" in content
+        assert "Add type hints to the new module" in content
+
+    def test_render_chain_markdown_omits_qa_block_when_qa_status_none(self) -> None:
+        """QA block is omitted when qa_status is None (default / --inline-qa off).
+
+        Runs without --inline-qa must produce byte-identical artifacts to the
+        pre-Q4 baseline — the only allowed difference is the absence of the
+        ### QA section.
+        """
+        from ouroboros.orchestrator.level_context import ACContextSummary, ACPostmortem
+
+        summary = ACContextSummary(
+            ac_index=0,
+            ac_content="Implement feature",
+            success=True,
+        )
+        # Default qa_status=None
+        pm = ACPostmortem(summary=summary, status="pass")
+        content = self._render(pm)
+
+        assert "### QA" not in content
+        assert "qa_status" not in content
+        assert "Score:" not in content
+        assert "Suggestions:" not in content
+
+    def test_render_chain_markdown_qa_block_uses_dynamic_fence(self) -> None:
+        """Suggestions in a fenced block use a fence longer than backtick runs in text.
+
+        When suggestion text contains triple backticks (e.g. "use ```code```"),
+        the fence must grow to 4+ backticks to prevent premature block closure.
+        """
+        # A suggestion that contains a triple-backtick run
+        nasty_suggestion = "Replace ```old_call()``` with the new API"
+        pm = self._make_pm_with_qa(
+            qa_status="exhausted",
+            score=0.55,
+            verdict="revise",
+            qa_attempts=2,
+            suggestions=[nasty_suggestion],
+        )
+        content = self._render(pm)
+
+        # The fence used must be at least 4 backticks (content has 3-backtick run)
+        assert "````" in content, (
+            "Expected at least 4-backtick fence when suggestion contains ``` runs; "
+            f"got:\n{content}"
+        )
+
+        # The suggestion text itself must still appear
+        assert nasty_suggestion in content
+
+        # The ### QA block itself must be present
+        assert "### QA" in content
+        assert "- Status: exhausted (attempt 2)" in content

@@ -258,6 +258,19 @@ async def verify_invariants(
     return results
 
 
+def _pick_fence_for_text(text: str) -> str:
+    """Return the shortest backtick fence that won't be closed by *text*.
+
+    Picks a fence at least one backtick longer than any run already present
+    in *text*, defaulting to three backticks when the content contains none.
+    This guards against pathological content (e.g. file names like
+    ```weird.py``) prematurely closing a fenced code block in the chain
+    artifact.
+    """
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
 def _render_chain_as_markdown(
     chain: PostmortemChain,
     session_id: str,
@@ -352,15 +365,7 @@ def _render_chain_as_markdown(
         # associated with the bullet under CommonMark.  Empty diff_summary
         # is suppressed entirely to keep no-op-AC artifacts terse.
         if diff_summary:
-            # Pick a fence at least one backtick longer than any run in
-            # the content, so a pathological file name like ```weird.py
-            # cannot prematurely close the block.  Default to 3 backticks
-            # when the content is well-behaved.
-            longest_backtick_run = max(
-                (len(m) for m in re.findall(r"`+", diff_summary)), default=0
-            )
-            fence = "`" * max(3, longest_backtick_run + 1)
-
+            fence = _pick_fence_for_text(diff_summary)
             lines.append("- Diff summary:")
             lines.append(f"  {fence}text")
             # ``splitlines()`` drops the trailing-newline empty element that
@@ -369,6 +374,37 @@ def _render_chain_as_markdown(
             for stat_line in diff_summary.splitlines():
                 lines.append(f"  {stat_line}")
             lines.append(f"  {fence}")
+
+        # Q4: QA block — emitted only when inline-QA was run for this AC.
+        # Rendered below the Diff summary block; omitted entirely when
+        # qa_status is None (the default / inline_qa-off path) so runs
+        # without --inline-qa produce byte-identical artifacts.
+        qa_status = entry.get("qa_status")
+        qa_verdict = entry.get("qa_verdict") or {}
+        qa_attempts = entry.get("qa_attempts", 0)
+        if qa_status is not None:
+            score = float(qa_verdict.get("score", 0.0)) if qa_verdict else 0.0
+            verdict_label = str(qa_verdict.get("verdict", "")) if qa_verdict else ""
+            suggestions: list[Any] = list(qa_verdict.get("suggestions") or []) if qa_verdict else []
+
+            lines.append("### QA")
+            lines.append("")
+            lines.append(f"- Status: {qa_status} (attempt {qa_attempts})")
+            lines.append(f"- Score: {score:.2f} / 1.00 — {verdict_label}")
+            if suggestions:
+                # Dynamic-fence defense: pick a fence longer than any
+                # backtick run already present in the suggestion text so
+                # a suggestion like "use ```foo```" cannot break the block.
+                all_suggestions_text = "\n".join(str(s) for s in suggestions)
+                sug_fence = _pick_fence_for_text(all_suggestions_text)
+                lines.append("- Suggestions:")
+                lines.append(f"  {sug_fence}text")
+                for sug in suggestions:
+                    lines.append(f"  - {sug}")
+                lines.append(f"  {sug_fence}")
+            else:
+                lines.append("- Suggestions: (none)")
+            lines.append("")
 
         lines.append("")
 
