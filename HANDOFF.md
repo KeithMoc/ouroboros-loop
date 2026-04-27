@@ -26,9 +26,9 @@ What shipped:
 - Test-fixture cleanup: autouse fixture in `tests/conftest.py` redirects `OUROBOROS_CHAIN_ARTIFACT_DIR` to `tmp_path` per test (was leaking ~280 `chain-*.md` files into `docs/brainstorm/` per CI run before this).
 - Design doc: `docs/brainstorm/phase-2-q2-diff-capture-design.md`. Dogfood seed: `seeds/phase-2-q2-diff-capture.yaml`.
 
-### ✅ Phase-2 Q2.1 — Dogfood-gap hotfix (PR #5)
+### ✅ Phase-2 Q2.1 — Dogfood-gap hotfix (PR #5 merged)
 
-**Branch `fix/q2-diff-capture-and-render` on `KeithMoc/ouroboros-loop`.**
+**Squash-merged as `4f0b044` on `KeithMoc/ouroboros-loop:main` at 2026-04-27 00:29:35 UTC.**
 
 A real `--compounding` validation run on 2026-04-26 (`orch_d90a52690b15`) produced a chain artifact with all four ACs marked `[pass]` but **zero `diff_summary` matches** despite the inner orch worktree having ten real commits. Root cause: two coupled bugs.
 
@@ -134,9 +134,8 @@ Same workflow:
 
 ## Repo State at Handoff Time
 
-- Branch: `fix/q2-diff-capture-and-render` (PR #5 open against `KeithMoc/ouroboros-loop:main`).
-- `main` at `f665c06` (`chore: ignore .worktrees/`); will fast-forward to `1f58098` + the review-response amendment commits when PR #5 merges.
-- Active worktree: `.worktrees/q2-fix` for the hotfix branch.
+- Branch: `main` at `4f0b044` (squash-merge of PR #5; synced with `origin/main`).
+- Hotfix branch + worktree (`fix/q2-diff-capture-and-render`, `.worktrees/q2-fix`) deleted post-merge.
 - Untracked: `.claude/scheduled_tasks.lock` (transient, ignore).
 
 ---
