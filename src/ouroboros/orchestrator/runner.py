@@ -555,7 +555,9 @@ class OrchestratorRunner:
             execution_id: Execution ID to remove.
             session_id: Session ID to remove.
         """
-        from ouroboros.orchestrator.heartbeat import release as release_lock
+        from ouroboros.orchestrator.heartbeat import (
+            release_if_owned_by_current_process as release_lock,
+        )
 
         self._active_sessions.pop(execution_id, None)
         release_lock(session_id)
@@ -1428,6 +1430,24 @@ class OrchestratorRunner:
             )
             return False
 
+    async def _check_startup_cancellation(self, session_id: str) -> bool:
+        """Check cancellation before normal message-loop checkpoints exist."""
+        if await is_cancellation_requested(session_id):
+            return True
+        try:
+            events = await self._event_store.query_events(
+                aggregate_id=session_id,
+                event_type="orchestrator.session.cancelled",
+                limit=1,
+            )
+            return len(events) > 0
+        except Exception:
+            log.warning(
+                "orchestrator.runner.startup_cancellation_check_failed",
+                session_id=session_id,
+            )
+            return False
+
     async def _handle_cancellation(
         self,
         session_id: str,
@@ -1467,18 +1487,57 @@ class OrchestratorRunner:
         # Only mark cancelled if not already in a terminal state
         session_result = await self._session_repo.reconstruct_session(session_id)
         _terminal = {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED}
-        if session_result.is_ok and session_result.value.status not in _terminal:
-            cancel_result = await self._session_repo.mark_cancelled(
-                session_id,
-                reason="Cancellation detected during execution",
-                cancelled_by="runner",
-            )
-            if cancel_result.is_err:
-                log.warning(
-                    "orchestrator.runner.mark_cancelled_failed",
-                    session_id=session_id,
-                    error=str(cancel_result.error),
+        session_already_terminal = session_result.is_ok and session_result.value.status in _terminal
+        if session_already_terminal:
+            terminal_status = session_result.value.status
+            final_message = f"Execution already {terminal_status.value}"
+            summary = {"terminal_status": terminal_status.value, **self._task_summary()}
+            if terminal_status == SessionStatus.CANCELLED:
+                summary["cancelled"] = True
+            try:
+                execution_terminal_events = await self._event_store.query_events(
+                    aggregate_id=execution_id,
+                    event_type="execution.terminal",
+                    limit=1,
                 )
+            except Exception:
+                execution_terminal_events = []
+            if not execution_terminal_events:
+                await self._event_store.append(
+                    create_execution_terminal_event(
+                        execution_id=execution_id,
+                        session_id=session_id,
+                        status=terminal_status.value,
+                        summary=summary if terminal_status == SessionStatus.COMPLETED else None,
+                        error_message=(
+                            final_message if terminal_status != SessionStatus.COMPLETED else None
+                        ),
+                        messages_processed=messages_processed,
+                    )
+                )
+            return Result.ok(
+                OrchestratorResult(
+                    success=terminal_status == SessionStatus.COMPLETED,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    summary=summary,
+                    messages_processed=messages_processed,
+                    final_message=final_message,
+                    duration_seconds=duration,
+                )
+            )
+
+        cancel_result = await self._session_repo.mark_cancelled(
+            session_id,
+            reason="Cancellation detected during execution",
+            cancelled_by="runner",
+        )
+        if cancel_result is not None and cancel_result.is_err:
+            log.warning(
+                "orchestrator.runner.mark_cancelled_failed",
+                session_id=session_id,
+                error=str(cancel_result.error),
+            )
 
         # Mirror cancellation into execution stream for TUI.
         await self._event_store.append(
@@ -1663,6 +1722,13 @@ class OrchestratorRunner:
             # Register session for cancellation tracking
             self._register_session(exec_id, tracker.session_id)
             session_registered = True
+            if await self._check_startup_cancellation(tracker.session_id):
+                return await self._handle_cancellation(
+                    session_id=tracker.session_id,
+                    execution_id=exec_id,
+                    messages_processed=0,
+                    start_time=start_time,
+                )
 
             # Build prompts with strategy. In compounding mode pin CLAUDE.md
             # into the system prefix so per-AC sessions inherit project
@@ -1731,6 +1797,20 @@ class OrchestratorRunner:
                     parallel_kwargs["resume_session_id"] = resume_session_id
 
                 return await self._execute_parallel(**parallel_kwargs)
+        except asyncio.CancelledError:
+            if session_registered and await is_cancellation_requested(tracker.session_id):
+                return await self._handle_cancellation(
+                    session_id=tracker.session_id,
+                    execution_id=exec_id,
+                    messages_processed=0,
+                    start_time=start_time,
+                )
+            self._cleanup_pre_execution_state(
+                exec_id,
+                tracker.session_id,
+                session_registered=session_registered,
+            )
+            raise
         except Exception as e:
             self._cleanup_pre_execution_state(
                 exec_id,
@@ -2083,6 +2163,18 @@ class OrchestratorRunner:
                 )
             )
 
+        except asyncio.CancelledError:
+            if await is_cancellation_requested(tracker.session_id):
+                return await self._handle_cancellation(
+                    session_id=tracker.session_id,
+                    execution_id=exec_id,
+                    messages_processed=messages_processed,
+                    start_time=start_time,
+                )
+            self._unregister_session(exec_id, tracker.session_id)
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
+            raise
         except Exception as e:
             log.exception(
                 "orchestrator.runner.execute_failed",
