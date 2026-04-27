@@ -864,8 +864,55 @@ def create_execution_terminal_event(
     )
 
 
+def create_ac_qa_evaluated_event(
+    session_id: str,
+    execution_id: str,
+    ac_index: int,
+    qa_attempt: int,
+    score: float,
+    verdict_label: str,
+    loop_action: str,
+    passed: bool,
+) -> BaseEvent:
+    """Create event emitted after each inline-QA evaluation in compounding mode.
+
+    Mirrors ``create_ac_postmortem_captured_event``'s naming convention.
+    Emitted on every QA call (pass, revise, fail, and skipped_delegated).
+
+    Args:
+        session_id: Parent session id.
+        execution_id: Execution id for event tracking.
+        ac_index: 0-based AC index.
+        qa_attempt: 1-based QA attempt number for this AC.
+        score: QA score (0.0 when skipped/delegated).
+        verdict_label: Raw verdict string from the QA judge (e.g. "pass", "revise").
+        loop_action: Loop-control action ("pass", "revise", "fail", "skipped_delegated").
+        passed: True when loop_action == "pass".
+
+    Returns:
+        BaseEvent for the QA evaluation.
+    """
+    return BaseEvent(
+        type="execution.ac.qa.evaluated",
+        aggregate_type="execution",
+        aggregate_id=f"ac_{ac_index}",
+        data={
+            "session_id": session_id,
+            "execution_id": execution_id,
+            "ac_index": ac_index,
+            "qa_attempt": qa_attempt,
+            "score": score,
+            "verdict_label": verdict_label,
+            "loop_action": loop_action,
+            "passed": passed,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 __all__ = [
     "create_ac_postmortem_captured_event",
+    "create_ac_qa_evaluated_event",
     "create_monolithic_resume_adjudicated_event",
     "create_postmortem_chain_truncated_event",
     "create_sub_postmortem_resume_event",

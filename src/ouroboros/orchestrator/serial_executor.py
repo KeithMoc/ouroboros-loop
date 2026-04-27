@@ -39,9 +39,14 @@ from ouroboros.orchestrator.diff_capture import (
 )
 from ouroboros.orchestrator.events import (
     create_ac_postmortem_captured_event,
+    create_ac_qa_evaluated_event,
     create_monolithic_resume_adjudicated_event,
     create_postmortem_chain_truncated_event,
     create_sub_postmortem_resume_event,
+)
+from ouroboros.orchestrator.inline_qa import (
+    _format_qa_feedback_section,
+    run_inline_qa,
 )
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
@@ -69,6 +74,7 @@ from ouroboros.orchestrator.parallel_executor_models import (
     ParallelExecutionResult,
     ParallelExecutionStageResult,
 )
+from ouroboros.mcp.tools.qa import QAHandler
 from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
@@ -966,6 +972,16 @@ class SerialCompoundingExecutor(ParallelACExecutor):
     differs.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize executor and create QAHandler for inline-QA.
+
+        All arguments are forwarded to :class:`ParallelACExecutor`.  The
+        ``_qa_handler`` instance is always created; it is only exercised when
+        ``inline_qa=True`` is passed to :meth:`execute_serial`.
+        """
+        super().__init__(*args, **kwargs)
+        self._qa_handler: QAHandler = QAHandler()
+
     async def execute_serial(
         self,
         seed: "Seed",
@@ -1331,11 +1347,10 @@ class SerialCompoundingExecutor(ParallelACExecutor):
             )
             self._flush_console()
 
-            # Q2: Capture pre-AC stash SHA so post-AC `git diff --stat` has a
-            # baseline.  Wrapped defensively — diff capture must NEVER fail
-            # the AC.  All known failure modes already return None inside
-            # capture_pre_ac_snapshot; the broad except guards against
-            # unforeseen errors and monkeypatched test stubs that may raise.
+            # Q2 + Q4: pre_sha captured ONCE per AC, BEFORE the QA retry loop.
+            # compute_diff_summary runs per attempt so the cumulative diff
+            # (pre_sha → HEAD) spans all retry commits per Q3=B add-on-commits
+            # design.  Wrapped defensively — diff capture must NEVER fail the AC.
             workspace_for_diff = Path(self._task_cwd or ".")
             try:
                 pre_sha = capture_pre_ac_snapshot(workspace_for_diff)
@@ -1348,57 +1363,204 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 )
                 pre_sha = None
 
-            try:
-                result = await self._execute_single_ac(
+            # Q4: QA retry loop — shared state across attempts.
+            # qa_verdict_for_feedback accumulates when a REVISE/FAIL verdict is
+            # received; it is injected into the next attempt's context_override.
+            qa_verdict_for_feedback: dict | None = None
+
+            for qa_attempt in range(max_qa_retries + 1):
+                # Build context for this attempt: base chain context plus any
+                # accumulated QA feedback from the PREVIOUS attempt.
+                context_for_attempt = context_section
+                if qa_verdict_for_feedback is not None:
+                    context_for_attempt = context_section + _format_qa_feedback_section(
+                        qa_verdict_for_feedback,
+                        attempt_number=qa_attempt,  # 1-based previous attempt number
+                        max_attempts=max_qa_retries + 1,
+                    )
+
+                try:
+                    result = await self._execute_single_ac(
+                        ac_index=ac_index,
+                        ac_content=ac_content,
+                        session_id=session_id,
+                        tools=tools,
+                        tool_catalog=tool_catalog,
+                        system_prompt=system_prompt,
+                        seed_goal=seed.goal,
+                        depth=0,
+                        execution_id=execution_id,
+                        level_contexts=None,
+                        sibling_acs=None,  # serial: no siblings
+                        retry_attempt=0,
+                        execution_counters=execution_counters,
+                        context_override=context_for_attempt,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.exception(
+                        "serial_executor.ac.unexpected_error",
+                        session_id=session_id,
+                        ac_index=ac_index,
+                        error=str(exc),
+                    )
+                    result = ACExecutionResult(
+                        ac_index=ac_index,
+                        ac_content=ac_content,
+                        success=False,
+                        error=f"unexpected executor error: {exc}",
+                        outcome=ACExecutionOutcome.FAILED,
+                    )
+
+                # Q2: Compute diff per attempt — spans pre_sha → HEAD naturally,
+                # covering all retry commits (add-on-commits / Q3=B design).
+                try:
+                    diff_summary = compute_diff_summary(pre_sha, workspace_for_diff)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "serial_executor.diff_capture.failed",
+                        reason="unexpected_exception",
+                        phase="diff",
+                        error=str(exc),
+                    )
+                    diff_summary = ""
+
+                postmortem = self._build_postmortem_from_result(
+                    result, workspace_root=self._task_cwd, diff_summary=diff_summary
+                )
+
+                # Q4: Skip QA when disabled or when the execution itself
+                # failed/stalled.  Failed/stalled ACs follow the existing
+                # FAILED-path below; QA on a stall result would judge out of context.
+                if not inline_qa or result.outcome != ACExecutionOutcome.SUCCEEDED:
+                    break
+
+                # Q4: Run inline QA against the completed postmortem.
+                inline_qa_outcome = await run_inline_qa(
+                    self._qa_handler,
+                    postmortem=postmortem,
                     ac_index=ac_index,
                     ac_content=ac_content,
-                    session_id=session_id,
-                    tools=tools,
-                    tool_catalog=tool_catalog,
-                    system_prompt=system_prompt,
-                    seed_goal=seed.goal,
-                    depth=0,
-                    execution_id=execution_id,
-                    level_contexts=None,
-                    sibling_acs=None,  # serial: no siblings
-                    retry_attempt=0,
-                    execution_counters=execution_counters,
-                    context_override=context_section,
+                    seed=seed,
+                    qa_session_id=f"qa-ac{ac_index}-{session_id[:8]}",
                 )
-            except Exception as exc:  # noqa: BLE001
-                log.exception(
-                    "serial_executor.ac.unexpected_error",
+
+                # Rebuild postmortem with QA verdict + attempt count.
+                # ACPostmortem is frozen — must reconstruct; qa_status finalized below.
+                postmortem = ACPostmortem(
+                    summary=postmortem.summary,
+                    diff_summary=postmortem.diff_summary,
+                    tool_trace_digest=postmortem.tool_trace_digest,
+                    gotchas=postmortem.gotchas,
+                    qa_suggestions=postmortem.qa_suggestions,
+                    invariants_established=postmortem.invariants_established,
+                    retry_attempts=postmortem.retry_attempts,
+                    status=postmortem.status,
+                    duration_seconds=postmortem.duration_seconds,
+                    ac_native_session_id=postmortem.ac_native_session_id,
+                    sub_postmortems=postmortem.sub_postmortems,
+                    qa_verdict=inline_qa_outcome.verdict_dict,
+                    qa_attempts=qa_attempt + 1,
+                )
+
+                # Emit QA evaluated event for observability.
+                _verdict_label = (
+                    inline_qa_outcome.verdict_dict.get("verdict", "")
+                    if inline_qa_outcome.verdict_dict
+                    else ""
+                )
+                await self._safe_emit_event(
+                    create_ac_qa_evaluated_event(
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        ac_index=ac_index,
+                        qa_attempt=qa_attempt + 1,
+                        score=inline_qa_outcome.score,
+                        verdict_label=_verdict_label,
+                        loop_action=inline_qa_outcome.loop_action,
+                        passed=inline_qa_outcome.loop_action == "pass",
+                    )
+                )
+
+                log.info(
+                    "serial_executor.inline_qa.evaluated",
                     session_id=session_id,
                     ac_index=ac_index,
-                    error=str(exc),
+                    qa_attempt=qa_attempt + 1,
+                    score=inline_qa_outcome.score,
+                    loop_action=inline_qa_outcome.loop_action,
                 )
-                result = ACExecutionResult(
+
+                if inline_qa_outcome.loop_action == "pass":
+                    # PASS — finalize with qa_status="passed" and exit loop.
+                    postmortem = ACPostmortem(
+                        summary=postmortem.summary,
+                        diff_summary=postmortem.diff_summary,
+                        tool_trace_digest=postmortem.tool_trace_digest,
+                        gotchas=postmortem.gotchas,
+                        qa_suggestions=postmortem.qa_suggestions,
+                        invariants_established=postmortem.invariants_established,
+                        retry_attempts=postmortem.retry_attempts,
+                        status=postmortem.status,
+                        duration_seconds=postmortem.duration_seconds,
+                        ac_native_session_id=postmortem.ac_native_session_id,
+                        sub_postmortems=postmortem.sub_postmortems,
+                        qa_verdict=postmortem.qa_verdict,
+                        qa_attempts=postmortem.qa_attempts,
+                        qa_status="passed",
+                    )
+                    break
+
+                if inline_qa_outcome.loop_action == "skipped_delegated":
+                    # Plugin-dispatch path or handler error — skip QA gracefully.
+                    postmortem = ACPostmortem(
+                        summary=postmortem.summary,
+                        diff_summary=postmortem.diff_summary,
+                        tool_trace_digest=postmortem.tool_trace_digest,
+                        gotchas=postmortem.gotchas,
+                        qa_suggestions=postmortem.qa_suggestions,
+                        invariants_established=postmortem.invariants_established,
+                        retry_attempts=postmortem.retry_attempts,
+                        status=postmortem.status,
+                        duration_seconds=postmortem.duration_seconds,
+                        ac_native_session_id=postmortem.ac_native_session_id,
+                        sub_postmortems=postmortem.sub_postmortems,
+                        qa_verdict=postmortem.qa_verdict,
+                        qa_attempts=postmortem.qa_attempts,
+                        qa_status="skipped_delegated",
+                    )
+                    break
+
+                # REVISE or FAIL — save feedback dict for next attempt's injection.
+                qa_verdict_for_feedback = inline_qa_outcome.verdict_dict
+
+            else:
+                # Q4=B soft-pass: budget exhausted without a PASS verdict.
+                # Keep the last attempt's postmortem; mark qa_status='exhausted'.
+                # A flaky LLM judge cannot nuke a long compounding chain.
+                postmortem = ACPostmortem(
+                    summary=postmortem.summary,
+                    diff_summary=postmortem.diff_summary,
+                    tool_trace_digest=postmortem.tool_trace_digest,
+                    gotchas=postmortem.gotchas,
+                    qa_suggestions=postmortem.qa_suggestions,
+                    invariants_established=postmortem.invariants_established,
+                    retry_attempts=postmortem.retry_attempts,
+                    status=postmortem.status,
+                    duration_seconds=postmortem.duration_seconds,
+                    ac_native_session_id=postmortem.ac_native_session_id,
+                    sub_postmortems=postmortem.sub_postmortems,
+                    qa_verdict=postmortem.qa_verdict,
+                    qa_attempts=postmortem.qa_attempts,
+                    qa_status="exhausted",
+                )
+                log.info(
+                    "serial_executor.inline_qa.exhausted",
+                    session_id=session_id,
                     ac_index=ac_index,
-                    ac_content=ac_content,
-                    success=False,
-                    error=f"unexpected executor error: {exc}",
-                    outcome=ACExecutionOutcome.FAILED,
+                    qa_attempts=postmortem.qa_attempts,
                 )
 
             results.append(result)
-
-            # Q2: Compute diff_summary against the post-AC snapshot.  Any
-            # failure inside compute_diff_summary already returns "";
-            # the broad except is a final safety net.
-            try:
-                diff_summary = compute_diff_summary(pre_sha, workspace_for_diff)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "serial_executor.diff_capture.failed",
-                    reason="unexpected_exception",
-                    phase="diff",
-                    error=str(exc),
-                )
-                diff_summary = ""
-
-            postmortem = self._build_postmortem_from_result(
-                result, workspace_root=self._task_cwd, diff_summary=diff_summary
-            )
 
             # Q3 (C-plus): Extract [[INVARIANT: ...]] tags inline-blocking before
             # chain advance so the next AC's prompt sees verified invariants.
@@ -1463,6 +1625,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         duration_seconds=postmortem.duration_seconds,
                         ac_native_session_id=postmortem.ac_native_session_id,
                         sub_postmortems=postmortem.sub_postmortems,
+                        qa_verdict=postmortem.qa_verdict,
+                        qa_status=postmortem.qa_status,
+                        qa_attempts=postmortem.qa_attempts,
                     )
                     min_rel = _get_min_reliability()
                     above_threshold = sum(
