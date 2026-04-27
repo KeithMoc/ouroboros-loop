@@ -602,6 +602,10 @@ class ACPostmortem:
     duration_seconds: float = 0.0
     ac_native_session_id: str | None = None
     sub_postmortems: tuple["ACPostmortem", ...] = field(default_factory=tuple)
+    # Q4 inline-QA fields — default None/0 preserves forward-compat with old chains
+    qa_verdict: dict[str, Any] | None = None
+    qa_status: str | None = None  # None | "passed" | "exhausted" | "skipped_delegated"
+    qa_attempts: int = 0
 
     def to_digest(
         self,
@@ -663,6 +667,14 @@ class ACPostmortem:
                 extra_inv = len(visible_invs) - 2
                 inv_str = inv_head + (f" (+{extra_inv} more)" if extra_inv > 0 else "")
                 parts.append(f"invariants: {inv_str}")
+
+        # Q4 inline-QA suffix — omitted when qa_status is None (default / inline_qa off)
+        if self.qa_status is not None:
+            if self.qa_status == "exhausted":
+                score = (self.qa_verdict or {}).get("score", 0.0)
+                parts.append(f"QA: exhausted (score={score:.2f})")
+            else:
+                parts.append(f"QA: {self.qa_status}")
 
         return " | ".join(parts)
 
@@ -1185,6 +1197,9 @@ def _deserialize_postmortem(d: dict[str, Any]) -> ACPostmortem:
         duration_seconds=d.get("duration_seconds", 0.0),
         ac_native_session_id=d.get("ac_native_session_id"),
         sub_postmortems=tuple(sub),
+        qa_verdict=d.get("qa_verdict"),
+        qa_status=d.get("qa_status"),
+        qa_attempts=d.get("qa_attempts", 0),
     )
 
 

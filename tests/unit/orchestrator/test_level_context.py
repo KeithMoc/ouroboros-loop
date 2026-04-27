@@ -19,6 +19,7 @@ from ouroboros.orchestrator.level_context import (
     POSTMORTEM_DEFAULT_TOKEN_BUDGET,
     PostmortemChain,
     _build_public_api_summary,
+    _deserialize_postmortem,
     _extract_public_api,
     build_context_prompt,
     build_postmortem_chain_prompt,
@@ -2728,3 +2729,104 @@ class TestInvariantFullLifecycle:
         # Canonical text from first occurrence preserved (AC-2 B-prime flattening)
         assert merged[0].text == "api_token header is required"
         assert merged[0].first_seen_ac_id == "ac_0_sub_1"
+
+
+class TestACPostmortemQAFields:
+    """Tests 18-23: Q4 inline-QA fields on ACPostmortem.
+
+    These tests verify the three new fields (qa_verdict, qa_status,
+    qa_attempts), their serialization round-trip, forward-compat
+    deserialization from old chains, and the to_digest QA suffix.
+    """
+
+    def _make_summary(self, ac_index: int = 0, content: str = "Test AC") -> ACContextSummary:
+        return ACContextSummary(ac_index=ac_index, ac_content=content, success=True)
+
+    # Test 18 — Default construction yields None/0 for all qa_* fields
+    def test_18_acpostmortem_default_qa_fields(self) -> None:
+        """ACPostmortem(summary=...) constructs with default qa_verdict=None,
+        qa_status=None, qa_attempts=0."""
+        summary = self._make_summary()
+        pm = ACPostmortem(summary=summary)
+        assert pm.qa_verdict is None
+        assert pm.qa_status is None
+        assert pm.qa_attempts == 0
+
+    # Test 19 — serialize → deserialize round-trip preserves qa_* fields
+    def test_19_serialize_deserialize_roundtrip_qa_fields(self) -> None:
+        """serialize_postmortem_chain → deserialize_postmortem_chain
+        round-trip preserves qa_verdict (dict), qa_status (str), qa_attempts (int)."""
+        summary = self._make_summary()
+        verdict_dict = {
+            "score": 0.88,
+            "verdict": "pass",
+            "dimensions": {"correctness": 0.9},
+            "differences": [],
+            "suggestions": ["add type hints"],
+            "reasoning": "Looks good.",
+        }
+        pm = ACPostmortem(
+            summary=summary,
+            qa_verdict=verdict_dict,
+            qa_status="passed",
+            qa_attempts=2,
+        )
+        chain = PostmortemChain(postmortems=(pm,))
+        serialized = serialize_postmortem_chain(chain)
+        chain2 = deserialize_postmortem_chain(serialized)
+        pm2 = chain2.postmortems[0]
+
+        assert pm2.qa_verdict == verdict_dict
+        assert pm2.qa_status == "passed"
+        assert pm2.qa_attempts == 2
+
+    # Test 20 — Forward-compat: old chain dict missing all qa_* keys → defaults
+    def test_20_deserialize_old_chain_missing_qa_keys_yields_defaults(self) -> None:
+        """_deserialize_postmortem with a dict missing all three qa_* keys
+        (forward-compat: old serialized chain) yields ACPostmortem with defaults."""
+        old_dict: dict = {
+            "summary": {
+                "ac_index": 0,
+                "ac_content": "Old-format AC without QA fields",
+                "success": True,
+            },
+            "status": "pass",
+            "diff_summary": "some diff",
+        }
+        pm = _deserialize_postmortem(old_dict)
+        assert pm.qa_verdict is None
+        assert pm.qa_status is None
+        assert pm.qa_attempts == 0
+
+    # Test 21 — to_digest with qa_status="passed" appends " | QA: passed"
+    def test_21_to_digest_passed_appends_qa_suffix(self) -> None:
+        """to_digest with qa_status='passed' appends ' | QA: passed'."""
+        summary = self._make_summary(content="Implement feature X")
+        pm = ACPostmortem(summary=summary, qa_status="passed", qa_attempts=1)
+        digest = pm.to_digest()
+        assert "| QA: passed" in digest
+        # Ensure the suffix is correctly formatted
+        assert digest.endswith("| QA: passed")
+
+    # Test 22 — to_digest with qa_status="exhausted" + qa_verdict score
+    def test_22_to_digest_exhausted_appends_score_suffix(self) -> None:
+        """to_digest with qa_status='exhausted' + qa_verdict={'score': 0.62}
+        appends ' | QA: exhausted (score=0.62)'."""
+        summary = self._make_summary(content="Implement feature Y")
+        pm = ACPostmortem(
+            summary=summary,
+            qa_status="exhausted",
+            qa_verdict={"score": 0.62, "verdict": "fail"},
+            qa_attempts=2,
+        )
+        digest = pm.to_digest()
+        assert "| QA: exhausted (score=0.62)" in digest
+        assert digest.endswith("| QA: exhausted (score=0.62)")
+
+    # Test 23 — to_digest with qa_status=None (default) appends nothing
+    def test_23_to_digest_none_qa_status_no_suffix(self) -> None:
+        """to_digest with qa_status=None (default) appends nothing."""
+        summary = self._make_summary(content="Implement feature Z")
+        pm = ACPostmortem(summary=summary)
+        digest = pm.to_digest()
+        assert "QA:" not in digest
