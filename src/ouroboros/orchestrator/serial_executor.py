@@ -1510,6 +1510,27 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         qa_attempts=prior_qa_attempts,
                     )
 
+                # ----- Inline QA (Q4) — parent-only by design -----
+                #
+                # QA fires at the PARENT AC level only. Sub-ACs created by
+                # _try_decompose_ac (parallel_executor.py:2169) are NOT
+                # independently QA'd. This is intentional, not a TODO:
+                #
+                #   1. Sub-ACs are agent-derived from the parent's content.
+                #      The seed provides acceptance criteria only at the parent
+                #      AC level — sub-AC QA would have no crisp pass/fail bar.
+                #   2. Sub-AC work flows into the parent's diff via the
+                #      commit-per-AC pattern AND into the parent's invariants
+                #      via Q3's sub-postmortem flatten path (see lines ~1703-
+                #      1722). The parent's QA verdict therefore judges the
+                #      sum-of-sub-AC outcome.
+                #   3. Inline-retry on parent QA fail re-decomposes the whole
+                #      parent (Q4 cycle-1 default). Deferred end-of-run sweep
+                #      mode is tracked as Q4.2 in the master brainstorm doc.
+                #
+                # See docs/brainstorm/phase-2-q4.1-hardening-design.md (AC-1)
+                # for the full design rationale.
+
                 # Q4: Skip QA when disabled or when the execution itself
                 # failed/stalled.  Failed/stalled ACs follow the existing
                 # FAILED-path below; QA on a stall result would judge out of context.

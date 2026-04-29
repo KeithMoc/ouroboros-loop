@@ -7473,12 +7473,23 @@ class TestInlineQAIntegration:
 
 
     @pytest.mark.asyncio
-    async def test_inline_qa_decomposed_ac_parent_only(self) -> None:
-        """10. Decomposed AC: QA runs once on parent, not per sub-AC. Sub-postmortems qa_status=None.
+    async def test_inline_qa_parent_only_is_intentional(self) -> None:
+        """Parent-only QA on decomposed ACs is deliberate, not a gap.
 
-        QA is called PARENT-AC only: sub-results are already aggregated into
-        parent.sub_postmortems by _build_postmortem_from_result; only the
-        parent-level QA evaluation runs once.
+        Sub-ACs created by _try_decompose_ac are agent-derived from
+        the parent's content and have no independent acceptance
+        criteria. Per Q4.1 design (docs/brainstorm/phase-2-q4.1-
+        hardening-design.md, AC-1), QA fires at the parent level
+        only. This test pins that contract.
+
+        Substrate detail: sub-results are already aggregated into
+        parent.sub_postmortems by _build_postmortem_from_result; the
+        parent-level QA verdict therefore judges the sum-of-sub-AC
+        outcome via the cumulative diff and Q3's sub-postmortem
+        flatten path.
+
+        See: docs/brainstorm/phase-2-q4-inline-qa-design.md (Q4
+        cycle-1 substrate reasoning).
         """
         seed = _make_seed("Decomposed AC with 3 sub-ACs")
         executor = _make_executor()
