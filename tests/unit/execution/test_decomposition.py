@@ -401,27 +401,20 @@ class TestDecomposeAc:
         assert result.is_err
         assert result.error.error_type == "insufficient_children"
 
-    @pytest.mark.asyncio
-    async def test_context_compression_at_depth(self, mock_llm_adapter):
-        """decompose_ac() should compress context at depth >= 3."""
-        from ouroboros.execution.decomposition import decompose_ac
+    def test_context_compression_at_depth(self):
+        """_compress_context should compress at depth >= COMPRESSION_DEPTH."""
+        from ouroboros.execution.decomposition import (
+            COMPRESSION_DEPTH,
+            _compress_context,
+        )
 
         long_insights = "A" * 1000
 
-        await decompose_ac(
-            ac_content="Test AC",
-            ac_id="ac_parent",
-            execution_id="exec_123",
-            depth=3,
-            llm_adapter=mock_llm_adapter,
-            discover_insights=long_insights,
-        )
+        compressed = _compress_context(long_insights, depth=COMPRESSION_DEPTH)
+        assert "[compressed for depth]" in compressed
 
-        # Check that LLM was called with compressed insights
-        call_args = mock_llm_adapter.complete.call_args
-        messages = call_args[0][0]
-        user_message = messages[1].content
-        assert "[compressed for depth]" in user_message
+        passthrough = _compress_context(long_insights, depth=COMPRESSION_DEPTH - 1)
+        assert passthrough == long_insights
 
     @pytest.mark.asyncio
     async def test_child_ids_are_unique(self, mock_llm_adapter):
@@ -458,10 +451,10 @@ class TestDecompositionConstants:
         assert MAX_CHILDREN == 5
 
     def test_max_depth_is_5(self):
-        """MAX_DEPTH should be 5."""
+        """MAX_DEPTH should be 2."""
         from ouroboros.execution.decomposition import MAX_DEPTH
 
-        assert MAX_DEPTH == 5
+        assert MAX_DEPTH == 2
 
     def test_compression_depth_is_3(self):
         """COMPRESSION_DEPTH should be 3."""

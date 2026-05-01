@@ -210,6 +210,7 @@ Inside AI coding agent sessions, use `ooo <cmd>` skills. From the terminal, use 
 | `ooo evolve`     | *(via MCP)*                                                       | Evolutionary loop until ontology converges                   |
 | `ooo unstuck`    | *(via MCP)*                                                       | 5 lateral thinking personas when you are stuck               |
 | `ooo status`     | `ouroboros status executions` / `ouroboros status execution <id>` | Session tracking + (MCP-only) drift detection                |
+| `ooo resume-session` | `ouroboros resume`                                           | List in-flight sessions and re-attach commands              |
 | `ooo cancel`     | `ouroboros cancel execution [<id>\|--all]`                        | Cancel stuck or orphaned executions                          |
 | `ooo ralph`      | *(via MCP)*                                                       | Persistent loop until verified                               |
 | `ooo tutorial`   | *(interactive)*                                                   | Interactive hands-on learning                                |
@@ -217,10 +218,11 @@ Inside AI coding agent sessions, use `ooo <cmd>` skills. From the terminal, use 
 | `ooo pm`         | *(via MCP)*                                                       | PM-focused interview + PRD generation                        |
 | `ooo qa`         | *(via skill)*                                                     | General-purpose QA verdict for any artifact                  |
 | `ooo update`     | `ouroboros update`                                                | Check for updates + upgrade to latest                        |
-| `ooo brownfield` | *(via skill)*                                                     | Scan and manage brownfield repo defaults                     |
+| `ooo brownfield` | *(via skill)*                                                     | Scan and manage brownfield repo/worktree defaults            |
 | `ooo publish`    | *(skill/runtime surface; uses `gh` CLI)*                          | Publish a Seed as GitHub Epic/Task issues for team workflows |
 
 > Not all skills have direct CLI equivalents. Some (`evaluate`, `evolve`, `unstuck`, `ralph`, `publish`) are available through agent skills, runtime rules, or MCP tools rather than a direct `ouroboros <subcommand>` shell command.
+> `/resume` is reserved for Claude Code's built-in session picker; use `ooo resume-session` for Ouroboros in-flight sessions.
 
 See the [CLI reference](./docs/cli-reference.md) for full details.
 

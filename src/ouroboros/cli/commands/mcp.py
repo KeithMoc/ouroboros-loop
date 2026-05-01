@@ -35,6 +35,7 @@ class AgentRuntimeBackend(str, Enum):  # noqa: UP042
     CODEX = "codex"
     OPENCODE = "opencode"
     HERMES = "hermes"
+    GEMINI = "gemini"
 
 
 class LLMBackend(str, Enum):  # noqa: UP042
@@ -44,6 +45,7 @@ class LLMBackend(str, Enum):  # noqa: UP042
     LITELLM = "litellm"
     CODEX = "codex"
     OPENCODE = "opencode"
+    GEMINI = "gemini"
 
 
 def _write_pid_file() -> bool:
@@ -195,6 +197,7 @@ async def _run_mcp_server(
 
     from ouroboros.mcp.server.adapter import create_ouroboros_server, validate_transport
     from ouroboros.orchestrator.session import SessionRepository
+    from ouroboros.persistence.brownfield import BrownfieldStore
     from ouroboros.persistence.event_store import EventStore
 
     # Validate transport early, before any expensive startup work
@@ -212,38 +215,38 @@ async def _run_mcp_server(
     # Create EventStore with custom path if provided
     if db_path:
         event_store = EventStore(f"sqlite+aiosqlite:///{db_path}")
+        brownfield_store = BrownfieldStore(f"sqlite+aiosqlite:///{db_path}")
     else:
         event_store = EventStore()
+        brownfield_store = BrownfieldStore()
 
     cleanup_task: asyncio.Task[None] | None = None
 
-    # Initialize the event store up front because the MCP server uses it for
-    # request handling. Orphan cleanup is intentionally deferred into the
-    # background so large SQLite histories do not block the initial MCP
-    # handshake on startup (#304).
-    try:
-        await event_store.initialize()
-    except Exception as e:
-        # Auto-cleanup is best-effort — don't prevent server from starting
-        _console_out.print(f"[yellow]Warning: auto-cleanup failed: {e}[/yellow]")
-    else:
-        repo = SessionRepository(event_store)
+    # Initialize the persistent stores up front. The MCP server uses both for
+    # request handling, so a partial init must surface as a clean startup
+    # failure rather than a server that runs with a half-initialized store.
+    await event_store.initialize()
+    await brownfield_store.initialize()
 
-        async def _run_startup_cleanup() -> None:
-            try:
-                cancelled = await repo.cancel_orphaned_sessions()
-                if cancelled:
-                    _console_out.print(
-                        f"[yellow]Auto-cancelled {len(cancelled)} orphaned session(s)[/yellow]"
-                    )
-            except Exception as e:
-                # Auto-cleanup is best-effort — don't prevent server startup
-                _console_out.print(f"[yellow]Warning: auto-cleanup failed: {e}[/yellow]")
+    # Orphan cleanup is intentionally deferred into the background so large
+    # SQLite histories do not block the initial MCP handshake on startup (#304).
+    repo = SessionRepository(event_store)
 
-        cleanup_task = asyncio.create_task(
-            _run_startup_cleanup(),
-            name="ouroboros-mcp-startup-cleanup",
-        )
+    async def _run_startup_cleanup() -> None:
+        try:
+            cancelled = await repo.cancel_orphaned_sessions()
+            if cancelled:
+                _console_out.print(
+                    f"[yellow]Auto-cancelled {len(cancelled)} orphaned session(s)[/yellow]"
+                )
+        except Exception as e:
+            # Auto-cleanup is best-effort — don't prevent server startup
+            _console_out.print(f"[yellow]Warning: auto-cleanup failed: {e}[/yellow]")
+
+    cleanup_task = asyncio.create_task(
+        _run_startup_cleanup(),
+        name="ouroboros-mcp-startup-cleanup",
+    )
 
     # Auto-discover and connect MCP bridge for server-to-server communication
     from ouroboros.mcp.bridge import create_bridge_from_env
@@ -267,6 +270,7 @@ async def _run_mcp_server(
         name="ouroboros-mcp",
         version="1.0.0",
         event_store=event_store,
+        brownfield_store=brownfield_store,
         runtime_backend=runtime_backend,
         llm_backend=llm_backend,
         mcp_bridge=mcp_bridge,
@@ -369,7 +373,7 @@ def serve(
         typer.Option(
             "--llm-backend",
             help=(
-                "LLM backend for interview/seed/evaluation tools (claude_code, litellm, codex, or opencode)."
+                "LLM backend for interview/seed/evaluation tools (claude_code, litellm, codex, opencode, or gemini)."
             ),
             case_sensitive=False,
         ),
@@ -459,7 +463,7 @@ def info(
         typer.Option(
             "--llm-backend",
             help=(
-                "LLM backend for interview/seed/evaluation tools (claude_code, litellm, codex, or opencode)."
+                "LLM backend for interview/seed/evaluation tools (claude_code, litellm, codex, opencode, or gemini)."
             ),
             case_sensitive=False,
         ),

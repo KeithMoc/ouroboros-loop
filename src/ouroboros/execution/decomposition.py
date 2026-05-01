@@ -56,7 +56,7 @@ log = get_logger(__name__)
 # Decomposition constraints
 MIN_CHILDREN = 2
 MAX_CHILDREN = 5
-MAX_DEPTH = 5
+MAX_DEPTH = 2
 COMPRESSION_DEPTH = 3
 
 

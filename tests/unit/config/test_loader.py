@@ -25,8 +25,10 @@ from ouroboros.config.loader import (
     get_decomposition_model,
     get_dependency_analysis_model,
     get_double_diamond_model,
+    get_gemini_cli_path,
     get_llm_backend,
     get_llm_permission_mode,
+    get_max_parallel_workers,
     get_ontology_analysis_model,
     get_opencode_cli_path,
     get_qa_model,
@@ -249,6 +251,51 @@ class TestLoadConfig:
         error_message = str(exc_info.value)
         assert "default_tier" in error_message or "economics" in error_message
 
+    def test_load_config_single_validation_error_sets_config_key(self, tmp_path: Path) -> None:
+        """Single-field validation errors should be self-classifying."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "orchestrator": {
+                "max_parallel_workers": 0,
+            }
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+
+        error = exc_info.value
+        assert error.config_key == "orchestrator.max_parallel_workers"
+        assert error.details["config_keys"] == ["orchestrator.max_parallel_workers"]
+
+    def test_load_config_multiple_validation_errors_leave_config_key_unset(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Multi-field validation failures should keep all keys in details."""
+        config_path = tmp_path / "config.yaml"
+        config_content = {
+            "economics": {
+                "default_tier": "invalid_tier",
+            },
+            "orchestrator": {
+                "max_parallel_workers": 0,
+            },
+        }
+        with config_path.open("w") as f:
+            yaml.dump(config_content, f)
+
+        with pytest.raises(ConfigError) as exc_info:
+            load_config(config_path)
+
+        error = exc_info.value
+        assert error.config_key is None
+        assert set(error.details["config_keys"]) == {
+            "economics.default_tier",
+            "orchestrator.max_parallel_workers",
+        }
+
     def test_load_config_empty_file(self, tmp_path: Path) -> None:
         """load_config handles empty file (uses defaults)."""
         config_path = tmp_path / "config.yaml"
@@ -410,6 +457,62 @@ class TestRuntimeHelperLookups:
         ):
             assert get_opencode_cli_path() == "/tmp/opencode"
 
+    def test_get_gemini_cli_path_returns_executable_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Env var path is returned when it points to an executable file."""
+        fake = tmp_path / "gemini"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setenv("OUROBOROS_GEMINI_CLI_PATH", str(fake))
+        assert get_gemini_cli_path() == str(fake)
+
+    def test_get_gemini_cli_path_rejects_stale_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stale env var that doesn't point to an executable is treated as missing.
+
+        Prevents writing an unusable path back into config via
+        `ouroboros config backend gemini` / `setup --runtime gemini`.
+        """
+        stale = tmp_path / "missing-gemini"
+        monkeypatch.setenv("OUROBOROS_GEMINI_CLI_PATH", str(stale))
+        with patch(
+            "ouroboros.config.loader.load_config",
+            return_value=OuroborosConfig(orchestrator=OrchestratorConfig()),
+        ):
+            assert get_gemini_cli_path() is None
+
+    def test_get_gemini_cli_path_falls_back_to_config(self, tmp_path: Path) -> None:
+        """Config path is honored when env is absent and the file is executable."""
+        fake = tmp_path / "gemini"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(gemini_cli_path=str(fake))
+                ),
+            ),
+        ):
+            assert get_gemini_cli_path() == str(fake)
+
+    def test_get_gemini_cli_path_rejects_stale_config(self, tmp_path: Path) -> None:
+        """Stale config value that no longer points to an executable returns None."""
+        stale = tmp_path / "ghost-gemini"
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "ouroboros.config.loader.load_config",
+                return_value=OuroborosConfig(
+                    orchestrator=OrchestratorConfig(gemini_cli_path=str(stale))
+                ),
+            ),
+        ):
+            assert get_gemini_cli_path() is None
+
     def test_get_opencode_mode_returns_config_value(self) -> None:
         """get_opencode_mode reads orchestrator.opencode_mode from config."""
         from ouroboros.config.loader import get_opencode_mode
@@ -506,6 +609,182 @@ class TestRuntimeHelperLookups:
             ),
         ):
             assert get_agent_permission_mode(backend="opencode") == "bypassPermissions"
+
+    def test_get_max_parallel_workers_prefers_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Environment variable overrides config for max parallel workers."""
+        monkeypatch.setenv("OUROBOROS_MAX_PARALLEL_WORKERS", "5")
+
+        assert get_max_parallel_workers() == 5
+
+    @pytest.mark.parametrize("env_value", ["0", "-1", "five"])
+    def test_get_max_parallel_workers_rejects_invalid_env(
+        self,
+        env_value: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invalid environment values fail instead of silently using the default."""
+        monkeypatch.setenv("OUROBOROS_MAX_PARALLEL_WORKERS", env_value)
+
+        with pytest.raises(ConfigError) as exc_info:
+            get_max_parallel_workers()
+
+        assert exc_info.value.config_key == "OUROBOROS_MAX_PARALLEL_WORKERS"
+        assert "OUROBOROS_MAX_PARALLEL_WORKERS" in str(exc_info.value)
+
+    def test_get_max_parallel_workers_falls_back_to_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Config is used when env override is absent for max parallel workers."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  max_parallel_workers: 5\n", encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 5
+
+    @pytest.mark.parametrize(
+        "config_content",
+        [
+            "economics:\n  default_tier: invalid_tier\n",
+            "orchestrator:\n  runtime_backend: invalid_backend\n",
+        ],
+    )
+    def test_get_max_parallel_workers_ignores_unrelated_invalid_config(
+        self,
+        config_content: str,
+        tmp_path: Path,
+    ) -> None:
+        """Worker-cap lookup should not validate unrelated config sections."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            config_content,
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 3
+
+    @pytest.mark.parametrize(
+        "config_content",
+        [
+            "economics:\n  default_tier: invalid_tier\norchestrator:\n  max_parallel_workers: 5\n",
+            "orchestrator:\n  runtime_backend: invalid_backend\n  max_parallel_workers: 5\n",
+        ],
+    )
+    def test_get_max_parallel_workers_reads_cap_despite_unrelated_invalid_config(
+        self,
+        config_content: str,
+        tmp_path: Path,
+    ) -> None:
+        """A valid worker cap should not be blocked by unrelated invalid fields."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            config_content,
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 5
+
+    def test_get_max_parallel_workers_defaults_when_config_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The built-in default is used only when no config source is present."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+        ):
+            assert get_max_parallel_workers() == 3
+
+    @pytest.mark.parametrize("config_value", ["0", "five"])
+    def test_get_max_parallel_workers_rejects_invalid_config(
+        self,
+        config_value: str,
+        tmp_path: Path,
+    ) -> None:
+        """Invalid config values fail instead of silently using the default."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            f"orchestrator:\n  max_parallel_workers: {config_value}\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert exc_info.value.config_key == "orchestrator.max_parallel_workers"
+        assert "max_parallel_workers" in str(exc_info.value)
+
+    def test_get_max_parallel_workers_rejects_malformed_config_yaml(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Malformed config YAML should still fail clearly."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  max_parallel_workers: [\n", encoding="utf-8")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert "Failed to parse configuration file" in str(exc_info.value)
+
+    def test_get_max_parallel_workers_normalizes_directory_at_config_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A directory at the config path should surface as ConfigError, not OSError."""
+        config_path = tmp_path / "config.yaml"
+        config_path.mkdir()
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert "Failed to read configuration file" in str(exc_info.value)
+        assert exc_info.value.details["error_type"] == "IsADirectoryError"
+
+    def test_get_max_parallel_workers_normalizes_os_error_on_open(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Any OSError from opening the config file should surface as ConfigError."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("orchestrator:\n  max_parallel_workers: 5\n", encoding="utf-8")
+
+        def _raise_os_error(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError(13, "Permission denied")
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("ouroboros.config.loader.get_config_dir", return_value=tmp_path),
+            patch.object(Path, "open", _raise_os_error),
+            pytest.raises(ConfigError) as exc_info,
+        ):
+            get_max_parallel_workers()
+
+        assert "Failed to read configuration file" in str(exc_info.value)
+        assert exc_info.value.details["error_type"] == "PermissionError"
 
 
 class TestLLMHelperLookups:

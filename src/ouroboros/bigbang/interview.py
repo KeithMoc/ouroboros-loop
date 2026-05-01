@@ -159,9 +159,6 @@ class InterviewState(BaseModel):
         """Get the current round number (1-based)."""
         return len(self.rounds) + 1
 
-    # Mirrors AMBIGUITY_THRESHOLD from ambiguity.py to avoid circular import.
-    _SEED_READY_THRESHOLD: float = 0.2
-
     @property
     def is_complete(self) -> bool:
         """Check if interview is marked complete (user-controlled)."""
@@ -182,18 +179,13 @@ class InterviewState(BaseModel):
     def can_reopen(self) -> bool:
         """True when a completed interview should be reopenable.
 
-        A completed interview is reopenable when it is missing a required
-        long-context summary, or when its stored ambiguity score exceeds the
-        seed-generation threshold — i.e. it was completed prematurely and is
-        now in a deadlock (can't generate seed, can't resume).
+        Any completed interview is reopenable: the main session is the final
+        gate on seed-ready (see Seed-ready Acceptance Guard in skills/interview/
+        SKILL.md). When it sends another answer, it is explicitly challenging
+        the prior closure — the stored ambiguity score is no longer trustworthy
+        and must be re-evaluated against the extended round history.
         """
-        return self.is_complete and (
-            self.needs_initial_context_summary
-            or (
-                self.ambiguity_score is not None
-                and self.ambiguity_score > self._SEED_READY_THRESHOLD
-            )
-        )
+        return self.is_complete
 
     def mark_updated(self) -> None:
         """Update the updated_at timestamp."""
@@ -288,7 +280,7 @@ class InterviewEngine:
     state_dir: Path = field(default_factory=lambda: Path.home() / ".ouroboros" / "data")
     model: str = field(default_factory=get_clarification_model)
     temperature: float = 0.7
-    max_tokens: int = 512
+    max_tokens: int = 2048
     _MAX_TOTAL_PROMPT_CHARS = 4800
     _MAX_SYSTEM_PROMPT_CHARS = 3500
     _MIN_SYSTEM_PROMPT_CHARS = 1200
@@ -476,12 +468,21 @@ class InterviewEngine:
                         value=state.status,
                     )
                 )
-            # Deadlock recovery: reopen when completed prematurely
+            prior_ambiguity = state.ambiguity_score
+            prior_streak = state.completion_candidate_streak
             state.status = InterviewStatus.IN_PROGRESS
+            state.clear_stored_ambiguity()
+            # The completion-candidate streak is the other half of the cached
+            # closure decision (authoring_handlers auto-completes when
+            # streak >= AUTO_COMPLETE_STREAK_REQUIRED). Leaving it intact would
+            # let the reopened session auto-close after a single qualifying
+            # score instead of rebuilding the required two-signal stability.
+            state.completion_candidate_streak = 0
             log.info(
-                "interview.reopened_for_ambiguity",
+                "interview.reopened",
                 interview_id=state.interview_id,
-                ambiguity_score=state.ambiguity_score,
+                prior_ambiguity_score=prior_ambiguity,
+                prior_completion_candidate_streak=prior_streak,
             )
 
         # Create new round
@@ -732,48 +733,19 @@ class InterviewEngine:
         from pydantic import ValidationError as PydanticValidationError
 
         from ouroboros.bigbang.ambiguity import (
-            AMBIGUITY_THRESHOLD,
-            AUTO_COMPLETE_STREAK_REQUIRED,
-            SEED_CLOSER_ACTIVATION_THRESHOLD,
             AmbiguityScore,
             ScoreBreakdown,
             get_completion_floor_failures,
             get_milestone,
-            get_next_milestone,
         )
 
         milestone, milestone_desc = get_milestone(state.ambiguity_score)
-        next_ms = get_next_milestone(state.ambiguity_score)
 
         lines = [
             "## Current Ambiguity Snapshot",
             f"- Overall ambiguity: {state.ambiguity_score:.2f}",
             f"- Milestone: **{milestone.value.upper()}** — {milestone_desc}",
         ]
-        if next_ms is not None:
-            lines.append(
-                f"- Next milestone: {next_ms[1].value} (<= {next_ms[0]:.1f}) — {next_ms[2]}"
-            )
-        lines.extend(
-            [
-                f"- Seed-ready threshold: {AMBIGUITY_THRESHOLD:.2f}",
-                f"- Closure-mode threshold: {SEED_CLOSER_ACTIVATION_THRESHOLD:.2f}",
-                (
-                    "- Seed-ready now: yes"
-                    if state.ambiguity_score <= AMBIGUITY_THRESHOLD
-                    else "- Seed-ready now: no"
-                ),
-                (
-                    "- Closure mode active: yes"
-                    if state.ambiguity_score <= SEED_CLOSER_ACTIVATION_THRESHOLD
-                    else "- Closure mode active: no"
-                ),
-                (
-                    "- Completion candidate streak: "
-                    f"{state.completion_candidate_streak}/{AUTO_COMPLETE_STREAK_REQUIRED}"
-                ),
-            ]
-        )
 
         reconstructed_score: AmbiguityScore | None = None
         if isinstance(state.ambiguity_breakdown, dict):
@@ -812,16 +784,15 @@ class InterviewEngine:
                 is_brownfield=state.is_brownfield,
             )
             if floor_failures:
-                lines.append(f"- Completion floors unmet: {'; '.join(floor_failures)}")
+                lines.append(f"- Per-dimension gaps: {'; '.join(floor_failures)}")
+                lines.append(
+                    "- Keep drilling those dimensions before asking a closure-style question, "
+                    "even when overall ambiguity reads low."
+                )
             else:
-                lines.append("- Completion floors: passed")
+                lines.append("- Per-dimension gaps: none")
 
-        lines.append(
-            "- Use this snapshot to drill into the weakest area until closure mode is active."
-        )
-        lines.append(
-            "- A single seed-ready score is not enough to end the interview; require sustained clarity before asking a closure question."
-        )
+        lines.append("- Drill into the weakest area with a concrete, scenario-grounded question.")
         return "\n".join(lines)
 
     def _select_perspectives(self, state: InterviewState) -> tuple[InterviewPerspective, ...]:

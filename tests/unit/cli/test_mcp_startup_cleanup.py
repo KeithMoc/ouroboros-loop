@@ -42,6 +42,27 @@ def _make_tracker(
 class TestMCPStartupAutoCleanup:
     """Tests for auto-cleanup during MCP server startup (_run_mcp_server)."""
 
+    @pytest.fixture(autouse=True)
+    def _stub_brownfield_store(self):
+        """Stub ``BrownfieldStore`` for every test in this class.
+
+        ``_run_mcp_server()`` always constructs and initializes a
+        ``BrownfieldStore`` after PR #487. Without this stub, tests that do
+        not patch it explicitly would open and migrate the real default DB
+        at ``~/.ouroboros/ouroboros.db``, making the unit tests stateful and
+        unsafe in environments where ``$HOME`` is not writable. Tests that
+        need a custom stub (e.g. to simulate init failure) can override by
+        patching ``ouroboros.persistence.brownfield.BrownfieldStore`` again
+        inside the test — the inner patch wins for its scope.
+        """
+        mock_brownfield = AsyncMock()
+        mock_brownfield.initialize = AsyncMock()
+        with patch(
+            "ouroboros.persistence.brownfield.BrownfieldStore",
+            return_value=mock_brownfield,
+        ):
+            yield mock_brownfield
+
     def _create_patches(
         self,
         mock_event_store: AsyncMock | None = None,
@@ -302,8 +323,10 @@ class TestMCPStartupAutoCleanup:
         mock_server.serve.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_cleanup_failure_does_not_prevent_startup(self) -> None:
-        """Test that auto-cleanup failure doesn't block server startup."""
+    async def test_event_store_init_failure_aborts_startup(self) -> None:
+        """Persistent-store init failures must surface — the server cannot
+        safely run with a half-initialized store, so the failure propagates
+        instead of being swallowed and the server never starts serving."""
         mock_es, _, mock_server = self._create_patches()
         mock_es.initialize = AsyncMock(side_effect=Exception("DB connection failed"))
 
@@ -316,21 +339,45 @@ class TestMCPStartupAutoCleanup:
                 "ouroboros.mcp.server.adapter.create_ouroboros_server",
                 return_value=mock_server,
             ),
-            patch("ouroboros.cli.commands.mcp._stderr_console") as mock_console,
         ):
-
-            async def serve_side_effect(*args, **kwargs) -> None:
-                await asyncio.sleep(0)
-
-            mock_server.serve.side_effect = serve_side_effect
-
             from ouroboros.cli.commands.mcp import _run_mcp_server
 
-            await _run_mcp_server("localhost", 8080, "stdio")
+            with pytest.raises(Exception, match="DB connection failed"):
+                await _run_mcp_server("localhost", 8080, "stdio")
 
-        mock_server.serve.assert_called_once()
-        warning_calls = [str(call) for call in mock_console.print.call_args_list]
-        assert any("auto-cleanup failed" in call for call in warning_calls)
+        mock_server.serve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_brownfield_store_init_failure_aborts_startup(self) -> None:
+        """Regression for PR #487: a failed shared brownfield-store init must
+        abort startup rather than wedge brownfield MCP access until restart."""
+        mock_es, _, mock_server = self._create_patches()
+
+        mock_brownfield = AsyncMock()
+        mock_brownfield.initialize = AsyncMock(side_effect=Exception("brownfield migration failed"))
+
+        with (
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=mock_es,
+            ),
+            patch(
+                "ouroboros.persistence.brownfield.BrownfieldStore",
+                return_value=mock_brownfield,
+            ),
+            patch(
+                "ouroboros.mcp.server.adapter.create_ouroboros_server",
+                return_value=mock_server,
+            ),
+        ):
+            from ouroboros.cli.commands.mcp import _run_mcp_server
+
+            with pytest.raises(Exception, match="brownfield migration failed"):
+                await _run_mcp_server("localhost", 8080, "stdio")
+
+        mock_es.initialize.assert_awaited_once()
+        mock_brownfield.initialize.assert_awaited_once()
+        mock_server.serve.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_cancel_orphaned_sessions_failure_does_not_block(self) -> None:

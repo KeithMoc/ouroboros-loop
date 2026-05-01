@@ -12,6 +12,7 @@ from ouroboros.bigbang.brownfield import (
     _SKIP_DIRS,
     BrownfieldEntry,
     _has_github_origin,
+    _has_origin_remote,
     _read_readme_content,
     generate_desc,
     register_repo,
@@ -21,6 +22,44 @@ from ouroboros.bigbang.brownfield import (
 )
 from ouroboros.core.errors import ProviderError
 from ouroboros.persistence.brownfield import BrownfieldRepo, BrownfieldStore
+
+
+def _git(args: list[str], cwd: Path | None = None) -> None:
+    """Run a git command for tests and fail with stderr on errors."""
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _init_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(["init", str(repo)])
+    _git(
+        [
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test User",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        cwd=repo,
+    )
+
+
+def _init_repo_with_origin(
+    repo: Path,
+    origin: str = "https://github.com/user/repo.git",
+) -> None:
+    _init_repo(repo)
+    _git(["remote", "add", "origin", origin], cwd=repo)
+
 
 # ── BrownfieldEntry (re-exported BrownfieldRepo) ──────────────────
 
@@ -68,8 +107,8 @@ class TestBrownfieldEntry:
 # ── _has_github_origin ─────────────────────────────────────────────
 
 
-class TestHasGithubOrigin:
-    """Tests for _has_github_origin helper."""
+class TestHasOriginRemote:
+    """Tests for origin-remote helpers."""
 
     def test_returns_true_for_github_origin(self, tmp_path: Path) -> None:
         # Create a real git repo with a GitHub origin
@@ -86,9 +125,10 @@ class TestHasGithubOrigin:
             ],
             capture_output=True,
         )
+        assert _has_origin_remote(tmp_path) is True
         assert _has_github_origin(tmp_path) is True
 
-    def test_returns_false_for_non_github_origin(self, tmp_path: Path) -> None:
+    def test_returns_true_only_for_origin_remote_on_non_github_origin(self, tmp_path: Path) -> None:
         subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
         subprocess.run(
             [
@@ -102,13 +142,50 @@ class TestHasGithubOrigin:
             ],
             capture_output=True,
         )
+        assert _has_origin_remote(tmp_path) is True
+        assert _has_github_origin(tmp_path) is False
+
+    def test_github_helper_returns_true_for_ssh_origin(self, tmp_path: Path) -> None:
+        subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:user/repo.git",
+            ],
+            capture_output=True,
+        )
+        assert _has_origin_remote(tmp_path) is True
+        assert _has_github_origin(tmp_path) is True
+
+    def test_github_helper_rejects_lookalike_hosts(self, tmp_path: Path) -> None:
+        subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com.example.com/user/repo.git",
+            ],
+            capture_output=True,
+        )
+        assert _has_origin_remote(tmp_path) is True
         assert _has_github_origin(tmp_path) is False
 
     def test_returns_false_for_no_origin(self, tmp_path: Path) -> None:
         subprocess.run(["git", "init", str(tmp_path)], capture_output=True)
+        assert _has_origin_remote(tmp_path) is False
         assert _has_github_origin(tmp_path) is False
 
     def test_returns_false_for_non_git_dir(self, tmp_path: Path) -> None:
+        assert _has_origin_remote(tmp_path) is False
         assert _has_github_origin(tmp_path) is False
 
 
@@ -118,8 +195,8 @@ class TestHasGithubOrigin:
 class TestScanHomeForRepos:
     """Tests for scan_home_for_repos."""
 
-    def test_finds_github_repos(self, tmp_path: Path) -> None:
-        # Create a repo with GitHub origin
+    def test_finds_repos_with_non_origin_remote(self, tmp_path: Path) -> None:
+        # Create a repo with a remote whose name is not "origin".
         repo = tmp_path / "my-project"
         repo.mkdir()
         subprocess.run(["git", "init", str(repo)], capture_output=True)
@@ -130,8 +207,8 @@ class TestScanHomeForRepos:
                 str(repo),
                 "remote",
                 "add",
-                "origin",
-                "git@github.com:user/my-project.git",
+                "upstream",
+                "https://dev.azure.com/org/project/_git/my-project",
             ],
             capture_output=True,
         )
@@ -141,17 +218,50 @@ class TestScanHomeForRepos:
         assert result[0]["path"] == str(repo.resolve())
         assert result[0]["name"] == "my-project"
 
-    def test_skips_non_github_repos(self, tmp_path: Path) -> None:
-        repo = tmp_path / "gitlab-proj"
-        repo.mkdir()
-        subprocess.run(["git", "init", str(repo)], capture_output=True)
-        subprocess.run(
-            ["git", "-C", str(repo), "remote", "add", "origin", "https://gitlab.com/user/repo.git"],
-            capture_output=True,
-        )
+    def test_finds_worktree_seed_with_git_file_without_expanding_family(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        main = tmp_path / "main"
+        linked = tmp_path / "linked-worktrees" / "task"
+        sibling = tmp_path / "other-worktrees" / "sibling"
+        linked.parent.mkdir(parents=True)
+        sibling.parent.mkdir(parents=True)
+        _init_repo(main)
+        _git(["worktree", "add", "-b", "task", str(linked)], cwd=main)
+        _git(["worktree", "add", "-b", "sibling", str(sibling)], cwd=main)
+
+        result = scan_home_for_repos(linked.parent)
+
+        paths = {r["path"] for r in result}
+        assert paths == {str(linked.resolve())}
+
+    def test_includes_git_reported_worktrees_without_crawling_hidden_dirs(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        main = tmp_path / "projects" / "main"
+        managed_worktree = tmp_path / ".ouroboros" / "worktrees" / "main" / "task"
+        unlinked_hidden_repo = tmp_path / ".ouroboros" / "worktrees" / "unlinked"
+        managed_worktree.parent.mkdir(parents=True)
+        _init_repo(main)
+        _git(["worktree", "add", "-b", "task", str(managed_worktree)], cwd=main)
+        _init_repo(unlinked_hidden_repo)
 
         result = scan_home_for_repos(tmp_path)
-        assert len(result) == 0
+
+        paths = {r["path"] for r in result}
+        assert paths == {str(main.resolve()), str(managed_worktree.resolve())}
+
+    def test_finds_local_repos_without_remotes(self, tmp_path: Path) -> None:
+        repo = tmp_path / "local-proj"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], capture_output=True)
+
+        result = scan_home_for_repos(tmp_path)
+        assert len(result) == 1
+        assert result[0]["path"] == str(repo.resolve())
+        assert result[0]["name"] == "local-proj"
 
     def test_prunes_subdirectories_after_git_found(self, tmp_path: Path) -> None:
         # Parent repo
@@ -993,8 +1103,14 @@ class TestScanAndRegisterMocked:
         store.update_is_default.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_mocked_scan_empty_returns_store_list(self) -> None:
-        """When scan finds no repos, returns store.list() (may have pre-registered)."""
+    async def test_mocked_scan_empty_returns_empty_list(self) -> None:
+        """An empty scan must not leak previously-registered repos into the result.
+
+        scan_and_register is boundary-sensitive: callers (CLI, MCP) display its
+        return value as "what this scan discovered." Returning the full DB on an
+        empty scan would falsely report unrelated repos as if they were just
+        found. Callers that need the full registry must call store.list() directly.
+        """
         store = AsyncMock(spec=BrownfieldStore)
         pre_registered = [BrownfieldRepo(path="/existing", name="existing")]
         store.list.return_value = pre_registered
@@ -1005,9 +1121,30 @@ class TestScanAndRegisterMocked:
         ):
             result = await scan_and_register(store, root=Path("/fake"))
 
-        assert len(result) == 1
-        assert result[0].path == "/existing"
+        assert result == []
+        store.register.assert_not_called()
         store.bulk_register.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mocked_scan_returns_only_scanned_repos(self) -> None:
+        """Result must contain only repos discovered by THIS scan, not the whole DB."""
+        fake_repos = [{"path": "/scanned", "name": "scanned"}]
+        store = AsyncMock(spec=BrownfieldStore)
+        store.register.return_value = BrownfieldRepo(path="/scanned", name="scanned")
+        # store.list() includes both the scanned repo AND an unrelated, manually
+        # registered repo outside the scan root.
+        store.list.return_value = [
+            BrownfieldRepo(path="/scanned", name="scanned"),
+            BrownfieldRepo(path="/manual/outside", name="outside"),
+        ]
+
+        with patch(
+            "ouroboros.bigbang.brownfield.scan_home_for_repos",
+            return_value=fake_repos,
+        ):
+            result = await scan_and_register(store, root=Path("/fake"))
+
+        assert {r.path for r in result} == {"/scanned"}
 
     @pytest.mark.asyncio
     async def test_mocked_scan_llm_adapter_not_called(self) -> None:

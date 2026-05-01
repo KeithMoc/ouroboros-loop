@@ -7,6 +7,7 @@ import pytest
 from ouroboros.router import (
     MCPDispatchTarget,
     NormalizedMCPFrontmatter,
+    ParsedOooCommand,
     Resolved,
     ResolveOutcome,
     ResolveRequest,
@@ -148,6 +149,25 @@ def test_valid_dispatch_inputs_normalize_to_canonical_runtime_metadata(
     assert result.outcome is ResolveOutcome.MATCH
 
 
+def test_valid_dispatch_normalizes_trailing_line_ending_on_single_line_argument(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_dispatchable_skill(skills_dir, "run")
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt='ooo run "seed file.yaml"\r\n',
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.first_argument == "seed file.yaml"
+    assert result.mcp_args["seed_path"] == "seed file.yaml"
+
+
 @pytest.mark.parametrize(
     ("prompt", "expected_prefix"),
     [
@@ -247,6 +267,243 @@ def test_valid_router_dispatch_forms_resolve_expected_parsed_dispatch_fields(
         mcp_args=expected_args,
     )
     assert result.outcome is ResolveOutcome.MATCH
+
+
+def test_valid_dispatch_preserves_multiline_inline_seed_payload(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    skill_md_path = _write_dispatchable_skill(skills_dir, "run")
+    runtime_cwd = tmp_path / "workspace"
+    seed_content = "goal: test\nconstraints:\n  - keep it simple\nacceptance_criteria:\n  - works"
+    prompt = f"/ouroboros:run\n{seed_content}"
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=prompt,
+            cwd=runtime_cwd,
+            skills_dir=skills_dir,
+        )
+    )
+
+    expected_args = {
+        "seed_path": seed_content,
+        "cwd": str(runtime_cwd),
+        "combined": f"cwd={runtime_cwd} seed={seed_content}",
+        "nested": {
+            "values": [
+                seed_content,
+                str(runtime_cwd),
+                True,
+            ],
+        },
+    }
+    _assert_resolved_payload(
+        result,
+        Resolved(
+            skill_name="run",
+            command_prefix="/ouroboros:run",
+            prompt=prompt,
+            skill_path=skill_md_path,
+            mcp_tool="ouroboros_execute_seed",
+            mcp_args=expected_args,
+            first_argument=seed_content,
+        ),
+    )
+    assert result.outcome is ResolveOutcome.MATCH
+
+
+def test_valid_dispatch_preserves_multiline_inline_seed_leading_whitespace(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_dispatchable_skill(skills_dir, "run")
+    seed_content = "  goal: test\n  constraints:\n    - keep it simple"
+    prompt = f"/ouroboros:run\n{seed_content}"
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=prompt,
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.first_argument == seed_content
+    assert result.mcp_args["seed_path"] == seed_content
+
+
+def test_valid_parsed_dispatch_reconstructs_multiline_prompt_with_newline_separator(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_dispatchable_skill(skills_dir, "run")
+    seed_content = "goal: test\nconstraints:\n  - keep it simple"
+    parsed = ParsedOooCommand(
+        skill_name="run",
+        command_prefix="/ouroboros:run",
+        remainder=seed_content,
+    )
+
+    result = resolve_skill_dispatch(parsed, cwd=tmp_path, skills_dir=skills_dir)
+
+    assert isinstance(result, Resolved)
+    assert result.prompt == f"/ouroboros:run\n{seed_content}"
+    assert result.first_argument == seed_content
+    assert result.mcp_args["seed_path"] == seed_content
+
+
+def test_valid_dispatch_preserves_windows_drive_letter_path_payload(tmp_path: Path) -> None:
+    """Windows drive-letter literal paths must reach ``$1`` with backslashes intact.
+
+    Without a Windows-literal carve-out the single-line path falls through to
+    ``shlex.split``, which treats ``\\`` as an escape character and silently
+    drops it. ``C:\\temp\\seed.yaml --strict`` would dispatch as
+    ``C:tempseed.yaml --strict``. This regression goes end-to-end through
+    ``resolve_skill_dispatch`` so the actual ``mcp_args`` payload is asserted
+    against the verbatim path, not just the prompt echo.
+    """
+    skills_dir = tmp_path / "skills"
+    skill_md_path = _write_dispatchable_skill(skills_dir, "run")
+    runtime_cwd = tmp_path / "workspace"
+    prompt = r"ooo run C:\temp\seed.yaml --strict"
+    expected_argument = r"C:\temp\seed.yaml --strict"
+    expected_args = {
+        "seed_path": expected_argument,
+        "cwd": str(runtime_cwd),
+        "combined": f"cwd={runtime_cwd} seed={expected_argument}",
+        "nested": {
+            "values": [
+                expected_argument,
+                str(runtime_cwd),
+                True,
+            ],
+        },
+    }
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=prompt,
+            cwd=runtime_cwd,
+            skills_dir=skills_dir,
+        )
+    )
+
+    _assert_resolved_payload(
+        result,
+        Resolved(
+            skill_name="run",
+            command_prefix="ooo run",
+            prompt=prompt,
+            skill_path=skill_md_path,
+            mcp_tool="ouroboros_execute_seed",
+            mcp_args=expected_args,
+            first_argument=expected_argument,
+        ),
+    )
+
+
+def test_valid_dispatch_preserves_windows_unc_path_payload(tmp_path: Path) -> None:
+    """Windows UNC literal paths (``\\\\server\\share\\…``) must keep their backslashes."""
+    skills_dir = tmp_path / "skills"
+    skill_md_path = _write_dispatchable_skill(skills_dir, "run")
+    runtime_cwd = tmp_path / "workspace"
+    prompt = r"ooo run \\server\share\seed.yaml --strict"
+    expected_argument = r"\\server\share\seed.yaml --strict"
+    expected_args = {
+        "seed_path": expected_argument,
+        "cwd": str(runtime_cwd),
+        "combined": f"cwd={runtime_cwd} seed={expected_argument}",
+        "nested": {
+            "values": [
+                expected_argument,
+                str(runtime_cwd),
+                True,
+            ],
+        },
+    }
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=prompt,
+            cwd=runtime_cwd,
+            skills_dir=skills_dir,
+        )
+    )
+
+    _assert_resolved_payload(
+        result,
+        Resolved(
+            skill_name="run",
+            command_prefix="ooo run",
+            prompt=prompt,
+            skill_path=skill_md_path,
+            mcp_tool="ouroboros_execute_seed",
+            mcp_args=expected_args,
+            first_argument=expected_argument,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_argument"),
+    [
+        pytest.param(
+            r'ooo run "C:\Program Files\app\seed.yaml" --strict',
+            r"C:\Program Files\app\seed.yaml --strict",
+            id="quoted-drive-with-spaces",
+        ),
+        pytest.param(
+            r'ooo run "\\server\share\dir name\seed.yaml" --strict',
+            r"\\server\share\dir name\seed.yaml --strict",
+            id="quoted-unc-with-spaces",
+        ),
+        pytest.param(
+            r"ooo run 'C:\Program Files\app\seed.yaml' --strict",
+            r"C:\Program Files\app\seed.yaml --strict",
+            id="single-quoted-drive-with-spaces",
+        ),
+        pytest.param(
+            r"ooo run '\\server\share\dir name\seed.yaml' --strict",
+            r"\\server\share\dir name\seed.yaml --strict",
+            id="single-quoted-unc-with-spaces",
+        ),
+        pytest.param(
+            r'ooo run "C:\Program Files\app\seed.yaml"',
+            r"C:\Program Files\app\seed.yaml",
+            id="quoted-drive-without-tail",
+        ),
+        pytest.param(
+            r'ooo run "C:\Program Files\app\seed.yaml" --label "two words"',
+            r"C:\Program Files\app\seed.yaml --label two words",
+            id="quoted-drive-with-quoted-tail-shell-normalized",
+        ),
+    ],
+)
+def test_valid_dispatch_preserves_quoted_windows_path_backslashes(
+    tmp_path: Path,
+    prompt: str,
+    expected_argument: str,
+) -> None:
+    """Windows literal paths wrapped in quotes (the natural form for paths
+    containing spaces) must reach ``$1`` with backslashes intact, not be
+    silently corrupted by POSIX ``shlex``."""
+    skills_dir = tmp_path / "skills"
+    runtime_cwd = tmp_path / "workspace"
+    _write_dispatchable_skill(skills_dir, "run")
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=prompt,
+            cwd=runtime_cwd,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.first_argument == expected_argument
+    assert result.mcp_args["seed_path"] == expected_argument
 
 
 def test_valid_dispatch_without_argument_normalizes_first_argument_template_to_empty_string(

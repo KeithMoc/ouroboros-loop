@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ouroboros.core.seed import (
+    BrownfieldContext,
+    ContextReference,
     EvaluationPrinciple,
     ExitCondition,
     OntologyField,
@@ -107,6 +109,33 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt(sample_seed)
         assert "completeness" in prompt
         assert "All requirements are met" in prompt
+        assert "(weight" not in prompt
+
+    def test_system_prompt_leaves_acceptance_criteria_to_task_prompt(
+        self, sample_seed: Seed
+    ) -> None:
+        """System prompt should not duplicate task-level acceptance criteria."""
+        system_prompt = build_system_prompt(sample_seed)
+        task_prompt = build_task_prompt(sample_seed)
+
+        assert "## Acceptance Criteria" not in system_prompt
+        for criterion in sample_seed.acceptance_criteria:
+            assert criterion not in system_prompt
+            assert criterion in task_prompt
+
+    def test_includes_seed_contract_ontology_lens(self, sample_seed: Seed) -> None:
+        """System prompt renders Seed ontology as an execution contract lens."""
+        prompt = build_system_prompt(sample_seed)
+
+        assert "## Seed Contract" in prompt
+        assert "## Ontology / Conceptual Lens" in prompt
+        assert "conceptual lens for execution decisions" in prompt
+        assert "It is not a mandatory output outline." in prompt
+        assert "Name: TaskManager" in prompt
+        assert "Description: Task management ontology" in prompt
+        assert "- tasks [array]: List of tasks (required concept)" in prompt
+        assert "closer to the Seed's intended outcome" in prompt
+        assert "Do not force the final artifact to mirror these fields" in prompt
 
     def test_includes_self_recovery_protocol(self, sample_seed: Seed) -> None:
         """Run prompts should tell agents how to change strategy when stuck."""
@@ -187,6 +216,53 @@ class TestBuildSystemPrompt:
         # The full 20KB input must not appear verbatim.
         assert giant not in prompt
 
+    def test_handles_empty_ontology_fields(self) -> None:
+        """Ontology lens renders cleanly even when no concepts are listed."""
+        seed = Seed(
+            goal="Test goal",
+            constraints=(),
+            acceptance_criteria=("AC1",),
+            ontology_schema=OntologySchema(
+                name="TestOntology",
+                description="A minimal ontology",
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.1),
+        )
+
+        prompt = build_system_prompt(seed)
+
+        assert "## Ontology / Conceptual Lens" in prompt
+        assert "Name: TestOntology" in prompt
+        assert "Description: A minimal ontology" in prompt
+        assert "Concepts:" not in prompt
+        assert "When execution decisions are ambiguous:" in prompt
+
+    def test_includes_brownfield_context(self, sample_seed: Seed) -> None:
+        """System prompt preserves brownfield project references and constraints."""
+        seed = sample_seed.model_copy(
+            update={
+                "brownfield_context": BrownfieldContext(
+                    project_type="brownfield",
+                    context_references=(
+                        ContextReference(
+                            path="/repo/app",
+                            role="primary",
+                            summary="Main application repository",
+                        ),
+                    ),
+                    existing_patterns=("Use repository service classes",),
+                    existing_dependencies=("sqlalchemy",),
+                )
+            }
+        )
+
+        prompt = build_system_prompt(seed)
+
+        assert "## Existing Codebase Context (BROWNFIELD)" in prompt
+        assert "[PRIMARY] /repo/app: Main application repository" in prompt
+        assert "Use repository service classes" in prompt
+        assert "sqlalchemy" in prompt
+
 
 class TestBuildTaskPrompt:
     """Tests for build_task_prompt function."""
@@ -209,6 +285,13 @@ class TestBuildTaskPrompt:
         assert "1." in prompt
         assert "2." in prompt
         assert "3." in prompt
+
+    def test_does_not_duplicate_system_ontology_lens(self, sample_seed: Seed) -> None:
+        """Task prompt remains focused on concrete acceptance criteria."""
+        prompt = build_task_prompt(sample_seed)
+
+        assert "## Ontology / Conceptual Lens" not in prompt
+        assert "conceptual lens for execution decisions" not in prompt
 
 
 class TestOrchestratorResult:

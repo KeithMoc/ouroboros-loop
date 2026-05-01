@@ -4,7 +4,7 @@ Standalone setup that works in any terminal — not just inside Claude Code.
 Detects available runtimes and configures Ouroboros accordingly.
 
 Also provides brownfield repository management subcommands:
-    ouroboros setup scan         Re-scan home directory for repos
+    ouroboros setup scan [ROOT]  Re-scan a root directory for repos/worktrees
     ouroboros setup list         List registered brownfield repos
     ouroboros setup default      Toggle default brownfield repos
 """
@@ -159,11 +159,25 @@ def _get_current_backend() -> str | None:
 
 
 def _detect_runtimes() -> dict[str, str | None]:
-    """Detect available runtime CLIs in PATH."""
+    """Detect available runtime CLIs in PATH.
+
+    For Gemini, we additionally honor the explicit-path overrides
+    (``OUROBOROS_GEMINI_CLI_PATH`` and persisted ``orchestrator.gemini_cli_path``)
+    so that users with non-PATH installs are still detected.
+    """
     runtimes: dict[str, str | None] = {}
     for name in ("claude", "codex", "opencode", "hermes"):
         path = shutil.which(name)
         runtimes[name] = path
+
+    # Gemini: prefer explicit-path config (env var / config.yaml) over PATH.
+    try:
+        from ouroboros.config import get_gemini_cli_path
+
+        gemini_path = get_gemini_cli_path()
+    except Exception:
+        gemini_path = None
+    runtimes["gemini"] = gemini_path or shutil.which("gemini")
     return runtimes
 
 
@@ -438,6 +452,51 @@ def _setup_hermes(hermes_path: str) -> None:
 
     # Register MCP server
     _register_hermes_mcp_server()
+
+
+def _setup_gemini(gemini_path: str) -> None:
+    """Configure Ouroboros for the Gemini CLI runtime.
+
+    Gemini is a base-package runtime — it does not require the ``[claude]``
+    extra (or any provider-specific extra) to function, so the MCP entry is
+    not rewritten as part of this flow. Users who want the Gemini runtime to
+    drive the MCP server can keep their existing entry; switching the
+    ``orchestrator.runtime_backend`` is sufficient.
+    """
+    from ouroboros.config.loader import create_default_config, ensure_config_dir
+
+    config_dir = ensure_config_dir()
+    config_path = config_dir / "config.yaml"
+
+    if config_path.exists():
+        config_dict = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    else:
+        create_default_config(config_dir)
+        config_dict = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+
+    if not isinstance(config_dict, dict):
+        print_warning("~/.ouroboros/config.yaml top-level is not a mapping — resetting.")
+        config_dict = {}
+
+    orch = config_dict.get("orchestrator")
+    if not isinstance(orch, dict):
+        orch = {}
+        config_dict["orchestrator"] = orch
+    orch["runtime_backend"] = "gemini"
+    orch["gemini_cli_path"] = gemini_path
+
+    # Gemini also serves as an LLM-only backend for interview/seed/eval flows.
+    llm = config_dict.get("llm")
+    if not isinstance(llm, dict):
+        llm = {}
+        config_dict["llm"] = llm
+    llm["backend"] = "gemini"
+
+    with config_path.open("w", encoding="utf-8") as f:
+        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
+    print_success(f"Configured Gemini runtime (CLI: {gemini_path})")
+    print_info(f"Config saved to: {config_path}")
 
 
 def _setup_claude(claude_path: str) -> None:
@@ -1075,19 +1134,23 @@ def _prompt_repo_selection(
 # ── Brownfield async core logic ──────────────────────────────────
 
 
-async def _scan_and_register_repos() -> list[dict]:
-    """Scan home directory and register repos in DB.
+async def _scan_and_register_repos(scan_root: Path | None = None) -> list[dict]:
+    """Scan a root directory and register repos/worktrees in DB.
 
     Uses upsert semantics so that manually-registered repos outside the
-    scan root are preserved across re-scans.
+    scan root are preserved across re-scans. Git-reported linked worktrees for
+    discovered normal repo roots may be registered even when they live outside
+    the scan root. A linked worktree inside the scan root is registered itself
+    but does not pull its main/sibling worktrees outside the scan root.
 
     Returns:
         List of repo dicts with path, name, desc, is_default.
     """
+    scan_root = scan_root or Path.home()
     store = BrownfieldStore()
     try:
         await store.initialize()
-        repos = await scan_and_register(store)
+        repos = await scan_and_register(store, root=scan_root)
         return [
             {
                 "path": r.path,
@@ -1165,7 +1228,7 @@ def setup(
         typer.Option(
             "--runtime",
             "-r",
-            help="Runtime backend to configure (claude, codex, opencode, hermes).",
+            help="Runtime backend to configure (claude, codex, opencode, hermes, gemini).",
         ),
     ] = None,
     non_interactive: Annotated[
@@ -1258,7 +1321,8 @@ def setup(
                 "  • Claude Code: https://claude.ai/download\n"
                 "  • Codex CLI:   npm install -g @openai/codex\n"
                 "  • OpenCode:    npm install -g opencode-ai\n"
-                "  • Hermes CLI:  https://hermes.ai/cli"
+                "  • Hermes CLI:  https://hermes.ai/cli\n"
+                "  • Gemini CLI:  npm install -g @google/gemini-cli"
             )
             raise typer.Exit(1)
 
@@ -1313,6 +1377,16 @@ def setup(
             print_error("Hermes CLI not found in PATH.")
             raise typer.Exit(1)
         _setup_hermes(hermes_path)
+    elif selected in ("gemini", "gemini_cli"):
+        gemini_path = available.get("gemini")
+        if not gemini_path:
+            print_error(
+                "Gemini CLI not found.\n"
+                "Install it (npm install -g @google/gemini-cli), set "
+                "OUROBOROS_GEMINI_CLI_PATH, or configure orchestrator.gemini_cli_path."
+            )
+            raise typer.Exit(1)
+        _setup_gemini(gemini_path)
     else:
         print_error(f"Unsupported runtime: {selected}")
         raise typer.Exit(1)
@@ -1327,16 +1401,33 @@ def setup(
 
 
 @app.command()
-def scan() -> None:
-    """Re-scan home directory and register new repos.
+def scan(
+    scan_root: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Root directory for the brownfield scan. Defaults to the current user's home directory.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            resolve_path=True,
+        ),
+    ] = None,
+) -> None:
+    """Re-scan a root directory and register new repos.
 
-    Scans ~/ for git repos with GitHub origins and updates the
-    brownfield registry. Existing repos are preserved (upsert).
+    Scans the requested root for valid seed git repos/worktrees and updates the
+    brownfield registry. Linked worktrees reported by normal repo roots may be
+    registered even when they live outside the scan root. A linked worktree
+    found inside the scan root is registered itself but does not pull its
+    main/sibling worktrees outside the scan root. Local repos and repos with any
+    remote name are eligible. Existing repos are preserved (upsert).
     """
+    effective_scan_root = scan_root or Path.home()
     console.print("\n[bold cyan]Brownfield Scan[/]\n")
 
     try:
-        repos = asyncio.run(_run_scan_only())
+        repos = asyncio.run(_run_scan_only(effective_scan_root))
     except KeyboardInterrupt:
         print_info("\nScan interrupted.")
         raise typer.Exit(code=0)
@@ -1349,10 +1440,10 @@ def scan() -> None:
     _display_repos_table(repos)
 
 
-async def _run_scan_only() -> list[dict]:
+async def _run_scan_only(scan_root: Path) -> list[dict]:
     """Scan and register, returning repo list."""
-    with console.status("[cyan]Scanning home directory...[/]", spinner="dots"):
-        return await _scan_and_register_repos()
+    with console.status("[cyan]Scanning scan root and linked worktrees...[/]", spinner="dots"):
+        return await _scan_and_register_repos(scan_root)
 
 
 @app.command(name="list")

@@ -3,9 +3,9 @@
 Provides an ``ouroboros_brownfield`` MCP tool for managing brownfield
 repository registrations in the SQLite database. Supports four actions:
 
-- **scan** — Scan home directory for git repos with GitHub origins and
-  register them in the DB. Optionally generates one-line descriptions
-  via a Frugal-tier LLM.
+- **scan** — Walk a caller-supplied root (or the home directory by
+  default) for seed repos/worktrees, include Git-reported linked worktrees
+  from normal repo roots, and register discovered local repositories in the DB.
 - **register** — Manually register a single repository by path.
 - **query** — List all registered repos or get the current default.
 - **set_default** — Set a registered repo as the default brownfield context.
@@ -15,6 +15,7 @@ Follows the action-dispatch pattern from ``pm_handler.py``.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,7 @@ class BrownfieldHandler:
 
     Manages brownfield repository registrations with action-based dispatch:
 
-    - ``scan`` — Walk ``~/`` for GitHub repos and register them.
+    - ``scan`` — Walk a scan root for seed repos/worktrees and register them.
     - ``register`` — Manually register one repo.
     - ``query`` — List repos or fetch the default.
     - ``set_default`` — Set a repo as the default brownfield context.
@@ -83,6 +84,10 @@ class BrownfieldHandler:
     """
 
     _store: BrownfieldStore | None = field(default=None, repr=False)
+    _store_ready: bool = field(default=False, repr=False)
+    _store_owned: bool = field(default=False, repr=False)
+    _init_lock: asyncio.Lock | None = field(default=None, repr=False)
+    _refcount: int = field(default=0, repr=False)
 
     @property
     def definition(self) -> MCPToolDefinition:
@@ -158,7 +163,10 @@ class BrownfieldHandler:
                 MCPToolParameter(
                     name="scan_root",
                     type=ToolInputType.STRING,
-                    description=("Root directory for 'scan' action. Defaults to ~/."),
+                    description=(
+                        "Existing directory to walk for the 'scan' action. "
+                        "Defaults to the current user's home directory."
+                    ),
                     required=False,
                 ),
                 MCPToolParameter(
@@ -191,13 +199,37 @@ class BrownfieldHandler:
         )
 
     async def _get_store(self) -> BrownfieldStore:
-        """Return the injected store or create and initialize a new one."""
-        if self._store is not None:
+        """Return the injected store or create and initialize a new one.
+
+        ``_store_ready`` flips to ``True`` only after a successful
+        ``initialize()`` so a partially-initialized shared store retries on the
+        next request instead of being treated as ready forever.
+
+        ``_init_lock`` serializes the first-time initialization across
+        concurrent requests so a shared store is only initialized once even
+        when multiple coroutines race for it on startup.
+
+        ``_store_owned`` records whether *this handler* created the store
+        lazily (no injected store). It is used by ``handle()`` together with
+        the in-flight refcount to close the store only after every concurrent
+        request that shares it has finished.
+        """
+        if self._init_lock is None:
+            # Lazily bound to the running loop on first use; subsequent
+            # `if`-check is atomic because this assignment never awaits.
+            self._init_lock = asyncio.Lock()
+        async with self._init_lock:
+            if self._store is None:
+                store = BrownfieldStore()
+                await store.initialize()
+                self._store = store
+                self._store_ready = True
+                self._store_owned = True
+                return store
+            if not self._store_ready:
+                await self._store.initialize()
+                self._store_ready = True
             return self._store
-        store = BrownfieldStore()
-        await store.initialize()
-        self._store = store
-        return store
 
     async def handle(
         self,
@@ -212,7 +244,28 @@ class BrownfieldHandler:
         - Otherwise → ``query``
         """
         action = _detect_action(arguments)
-        owned_store = self._store is None
+
+        # Acquire a refcounted reference to the store. The first request
+        # creates (or initializes) it under ``_init_lock``; concurrent
+        # requests share the cached instance and increment the refcount
+        # so the lazily-created store is only closed after every in-flight
+        # request that shares it has finished. This prevents the
+        # close-while-in-use race that previously surfaced under parallel
+        # brownfield tool calls on a non-injected handler.
+        try:
+            await self._get_store()
+        except Exception as e:
+            log.error("brownfield_handler.store_init_failed", error=str(e), action=action)
+            return Result.err(
+                MCPToolError(
+                    f"Brownfield operation failed: {e}",
+                    tool_name=_TOOL_NAME,
+                )
+            )
+
+        assert self._init_lock is not None  # set inside _get_store
+        async with self._init_lock:
+            self._refcount += 1
 
         try:
             if action == "scan":
@@ -247,9 +300,20 @@ class BrownfieldHandler:
                 )
             )
         finally:
-            if owned_store and self._store is not None:
-                await self._store.close()
-                self._store = None
+            # Take ownership of the close obligation under the lock so a
+            # concurrent request cannot decide to close the same store. The
+            # actual ``close()`` is awaited outside the lock to avoid holding
+            # it during database IO.
+            store_to_close: BrownfieldStore | None = None
+            async with self._init_lock:
+                self._refcount -= 1
+                if self._refcount == 0 and self._store_owned and self._store is not None:
+                    store_to_close = self._store
+                    self._store = None
+                    self._store_ready = False
+                    self._store_owned = False
+            if store_to_close is not None:
+                await store_to_close.close()
 
     # ──────────────────────────────────────────────────────────────
     # scan — Discover repos from home directory
@@ -259,19 +323,25 @@ class BrownfieldHandler:
         self,
         arguments: dict[str, Any],
     ) -> Result[MCPToolResult, MCPServerError]:
-        """Scan home directory for git repos and register them.
+        """Scan an existing root directory for repos/worktrees and register them.
 
         Delegates to ``bigbang.brownfield.scan_and_register`` which handles
-        directory walking, GitHub origin filtering, LLM description generation,
-        and DB upsert.
+        directory walking, linked worktree expansion, and DB upsert.
         """
         scan_root_str = arguments.get("scan_root")
-        scan_root = Path(scan_root_str) if scan_root_str else None
+        scan_root = Path(scan_root_str).expanduser() if scan_root_str else None
+        if scan_root is not None and not scan_root.is_dir():
+            return Result.err(
+                MCPToolError(
+                    f"scan_root must be an existing directory: {scan_root}",
+                    tool_name=_TOOL_NAME,
+                )
+            )
 
         store = await self._get_store()
 
         # scan_and_register handles the full workflow:
-        # walk dirs → filter GitHub origins → generate descs → upsert
+        # walk dirs → expand linked worktrees → upsert
         repos = await scan_and_register(
             store=store,
             llm_adapter=None,  # No LLM in MCP context for now

@@ -23,7 +23,8 @@ from ouroboros.config import (
     get_parallel_default,
     get_skip_qa_default,
 )
-from ouroboros.core.errors import ValidationError
+from ouroboros.config.loader import get_max_parallel_workers
+from ouroboros.core.errors import ConfigError, ValidationError
 from ouroboros.core.project_paths import resolve_seed_project_path
 from ouroboros.core.security import InputValidator
 from ouroboros.core.seed import Seed
@@ -70,7 +71,6 @@ from ouroboros.persistence.event_store import EventStore
 from ouroboros.providers.base import LLMAdapter
 
 log = structlog.get_logger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Module-level state for Q4.1 / AC-2 mode resolution
@@ -334,38 +334,21 @@ class ExecuteSeedHandler(BridgeAwareMixin):
             cwd=str(resolved_cwd),
         )
 
-        # ---------------------------------------------------------------
-        # Q4.1 / AC-2 — seed parse + caller-wins-and-warn mode resolution
-        # ---------------------------------------------------------------
-        # Seed parsing and mode resolution run *before* the plugin-dispatch
-        # check below so both branches (in-process AND delegated) honor the
-        # mode contract: the caller-vs-seed conflict warning,
-        # ``mcp.execute_seed.mode_conflict`` event, and session-scoped
-        # counter fire uniformly.  Without this ordering the
-        # ``should_dispatch_via_plugin`` early-return would silently bypass
-        # AC-2 on delegated runs.
-        #
-        # Mode-resolution priority:
-        #   1. ``arguments["mode"]``                       (caller — wins)
-        #   2. ``seed.metadata.execution_mode_required``   (seed preference)
-        #   3. ``"compounding"``                           (Q4.1 default)
-        #
-        # When the caller specifies a mode AND the seed declares a different
-        # one, the caller wins but the disagreement is surfaced via warning
-        # + event + counter (drained by AC-4's Run Summary).  When neither
-        # side specifies a mode, ``"compounding"`` applies and a one-time
-        # per-session deprecation warning fires — external MCP callers have
-        # a release cycle to set ``mode`` or
-        # ``metadata.execution_mode_required`` explicitly.
-        #
-        # Invalid-mode validation runs after resolution so the rejection
-        # message reflects the actually-resolved value, not the raw
-        # caller argument (which may be ``None``).
-        #
-        # Soft-flip flag and conflict counter live on
-        # :mod:`ouroboros.orchestrator._q41_state` (AC-4 sub-AC 5) so the
-        # runner can read the counter at end-of-run without re-importing
-        # this module.  Mutate via the canonical module reference.
+        # Resolve worker cap up front so plugin and in-process paths agree.
+        try:
+            max_parallel_workers = get_max_parallel_workers()
+        except ConfigError as e:
+            return Result.err(
+                MCPToolError(
+                    f"Execution handler config error: {e}",
+                    tool_name="ouroboros_execute_seed",
+                )
+            )
+
+        # Q4.1 / AC-2 — seed parsing + caller-wins-and-warn mode resolution
+        # below MUST precede the plugin-dispatch gate so both in-process and
+        # delegated paths honor the mode contract uniformly. See AC-2 design
+        # in docs/brainstorm/phase-2-q4.1-hardening-design.md.
 
         # Parse seed_content YAML into Seed object
         try:
@@ -462,6 +445,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
             max_iterations=max_iterations,
             skip_qa=arguments.get("skip_qa", False),
             model_tier=model_tier,
+            max_parallel_workers=max_parallel_workers,
         )
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
             # Q4.1 / AC-2 — flush the deferred mode-conflict event on the
@@ -630,6 +614,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     inherited_tools=inherited_effective_tools,
                     task_workspace=workspace,
                     checkpoint_store=checkpoint_store,
+                    max_parallel_workers=max_parallel_workers,
                 )
 
                 # Parse skip_qa with strict validation to avoid truthy string inversion
@@ -1061,6 +1046,17 @@ class StartExecuteSeedHandler:
                 )
             )
 
+        # Resolve worker cap up front so plugin and background paths agree.
+        try:
+            max_parallel_workers = get_max_parallel_workers()
+        except ConfigError as e:
+            return Result.err(
+                MCPToolError(
+                    f"Execution handler config error: {e}",
+                    tool_name="ouroboros_start_execute_seed",
+                )
+            )
+
         # --- Subagent dispatch: gate on runtime + opencode_mode ---
         # StartExecuteSeedHandler delegates to ExecuteSeedHandler internally.
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
@@ -1083,6 +1079,7 @@ class StartExecuteSeedHandler:
                 max_iterations=arguments.get("max_iterations", 10),
                 skip_qa=arguments.get("skip_qa", False),
                 model_tier=arguments.get("model_tier", "medium"),
+                max_parallel_workers=max_parallel_workers,
             )
 
             await emit_subagent_dispatched_event(
@@ -1119,6 +1116,7 @@ class StartExecuteSeedHandler:
             max_iterations=arguments.get("max_iterations", 10),
             skip_qa=arguments.get("skip_qa", False),
             model_tier=arguments.get("model_tier", "medium"),
+            max_parallel_workers=max_parallel_workers,
         )
 
         await self._event_store.initialize()

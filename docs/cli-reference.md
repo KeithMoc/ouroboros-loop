@@ -103,6 +103,20 @@ ouroboros setup --non-interactive
 
 > **Codex config split:** put persistent Ouroboros per-role model overrides in `~/.ouroboros/config.yaml` (`clarification.default_model`, `llm.qa_model`, `evaluation.semantic_model`, `consensus.models`, `consensus.advocate_model`, `consensus.devil_model`, `consensus.judge_model`). `~/.codex/config.toml` is only the Codex MCP/env hookup file used by setup.
 
+### Brownfield Subcommands
+
+`ouroboros setup` also includes brownfield repository registration helpers:
+
+```bash
+ouroboros setup scan [SCAN_ROOT]
+ouroboros setup list
+ouroboros setup default
+```
+
+`ouroboros setup scan [SCAN_ROOT]` walks `scan_root` for valid seed git repositories and worktrees. When `SCAN_ROOT` is omitted, `scan_root` defaults to the current user's home directory. The filesystem walk is bounded to `scan_root`: dot-prefixed directories and known noisy directories such as `node_modules` are not walked as seed locations. Local repos, repos without remotes, and repos whose remotes are not named `origin` are all eligible.
+
+Linked worktree expansion has a different boundary. For each normal repo root found under `scan_root` with a `.git` directory, Ouroboros runs `git worktree list --porcelain` and may register those linked worktrees even when their paths are outside `scan_root`, as long as Git reports them and the paths still exist. A linked worktree found under `scan_root` with a `.git` file is registered itself, but it is not used to register its main worktree or sibling worktrees outside `scan_root`. This keeps narrow scans scoped when a user intentionally passes one worktree as AI context. Existing registrations and default selections are preserved by upsert.
+
 ---
 
 ## `ouroboros init`
@@ -752,6 +766,7 @@ The table below covers the most commonly used variables. For the full list — i
 | `OPENROUTER_API_KEY` | — | OpenRouter API key for consensus and LiteLLM |
 | `OUROBOROS_AGENT_RUNTIME` | `orchestrator.runtime_backend` | Override the runtime backend (`claude`, `codex`, `opencode`) |
 | `OUROBOROS_AGENT_PERMISSION_MODE` | `orchestrator.permission_mode` | Permission mode for Claude Code / Codex runtimes (no-op for OpenCode) |
+| `OUROBOROS_MAX_PARALLEL_WORKERS` | `orchestrator.max_parallel_workers` | Maximum concurrent Acceptance Criteria workers for parallel execution |
 | `OUROBOROS_LLM_BACKEND` | `llm.backend` | Override the LLM-only flow backend |
 | `OUROBOROS_CLI_PATH` | `orchestrator.cli_path` | Path to the Claude CLI binary |
 | `OUROBOROS_CODEX_CLI_PATH` | `orchestrator.codex_cli_path` | Path to the Codex CLI binary |
