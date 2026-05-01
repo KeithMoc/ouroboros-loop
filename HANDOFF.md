@@ -1,7 +1,7 @@
 # Handoff Document
 
-> Last Updated: 2026-04-29 ~05:15 UTC
-> Session: Q4.1 dogfood run COMPLETED. Session `orch_ca1ac0b88c85` / Job `job_77267701b1c8` ran ~1h47m, 4/4 ACs · 17/17 sub-ACs · `5742 passed + 2 skipped` (was 5699; +43 tests). PR opened on branch `feat/phase-2-q4.1-hardening`; squash-merge pending CodeRabbit review.
+> Last Updated: 2026-05-01 ~04:35 UTC
+> Session: Q4.1 SHIPPED. PR #7 squash-merged as `9a8d9f9` at 2026-05-01 04:33:23 UTC. CodeRabbit posted 9 inline + 1 outside-diff actionable findings on first pass; all 10 addressed in follow-up commit `a2f17e2`. Tests `5742 passed + 2 skipped`. Local feature branch deleted; main synced with `origin/main` at `9a8d9f9`.
 
 ---
 
@@ -9,7 +9,7 @@
 
 Ship serial-compounding Phase 2 incrementally as dogfood runs. Each work item from the brainstorm doc (`docs/brainstorm/serial-compounding-open-questions.md`) becomes one `ooo run --compounding` cycle: design → seed → run → evaluate → ship.
 
-Phase-2 Q1, Q2, Q3, Q4, Q4.1, Q6, Q7 all in code (PRs #3–#6 merged; Q4.1 PR open at #7). Phase 2's open queue narrows to Q4.2 (judge-accuracy substrate + end-of-run sweep mode), Q5 (`ooo evolve` integration), and the carry-over prompt-caching investigation.
+Phase-2 Q1, Q2, Q3, Q4, Q4.1, Q6, Q7 all merged (PRs #3–#7). Phase 2's open queue narrows to Q4.2 (judge-accuracy substrate + end-of-run sweep mode), Q5 (`ooo evolve` integration), and the carry-over prompt-caching investigation.
 
 ---
 
@@ -21,13 +21,16 @@ Phase-2 Q1, Q2, Q3, Q4, Q4.1, Q6, Q7 all in code (PRs #3–#6 merged; Q4.1 PR op
 
 Test status: **5699 tests collected** post-PR #6.
 
-### ✅ Phase-2 Q4.1 — Hardening cycle (PR #7 open; squash-merge pending)
+### ✅ Phase-2 Q4.1 — Hardening cycle (PR #7 merged)
 
-**Branch:** `feat/phase-2-q4.1-hardening` — four commits on top of `origin/main` at `ce5ad1e`:
+**Squash-merged as `9a8d9f9` on `KeithMoc/ouroboros-loop:main` at 2026-05-01 04:33:23 UTC.**
+
+Pre-squash branch (`feat/phase-2-q4.1-hardening`, now deleted) had five commits:
 - `33836b2 docs(compounding): lock phase-2 Q4.1 hardening design`
 - `03c322f feat(compounding): add phase-2 Q4.1 hardening dogfood seed`
 - `a4cf6f3 feat(compounding): Q4.1 — AC-1 parent-only QA design rationale + test rename` *(orchestrator's commit-per-AC fired only for AC-1 — see [What Didn't Work](#what-didnt-work--open-gaps))*
 - `a6002b9 feat(compounding): Q4.1 — AC-2/3/4 (MCP mode + resume sentinel + observability + 4 deferred CR items)` *(this session, post-run)*
+- `a2f17e2 fix(compounding): address CodeRabbit findings on PR #7 (10 items)` *(post-CR-review fix batch)*
 
 **Run details:** session `orch_ca1ac0b88c85` / job `job_77267701b1c8` / exec `exec_c826cecb17c7`. Started 2026-04-29 03:10:38 UTC, completed 04:57:35 UTC (~1h47m). Backend: `claude` / `claude_code`. 1031 messages processed.
 
@@ -157,10 +160,12 @@ tests/conftest.py                                         # Autouse OUROBOROS_CH
 
 ### Immediate — pick up where this session ended
 
-1. **Review PR #7** (`feat/phase-2-q4.1-hardening`). Wait for CodeRabbit review. Address inline + review-level findings (use `gh pr comment` for review-level nitpicks per the carry-over note below).
-2. **Squash-merge** to `KeithMoc/ouroboros-loop:main`. Commit title follows prior cycles: `feat(compounding): phase-2 Q4.1 — hardening (decomp docs + MCP mode + resume sentinel + observability) (#7)`.
-3. **After merge:** `git fetch && git checkout main && git pull && git branch -d feat/phase-2-q4.1-hardening` to clean up the local feature branch.
-4. **Verify the Run Summary panel renders during the next dogfood cycle** — that's the meta-validation AC-4 was meant to provide. The current run was driven by the v0.30.0 orchestrator which doesn't have AC-4's panel; first sighting will be the Q4.2 kickoff.
+1. **Q4.2 kickoff** is the natural next cycle. Two scopes packaged together in the brainstorm doc:
+   - **Judge-accuracy substrate** — FP/FN observation infrastructure that lets `--fail-fast` actually trigger.
+   - **End-of-run sweep mode** (`--qa-mode=defer`) — real ~250 LOC mode change.
+   Apply the same three-pass procedure as Q4.1 (P0 recon → brainstorming → P1 edge-case mining → ooo interview / Path B fallback).
+2. **First Q4.2 run will exercise AC-4's Run Summary panel + AC-2's mode honoring as the *driver*, not the *target*.** That's the meta-validation Q4.1 was designed to enable. Watch the panel render during Q4.2's actual `ooo run`.
+3. **PyPI release of `ouroboros-ai==0.30.1`** (or whatever the next version) is gated externally — but until that ships, dogfood cycles will continue to be driven by 0.30.0 (= pre-Q4.1) until the user pushes a release. The dogfood-bootstrap memory note covers this.
 
 ### Deferred (not blocked, not in Q4.1)
 
@@ -174,15 +179,9 @@ tests/conftest.py                                         # Autouse OUROBOROS_CH
 
 ## Repo State at Handoff Time
 
-- Branch: `feat/phase-2-q4.1-hardening` (PR #7 open against `KeithMoc/ouroboros-loop:main`).
-- Local `main` reset back to `origin/main` (`ce5ad1e`).
-- Branch commits ahead of `origin/main`:
-  - `33836b2 docs(compounding): lock phase-2 Q4.1 hardening design`
-  - `03c322f feat(compounding): add phase-2 Q4.1 hardening dogfood seed`
-  - `a4cf6f3 feat(compounding): Q4.1 — AC-1 parent-only QA design rationale + test rename`
-  - `a6002b9 feat(compounding): Q4.1 — AC-2/3/4 (MCP mode + resume sentinel + observability + 4 deferred CR items)`
-  - `<HANDOFF commit> docs(handoff): mark Q4.1 cycle complete`
-- Working tree clean post-commit chain.
+- Branch: `main` at `9a8d9f9` (synced with `origin/main`).
+- Feature branch `feat/phase-2-q4.1-hardening` deleted locally; remote branch survives on origin (GitHub may auto-delete depending on repo settings).
+- Working tree clean.
 
 ---
 
@@ -207,11 +206,10 @@ gh pr view 7
 If you're picking this up cold from a new session:
 
 1. **Read this file** (you are).
-2. **Check PR #7 state:** `gh pr view 7` — is it merged yet? Has CodeRabbit reviewed?
-3. **If PR #7 is merged:** Q4.2 is the next cycle (judge-accuracy substrate + end-of-run sweep mode). Start a new design pass.
-4. **If PR #7 is open:** address review feedback, then squash-merge. The cycle's commits are at `feat/phase-2-q4.1-hardening`.
-5. **Check `.claude/projects/-home-keith--WORKSPACES--ouroboros-loop/memory/MEMORY.md`** for project memory (especially `prompt_caching_blocked.md`).
+2. **Verify main is at `9a8d9f9`** (Q4.1 squash-merge): `git log --oneline -1`.
+3. **Q4.2 is the next cycle** (judge-accuracy substrate + end-of-run sweep mode). Start with P0 recon against the master Q-list at `docs/brainstorm/serial-compounding-open-questions.md`, then brainstorming, then P1 edge-case mining, then ooo-style interview — same three-pass procedure as Q4.1 (took ~41 min and produced a spec ~30% richer than brainstorm-only).
+4. **Check `.claude/projects/-home-keith--WORKSPACES--ouroboros-loop/memory/MEMORY.md`** for project memory: dogfood-bootstrap pattern, gh-fork-resolution gotcha, prompt-caching block.
 
 ---
 
-*Q4.1 shipped a 4-AC hardening cycle that adds MCP `execution_mode_required` honoring, a QA-pending sentinel resume path, an audit-diff sidecar, and a Run Summary observability panel. Dogfood run state: `completed`. Three-pass procedure (P0 → brainstorm → P1 → interview, ~41 min) produced a spec ~30% richer than brainstorm-alone — worth keeping as discipline.*
+*Q4.1 shipped a 4-AC hardening cycle: MCP `execution_mode_required` honoring (with caller-wins-and-warn conflict policy), a QA-pending sentinel resume path with audit-diff sidecar, a Run Summary observability panel, and 4 deferred CR items. Dogfood run completed cleanly; first CodeRabbit pass surfaced 10 actionable findings (architectural: plugin-dispatch path bypassed mode resolution; quality-of-life: defensive coercion, panel completeness, hermetic test discipline) — all addressed in commit `a2f17e2`. Three-pass procedure proved its keep again; carrying as standard cycle discipline.*
