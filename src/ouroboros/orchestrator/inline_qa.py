@@ -184,6 +184,30 @@ def _serialize_qa_verdict(verdict: QAVerdict) -> dict[str, Any]:
     }
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort float coercion. Returns ``default`` on failure."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Coerce ``value`` to a ``list[str]`` without splitting strings into chars.
+
+    A bare string yields a single-element list; ``None`` yields an empty list;
+    list/tuple inputs are stringified element-wise; anything else falls back
+    to an empty list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item is not None]
+    return []
+
+
 def _meta_to_qaverdict_kwargs(meta: dict[str, Any]) -> dict[str, Any]:
     """Extract and normalize QAVerdict-shaped fields from a raw meta dict.
 
@@ -196,6 +220,14 @@ def _meta_to_qaverdict_kwargs(meta: dict[str, Any]) -> dict[str, Any]:
     through :class:`QAVerdict` → :func:`_serialize_qa_verdict`, ensuring
     the returned ``verdict_dict`` matches the canonical shape.
 
+    Coercions are defensive: ``score`` accepts numeric strings via a
+    try/except wrapper; ``differences`` / ``suggestions`` accept bare
+    strings (treated as single-element lists, never iterable-to-chars);
+    ``dimensions`` only retains dict entries with numeric values.  This
+    preserves the QA-path contract that ``run_inline_qa`` degrades to
+    ``skipped_error`` rather than surfacing exceptions on malformed
+    LLM payloads.
+
     Args:
         meta: Raw meta dict from ``MCPToolResult.meta`` (may contain extra
             keys like ``loop_action``, ``qa_session_id``, ``passed`` that
@@ -206,16 +238,20 @@ def _meta_to_qaverdict_kwargs(meta: dict[str, Any]) -> dict[str, Any]:
         QAVerdict fields.
     """
     raw_dimensions = meta.get("dimensions")
-    dimensions: dict[str, float] = (
-        dict(raw_dimensions) if isinstance(raw_dimensions, dict) else {}
-    )
+    dimensions: dict[str, float] = {}
+    if isinstance(raw_dimensions, dict):
+        for key, value in raw_dimensions.items():
+            try:
+                dimensions[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
     return {
-        "score": float(meta.get("score", 0.0)),
-        "verdict": str(meta.get("verdict", "") or ""),
+        "score": _coerce_float(meta.get("score"), 0.0),
+        "verdict": str(meta.get("verdict") or ""),
         "dimensions": dimensions,
-        "differences": list(meta.get("differences") or []),
-        "suggestions": list(meta.get("suggestions") or []),
-        "reasoning": str(meta.get("reasoning", "") or ""),
+        "differences": _coerce_str_list(meta.get("differences")),
+        "suggestions": _coerce_str_list(meta.get("suggestions")),
+        "reasoning": str(meta.get("reasoning") or ""),
     }
 
 

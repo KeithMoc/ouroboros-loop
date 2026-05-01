@@ -448,11 +448,17 @@ class TestOrchestratorRunner:
         assert result.is_ok
         assert result.value == orchestrator_result
         prepare_session.assert_awaited_once_with(sample_seed, execution_id="exec_delegated")
+        # Q4.1 / AC-4 (deferred CR item — addressed in PR #7 follow-up):
+        # max_qa_retries is now forwarded unconditionally (was previously
+        # only forwarded when inline_qa=True).  The default value of 1
+        # propagates through, mirroring prepare_session() +
+        # execute_precreated_session() behavior.
         execute_precreated.assert_awaited_once_with(
             seed=sample_seed,
             tracker=tracker,
             parallel=True,
             mode=None,
+            max_qa_retries=1,
         )
 
     @pytest.mark.asyncio
@@ -3270,7 +3276,9 @@ class TestRunSummaryAggregation:
             "mode_conflicts": 0,
         }
 
-    def test_61_aggregate_populated_chain_sums_qa_and_invariants(self) -> None:
+    def test_61_aggregate_populated_chain_sums_qa_and_invariants(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test 61: populated chain → qa_calls / qa_verdicts / invariants_above_threshold roll up.
 
         Builds a 3-AC chain with mixed qa_status + a mix of below/above-
@@ -3281,7 +3289,14 @@ class TestRunSummaryAggregation:
         * ``qa_verdicts`` = per-status counts.
         * ``invariants_above_threshold`` = non-contradicted with reliability
           ≥ ``_get_min_reliability()``.
+
+        Hermeticity: ``_aggregate_run_summary_stats`` reads
+        ``_get_min_reliability()`` dynamically from
+        ``OUROBOROS_INVARIANT_MIN_RELIABILITY``.  Pin the threshold to 0.7
+        so the assertion below isn't sensitive to the developer's shell.
         """
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "0.7")
+
         from ouroboros.orchestrator.level_context import (
             ACContextSummary,
             ACPostmortem,

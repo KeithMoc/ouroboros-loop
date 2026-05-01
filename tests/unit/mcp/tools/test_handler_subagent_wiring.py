@@ -269,8 +269,40 @@ class TestEvaluateHandlerSubagentDispatch:
 # ---------------------------------------------------------------------------
 
 
+_VALID_SEED_YAML = """\
+goal: Test task
+constraints:
+  - Python 3.14+
+acceptance_criteria:
+  - Task completes successfully
+ontology_schema:
+  name: TestOntology
+  description: Test ontology
+  fields:
+    - name: test_field
+      field_type: string
+      description: A test field
+evaluation_principles: []
+exit_conditions: []
+metadata:
+  seed_id: test-seed-subagent
+  version: "1.0.0"
+  created_at: "2024-01-01T00:00:00Z"
+  ambiguity_score: 0.1
+  interview_id: null
+"""
+
+
 class TestExecuteSeedHandlerSubagentDispatch:
-    """ExecuteSeedHandler.handle() returns _subagent payload."""
+    """ExecuteSeedHandler.handle() returns _subagent payload.
+
+    Q4.1 / AC-2 — these handler tests use a fully-parseable seed because
+    the execute-seed handler now parses the seed BEFORE the plugin
+    dispatch check (so seed.metadata.execution_mode_required is honored
+    on delegated runs too).  Pre-Q4.1 the dispatch ran first and the
+    seed was never parsed for the plugin path; post-Q4.1 the seed must
+    pass Pydantic validation regardless of dispatch mode.
+    """
 
     @pytest.fixture
     def handler(self):
@@ -281,7 +313,7 @@ class TestExecuteSeedHandlerSubagentDispatch:
     async def test_returns_subagent_for_valid_args(self, handler) -> None:
         result = await handler.handle(
             {
-                "seed_content": "goal: build it\nconstraints: []\nacceptance_criteria: [tests pass]",
+                "seed_content": _VALID_SEED_YAML,
             }
         )
         assert result.is_ok
@@ -295,7 +327,7 @@ class TestExecuteSeedHandlerSubagentDispatch:
     async def test_context_has_execution_args(self, handler) -> None:
         result = await handler.handle(
             {
-                "seed_content": "goal: test",
+                "seed_content": _VALID_SEED_YAML,
                 "max_iterations": 5,
                 "skip_qa": True,
             }

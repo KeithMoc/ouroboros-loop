@@ -8735,7 +8735,10 @@ class TestInlineQAResumeReplay:
 
     @pytest.mark.asyncio
     async def test_resume_replay_skipped_when_inline_qa_off_clears_pending_to_none(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """43. pending + inline_qa=False → replay skipped, qa_status cleared to None.
 
@@ -8789,6 +8792,21 @@ class TestInlineQAResumeReplay:
 
         executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
 
+        # Belt-and-braces: structlog routing through stdlib's caplog can be
+        # config-dependent.  Patch the executor module's ``log.warning`` to
+        # record calls directly so the assertion below isn't sensitive to
+        # the test runner's structlog configuration.
+        from ouroboros.orchestrator import serial_executor as _exec_module
+
+        warning_calls: list[tuple[str, dict[str, Any]]] = []
+        original_warning = _exec_module.log.warning
+
+        def _capture_warning(event: str, **kwargs: Any) -> None:
+            warning_calls.append((event, kwargs))
+            return original_warning(event, **kwargs)
+
+        monkeypatch.setattr(_exec_module.log, "warning", _capture_warning)
+
         plan = _make_plan((0,), (1,))
         with caplog.at_level(logging.WARNING):
             result = await executor.execute_serial(
@@ -8814,15 +8832,25 @@ class TestInlineQAResumeReplay:
 
         # Replay-skipped warning fired.  Search both caplog and structlog
         # records (the codebase uses structured logging via ``log.warning``;
-        # the event-name string lands in the message).
+        # the event-name string lands in the message).  Patch the module's
+        # ``log.warning`` directly as a belt-and-braces fallback in case the
+        # test runner's structlog config doesn't route through stdlib's
+        # caplog in this environment.
         skip_log_seen = any(
             "resume.qa_replay_skipped" in record.getMessage()
             or "resume.qa_replay_skipped" in str(record)
             for record in caplog.records
+        ) or any(
+            "resume.qa_replay_skipped" in str(call)
+            for call in warning_calls
         )
-        # If structlog isn't routing through stdlib in this test env, fall
-        # back to checking persisted state — the qa_status flip is the
-        # observable contract that matters most.
+        assert skip_log_seen, (
+            "expected 'serial_executor.resume.qa_replay_skipped' warning "
+            "to be logged when inline_qa=False on resume from a "
+            "qa_status='pending' sentinel; AC-3 contract requires it"
+        )
+
+        # Persisted-state contract: qa_status flipped from pending to None.
         from ouroboros.persistence.checkpoint import CompoundingCheckpointState
 
         load_result = store.load(seed.metadata.seed_id)
@@ -8839,10 +8867,6 @@ class TestInlineQAResumeReplay:
             f"on resume; got {ac0_pm.get('qa_status')!r}.  Leaving 'pending' "
             f"would re-trigger replay forever."
         )
-        # Either the warning surfaced through caplog OR (at minimum) the
-        # contract behavior — qa_status flipped from pending to None — is
-        # observed.  The log assertion is best-effort given structlog config.
-        _ = skip_log_seen  # documented; not strictly required for pass
 
         # Run completed both ACs (AC 0 SATISFIED_EXTERNALLY, AC 1 SUCCEEDED).
         assert len(result.results) == 2

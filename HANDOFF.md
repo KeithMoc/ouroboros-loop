@@ -23,7 +23,7 @@ Test status: **5699 tests collected** post-PR #6.
 
 ### ✅ Phase-2 Q4.1 — Hardening cycle (PR #7 open; squash-merge pending)
 
-**Branch:** `feat/phase-2-q4.1-hardening` — three commits on top of `origin/main` at `ce5ad1e`:
+**Branch:** `feat/phase-2-q4.1-hardening` — four commits on top of `origin/main` at `ce5ad1e`:
 - `33836b2 docs(compounding): lock phase-2 Q4.1 hardening design`
 - `03c322f feat(compounding): add phase-2 Q4.1 hardening dogfood seed`
 - `a4cf6f3 feat(compounding): Q4.1 — AC-1 parent-only QA design rationale + test rename` *(orchestrator's commit-per-AC fired only for AC-1 — see [What Didn't Work](#what-didnt-work--open-gaps))*
@@ -93,13 +93,14 @@ seeds/phase-2-q4.1-hardening.yaml                         # Q4.1 seed — READY 
 seeds/phase-2-q4-inline-qa.yaml                           # Q4 seed (drove PR #6)
 seeds/phase-2-q2-diff-capture.yaml                        # Q2 seed (drove PR #4)
 
-src/ouroboros/orchestrator/inline_qa.py                   # Q4 core
-src/ouroboros/orchestrator/serial_executor.py             # QA-retry loop at ~1516+; AC-3 will add phase-1 checkpoint write here
-src/ouroboros/orchestrator/level_context.py               # ACPostmortem; AC-3 will extend qa_status enum + add final_message field
-src/ouroboros/orchestrator/events.py                      # AC-2 will add create_mode_conflict_event factory here
-src/ouroboros/orchestrator/runner.py                      # AC-4 Run Summary panel lands here (~line 2091-2114)
-src/ouroboros/core/seed.py                                # AC-2 will extend SeedMetadata with execution_mode_required field
-src/ouroboros/mcp/tools/execution_handlers.py             # AC-2 will relocate the mode-resolution block below the seed-parse line
+src/ouroboros/orchestrator/inline_qa.py                   # Q4 core; AC-4 unified run_inline_qa serialization through _serialize_qa_verdict
+src/ouroboros/orchestrator/serial_executor.py             # AC-3 added phase-1 'qa_status=pending' checkpoint write + resume QA-replay branch
+src/ouroboros/orchestrator/level_context.py               # AC-3 extended ACPostmortem with final_message field + qa_status='pending' enum value
+src/ouroboros/orchestrator/events.py                      # AC-2 added create_mode_conflict_event factory
+src/ouroboros/orchestrator/runner.py                      # AC-4 Run Summary panel + completion_summary extension
+src/ouroboros/orchestrator/_q41_state.py                  # AC-2/4 shared module-level state (soft-flip flag + mode-conflict counter)
+src/ouroboros/core/seed.py                                # AC-2 extended SeedMetadata with execution_mode_required field
+src/ouroboros/mcp/tools/execution_handlers.py             # AC-2 relocated the mode-resolution block below the seed-parse line
 
 tests/unit/orchestrator/                                  # Where most new Q4.1 tests will land
 tests/conftest.py                                         # Autouse OUROBOROS_CHAIN_ARTIFACT_DIR redirect

@@ -608,7 +608,8 @@ def _render_run_summary_panel_text(
         (
             f"QA verdicts:         {qa_verdicts.get('passed', 0)} passed, "
             f"{qa_verdicts.get('exhausted', 0)} exhausted, "
-            f"{qa_verdicts.get('skipped_error', 0)} errors"
+            f"{qa_verdicts.get('skipped_error', 0)} errors, "
+            f"{qa_verdicts.get('skipped_delegated', 0)} delegated"
         ),
         f"Invariants captured: {invariants} above threshold {threshold}",
         f"Mode conflicts:      {conflicts}",
@@ -1849,9 +1850,13 @@ class OrchestratorRunner:
             execute_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
         if resume_session_id is not None:
             execute_kwargs["resume_session_id"] = resume_session_id
+        # Forward max_qa_retries unconditionally so execute_seed mirrors
+        # prepare_session() + execute_precreated_session(): the retry budget
+        # must propagate even when inline_qa is False, otherwise the public
+        # entry point silently falls back to the default.
+        execute_kwargs["max_qa_retries"] = max_qa_retries
         if inline_qa:
             execute_kwargs["inline_qa"] = inline_qa
-            execute_kwargs["max_qa_retries"] = max_qa_retries
 
         return await self.execute_precreated_session(**execute_kwargs)
 
@@ -2321,18 +2326,23 @@ class OrchestratorRunner:
             # Calculate duration
             duration = (datetime.now(UTC) - start_time).total_seconds()
 
+            # Q4.1 / AC-4 sub-AC 5: aggregate Run Summary stats.
+            # Run unconditionally (not just on success) so the
+            # _q41_state._mode_conflict_counter entry for this session is
+            # drained even when execution fails — otherwise the
+            # process-global dict accumulates dead session IDs.  Single-call
+            # path has no postmortem chain — pass None so QA / invariant
+            # counters return zero/empty.  Cost comes from the workflow
+            # state tracker (best-effort: degrades to 0.0 if the tracker
+            # hasn't been fed any token data yet).
+            _run_stats = _aggregate_run_summary_stats(
+                chain=None,
+                session_id=tracker.session_id,
+                cost_usd=getattr(state_tracker.state, "estimated_cost_usd", 0.0),
+            )
+
             # Emit completion event
             if success:
-                # Q4.1 / AC-4 sub-AC 5: aggregate Run Summary stats.
-                # Single-call path has no postmortem chain — pass None so QA /
-                # invariant counters return zero/empty.  Cost comes from the
-                # workflow state tracker (best-effort: degrades to 0.0 if the
-                # tracker hasn't been fed any token data yet).
-                _run_stats = _aggregate_run_summary_stats(
-                    chain=None,
-                    session_id=tracker.session_id,
-                    cost_usd=getattr(state_tracker.state, "estimated_cost_usd", 0.0),
-                )
                 completion_summary = {
                     "final_message": final_message[:500],
                     "messages_processed": messages_processed,

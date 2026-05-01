@@ -100,14 +100,19 @@ class TestExecuteSeedHandler:
         assert "mode" in param_names
 
     def test_mode_parameter_enumerates_parallel_and_compounding(self) -> None:
-        """The mode parameter must advertise both execution modes."""
+        """The mode parameter must advertise both execution modes.
+
+        Q4.1 / AC-2 soft-flipped the global default from ``"parallel"`` to
+        ``"compounding"`` to bring the public schema in sync with the
+        runtime resolver (see Q4.1 design doc, AC-2 schema-default split).
+        """
         handler = ExecuteSeedHandler()
         mode_param = next(
             (p for p in handler.definition.parameters if p.name == "mode"),
             None,
         )
         assert mode_param is not None
-        assert mode_param.default == "parallel"
+        assert mode_param.default == "compounding"
         assert mode_param.enum == ("parallel", "compounding")
 
     async def test_handle_rejects_invalid_mode(self) -> None:
