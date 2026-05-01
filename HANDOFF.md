@@ -1,7 +1,49 @@
 # Handoff Document
 
-> Last Updated: 2026-05-01 ~04:35 UTC
-> Session: Q4.1 SHIPPED. PR #7 squash-merged as `9a8d9f9` at 2026-05-01 04:33:23 UTC. CodeRabbit posted 9 inline + 1 outside-diff actionable findings on first pass; all 10 addressed in follow-up commit `a2f17e2`. Tests `5742 passed + 2 skipped`. Local feature branch deleted; main synced with `origin/main` at `9a8d9f9`.
+> Last Updated: 2026-05-01 ~04:50 UTC
+> Session: **Upstream sync** — `Q00/ouroboros:main` (v0.30.0 → v0.31.1, +35 commits) merged into `KeithMoc/ouroboros-loop:main` as merge-commit `57a6449`. 3 conflicts resolved (1 trivial, 1 architectural, 1 additive); 1 upstream test reshaped to honor Q4.1 AC-2 ordering. Tests `5847 passed + 2 skipped` (+105 net new tests from upstream). Local main now 15 ahead / 0 behind upstream. Not pushed to origin.
+> Prior session: Q4.1 SHIPPED. PR #7 squash-merged as `9a8d9f9` at 2026-05-01 04:33:23 UTC. CodeRabbit posted 9 inline + 1 outside-diff actionable findings on first pass; all 10 addressed in follow-up commit `a2f17e2`. Pre-merge tests `5742 passed + 2 skipped`.
+
+---
+
+## Latest Update — Upstream sync (v0.30.0 → v0.31.1)
+
+**Merge commit:** `57a6449 Merge remote-tracking branch 'upstream/main'`
+
+### What we picked up from upstream
+
+| Tag | Highlights |
+|---|---|
+| **v0.31.0** | Gemini CLI runtime backend (#504), parallel worker-cap honoring (#489), seed ontology rendering in execution contract, AC decomposition depth cap (=2), seed-contract prompt scoped to execution, AC-duplication fix in execution prompt, router multiline/Windows-path fixes, MCP startup-test isolation, brownfield-store init failure-safety, resume skill rename (`resume` → `resume-session`) |
+| **v0.31.1** | Brownfield store refcount + share for `serve --db` (#487 / #507), brownfield scan-roots validation (#486), interview seed-ready reopen fixes (closure-pressure removal + per-dimension gap signal restoration) |
+
+### Conflict resolution
+
+Real overlap was 11 files; auto-merge resolved 8. Three needed manual work:
+
+1. **`src/ouroboros/config/__init__.py`** — trivial: both sides added an import (`get_max_decomposition_depth_default` ours, `get_max_parallel_workers` upstream). Kept both.
+2. **`src/ouroboros/mcp/tools/execution_handlers.py`** — architectural: upstream put worker-cap resolution + plugin-dispatch *before* seed parsing (#489); our Q4.1 AC-2 requires seed parsing *before* plugin dispatch (so `seed.metadata.execution_mode_required` is honored on delegated runs). Resolution: take upstream's worker-cap resolution at the top (it doesn't need the seed), drop the now-redundant intent comment block, keep Q4.1 AC-2's mode-resolution flow at its existing position, and wire upstream's `max_parallel_workers=...` argument into the `build_execute_subagent` call below.
+3. **`tests/unit/orchestrator/test_runner.py`** — additive: HEAD added `test_claude_md_*` tests, upstream added `test_handles_empty_ontology_fields` + `test_includes_brownfield_context`. Kept both.
+
+Plus one downstream test fix: **`tests/unit/mcp/tools/test_handler_subagent_wiring.py::test_plugin_payload_includes_resolved_worker_cap`** was authored against upstream's pre-AC-2 ordering and used `seed_content="goal: test"` (insufficient for full Pydantic validation). Now passes `_VALID_SEED_YAML`. The companion `test_plugin_path_surfaces_worker_cap_config_error` still uses the minimal seed correctly — its ConfigError fires before seed parsing and the test relies on that.
+
+### Tests
+
+`uv run pytest tests/unit/ -q` → **5847 passed + 2 skipped** (was 5742 + 2 pre-merge).
+
+### What this changes downstream
+
+- **Worker-cap is now honored on the plugin-dispatch path.** Our local AC-2 work fixed the mode contract on plugin dispatch; #489 fixes the worker-cap contract on plugin dispatch. Both apply now.
+- **Gemini CLI runtime is available** (`runtime_backend="gemini_cli"`). Adds a third backend alongside Claude / OpenCode / Codex / Hermes.
+- **AC decomposition depth is capped at 2.** Reduces risk of sub-AC explosion in compounding mode — should be invisible to existing Q4.1 work since our seeds set `expected_decomposition_depth=0`.
+- **Resume skill renamed.** `skills/resume/` → `skills/resume-session/`. Documented in command summary; the user-facing `ooo resume` mapping in `CLAUDE.md` still resolves through the harness.
+- **Dogfood-bootstrap caveat partially eased.** When PyPI publishes ouroboros-ai 0.31.1, dogfood cycles on the next refresh will pick up router / interview / brownfield fixes — but **AC-2 (`execution_mode_required` honoring) is still unique to this fork** until merged upstream.
+
+### Repo state at merge time
+
+- Branch: `main` at `57a6449` (merge commit). `origin/main` still at `9a8d9f9` — **not pushed**.
+- Working tree: clean (only `.claude/scheduled_tasks.lock` untracked, which is gitignored anyway).
+- Diff vs upstream: 15 ahead / 0 behind.
 
 ---
 
@@ -138,6 +180,8 @@ tests/conftest.py                                         # Autouse OUROBOROS_CH
 
 4. **Prompt-prefix caching transparency in the Claude Code SDK** (low confidence; worth a 30-min test). The `prompt_caching_blocked.md` memo treats savings as theoretical. Two compounding cycles back-to-back with identical system prompts + AC-2 first-turn latency measurement would tell us whether the SDK caches transparently at the runtime layer.
 
+6. **Push the upstream-sync merge to `origin`?** `57a6449` is unpushed. Whether to fast-forward `origin/main` or open a PR for review is a project-style call — typical for this fork has been direct push to `origin/main` after green tests, but the merge surface here is large enough (35 upstream commits + 1 architectural conflict resolution) that a one-shot review PR is defensible.
+
 ### Stale prior gaps (CLOSED by Q4.1 — code shipped)
 
 | Prior gap | Closed by |
@@ -179,24 +223,26 @@ tests/conftest.py                                         # Autouse OUROBOROS_CH
 
 ## Repo State at Handoff Time
 
-- Branch: `main` at `9a8d9f9` (synced with `origin/main`).
+- Branch: `main` at `57a6449` (merge of `upstream/main` v0.31.1). **Not pushed** — `origin/main` is still at `9a8d9f9`.
+- Diff vs upstream: 15 ahead / 0 behind.
 - Feature branch `feat/phase-2-q4.1-hardening` deleted locally; remote branch survives on origin (GitHub may auto-delete depending on repo settings).
-- Working tree clean.
+- Working tree clean (only `.claude/scheduled_tasks.lock` untracked, which is gitignored).
 
 ---
 
 ## Verification Commands
 
 ```bash
-# Tests (post-Q4.1 baseline)
-uv run pytest tests/unit/ -q  # 5742 passed + 2 skipped
+# Tests (post-merge baseline)
+uv run pytest tests/unit/ -q  # 5847 passed + 2 skipped
 
 # Repo state
 git log --oneline -10
 git status --short
+git rev-list --left-right --count main...upstream/main  # 15  0
 
-# PR
-gh pr view 7
+# PRs
+gh pr view 7 --repo KeithMoc/ouroboros-loop
 ```
 
 ---
@@ -206,10 +252,13 @@ gh pr view 7
 If you're picking this up cold from a new session:
 
 1. **Read this file** (you are).
-2. **Verify main is at `9a8d9f9`** (Q4.1 squash-merge): `git log --oneline -1`.
-3. **Q4.2 is the next cycle** (judge-accuracy substrate + end-of-run sweep mode). Start with P0 recon against the master Q-list at `docs/brainstorm/serial-compounding-open-questions.md`, then brainstorming, then P1 edge-case mining, then ooo-style interview — same three-pass procedure as Q4.1 (took ~41 min and produced a spec ~30% richer than brainstorm-only).
-4. **Check `.claude/projects/-home-keith--WORKSPACES--ouroboros-loop/memory/MEMORY.md`** for project memory: dogfood-bootstrap pattern, gh-fork-resolution gotcha, prompt-caching block.
+2. **Verify main is at `57a6449`** (upstream-sync merge): `git log --oneline -1`. The Q4.1 squash-merge `9a8d9f9` is now the parent on the local-side, and `483e9be` (upstream's v0.31.1 release-merge) is the parent on the upstream-side.
+3. **Decide whether to push `57a6449` to `origin/main`** (or open a review PR — see open gap #6).
+4. **Q4.2 is the next cycle** (judge-accuracy substrate + end-of-run sweep mode). Start with P0 recon against the master Q-list at `docs/brainstorm/serial-compounding-open-questions.md`, then brainstorming, then P1 edge-case mining, then ooo-style interview — same three-pass procedure as Q4.1 (took ~41 min and produced a spec ~30% richer than brainstorm-only).
+5. **Check `.claude/projects/-home-keith--WORKSPACES--ouroboros-loop/memory/MEMORY.md`** for project memory: dogfood-bootstrap pattern, gh-fork-resolution gotcha, prompt-caching block.
 
 ---
 
 *Q4.1 shipped a 4-AC hardening cycle: MCP `execution_mode_required` honoring (with caller-wins-and-warn conflict policy), a QA-pending sentinel resume path with audit-diff sidecar, a Run Summary observability panel, and 4 deferred CR items. Dogfood run completed cleanly; first CodeRabbit pass surfaced 10 actionable findings (architectural: plugin-dispatch path bypassed mode resolution; quality-of-life: defensive coercion, panel completeness, hermetic test discipline) — all addressed in commit `a2f17e2`. Three-pass procedure proved its keep again; carrying as standard cycle discipline.*
+
+*Upstream sync (this session): merged `Q00/ouroboros:main` v0.30.0 → v0.31.1 (+35 commits) into local main. The architectural collision was instructive — upstream's #489 worker-cap fix and our Q4.1 AC-2 mode-resolution fix both targeted the plugin-dispatch path but from different angles. Resolution preserves AC-2's "seed-parse-before-dispatch" ordering (which is required for `execution_mode_required` to be readable) and slots #489's worker-cap resolution above it (which doesn't need the seed). 5847 tests green. Worth flagging upstream that AC-2 generalizes #489's fix shape: contracts that depend on the seed must be resolved before the plugin-dispatch gate, not after.*
