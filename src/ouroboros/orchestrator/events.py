@@ -864,6 +864,55 @@ def create_execution_terminal_event(
     )
 
 
+def create_mode_conflict_event(
+    session_id: str,
+    caller_mode: str,
+    seed_mode: str,
+    seed_id: str,
+) -> BaseEvent:
+    """Create execute-seed mode-conflict event (Q4.1 / AC-2).
+
+    Emitted from the MCP ``execute_seed`` handler when the caller-provided
+    ``mode`` argument disagrees with the seed's
+    ``metadata.execution_mode_required`` field.  Conflict policy is
+    "caller wins, log warning + emit structured event" — the event records
+    the override so AC-4's Run Summary panel can surface conflict counts
+    at run end without re-deriving them from log lines.
+
+    Aggregate is keyed on ``session_id`` (mirroring the other
+    ``orchestrator.session.*`` factories) so per-session conflict counts
+    can be aggregated by replaying events for a single session.
+
+    Args:
+        session_id: Parent session id (the session executing the seed).
+        caller_mode: Mode passed by the caller — the winner.  One of
+            ``"parallel"`` or ``"compounding"``.
+        seed_mode: Mode declared by the seed's
+            ``metadata.execution_mode_required`` — the loser.  One of
+            ``"parallel"`` or ``"compounding"``.
+        seed_id: ID of the seed being executed (interview-derived: groups
+            conflicts across sessions for the same seed).
+
+    Returns:
+        BaseEvent for the mode conflict.
+
+    [[INVARIANT: mode_conflict event type is mcp.execute_seed.mode_conflict]]
+    [[INVARIANT: caller_mode wins on conflict — seed_mode is recorded but not honored]]
+    """
+    return BaseEvent(
+        type="mcp.execute_seed.mode_conflict",
+        aggregate_type="session",
+        aggregate_id=session_id,
+        data={
+            "session_id": session_id,
+            "caller_mode": caller_mode,
+            "seed_mode": seed_mode,
+            "seed_id": seed_id,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    )
+
+
 def create_ac_qa_evaluated_event(
     session_id: str,
     execution_id: str,
@@ -928,6 +977,7 @@ __all__ = [
     "create_execution_terminal_event",
     "create_heartbeat_event",
     "create_mcp_tools_loaded_event",
+    "create_mode_conflict_event",
     "create_policy_capabilities_evaluated_event",
     "create_progress_event",
     "create_session_cancelled_event",

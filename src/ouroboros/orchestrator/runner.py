@@ -101,9 +101,38 @@ if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
     from ouroboros.mcp.client.manager import MCPClientManager
     from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
+    from ouroboros.orchestrator.level_context import PostmortemChain
     from ouroboros.persistence.event_store import EventStore
 
 log = get_logger(__name__)
+
+
+# Q4.1 / AC-4 sub-AC 5 — Run Summary aggregation imports.
+#
+# ``_q41_state`` is a leaf module (no inbound imports from runner/handlers) so
+# eager import is safe.  ``_get_min_reliability`` lives in ``serial_executor``;
+# eager import would surface a circular through the MCP tools package, so it is
+# resolved lazily at first call (the helper that needs it caches the function
+# in module-level state to keep the per-call cost zero after the first hit).
+from ouroboros.orchestrator import _q41_state  # noqa: E402
+
+
+def _get_min_reliability() -> float:
+    """Lazy proxy to :func:`ouroboros.orchestrator.serial_executor._get_min_reliability`.
+
+    Eager-importing :mod:`serial_executor` from :mod:`runner` re-introduces
+    the runner ↔ MCP-tools circular import (``serial_executor`` imports
+    :class:`ouroboros.mcp.tools.qa.QAHandler`, whose package ``__init__``
+    transitively imports :mod:`ouroboros.mcp.job_manager` which imports
+    ``runner.clear_cancellation``).  Resolving the symbol on first call —
+    after both modules have finished loading — sidesteps the cycle without
+    leaving the threshold lookup hard-wired to a constant.
+    """
+    from ouroboros.orchestrator.serial_executor import (
+        _get_min_reliability as _impl,
+    )
+
+    return _impl()
 
 
 # =============================================================================
@@ -433,6 +462,160 @@ SESSION_PROGRESS_PERSIST_INTERVAL = 10
 CANCELLATION_CHECK_INTERVAL = 5
 
 
+# =============================================================================
+# Q4.1 / AC-4 sub-AC 5 — Run Summary aggregation
+# =============================================================================
+#
+# These pure helpers extract the cost/QA/invariant/mode-conflict counters from
+# an end-of-run :class:`PostmortemChain` (or an empty chain in the single-call
+# path) and decide whether the Run Summary panel should print.  They are
+# intentionally module-level (not methods) so they can be unit-tested without
+# instantiating an :class:`OrchestratorRunner` and so the interface stays
+# explicit about all inputs.
+#
+# See ``docs/brainstorm/phase-2-q4.1-hardening-design.md``, "AC-4 Run Summary
+# observability" for the design rationale and the always-show-5-row decision.
+
+
+def _aggregate_run_summary_stats(
+    *,
+    chain: PostmortemChain | None,
+    session_id: str,
+    cost_usd: float,
+) -> dict[str, Any]:
+    """Aggregate the five end-of-run counters used by the Run Summary panel.
+
+    Args:
+        chain: Postmortem chain produced by the compounding executor, or
+            ``None`` for the single-call (parallel_degenerate / parallel)
+            paths.  When ``None`` is passed the QA / invariant counters
+            return zero/empty.
+        session_id: Session id used to drain the AC-2 mode-conflict counter
+            via :meth:`dict.pop`.  Drains exactly once per call so a
+            subsequent call with the same session id reads zero unless a
+            fresh conflict happened in between.
+        cost_usd: Estimated cost in USD captured from the workflow state
+            tracker when available; ``0.0`` is a valid degraded value.
+
+    Returns:
+        Dict with the five canonical keys consumed by the Run Summary
+        panel and persisted into ``completion_summary``:
+
+        * ``cost_usd`` — float, passed through.
+        * ``qa_calls`` — total ``qa_attempts`` across all postmortems.
+        * ``qa_verdicts`` — dict with ``passed`` / ``exhausted`` /
+          ``skipped_error`` / ``skipped_delegated`` counts.
+        * ``invariants_above_threshold`` — count of non-contradicted
+          invariants with reliability >= the runtime threshold.
+        * ``mode_conflicts`` — drained AC-2 counter for ``session_id``.
+
+    [[INVARIANT: _aggregate_run_summary_stats drains _mode_conflict_counter exactly once via dict.pop]]
+    """
+    qa_calls = 0
+    qa_verdicts = {
+        "passed": 0,
+        "exhausted": 0,
+        "skipped_error": 0,
+        "skipped_delegated": 0,
+    }
+    invariants_above_threshold = 0
+
+    if chain is not None and chain.postmortems:
+        threshold = _get_min_reliability()
+        for pm in chain.postmortems:
+            qa_calls += getattr(pm, "qa_attempts", 0) or 0
+            status = getattr(pm, "qa_status", None)
+            if status in qa_verdicts:
+                qa_verdicts[status] += 1
+            for inv in getattr(pm, "invariants_established", ()):  # type: ignore[assignment]
+                # ``Invariant`` carries reliability + is_contradicted; defensively
+                # gate via getattr so older serialized chains (pre-Q3) don't
+                # crash here.
+                if getattr(inv, "is_contradicted", False):
+                    continue
+                reliability = getattr(inv, "reliability", 0.0)
+                if reliability >= threshold:
+                    invariants_above_threshold += 1
+
+    mode_conflicts = _q41_state._mode_conflict_counter.pop(session_id, 0)
+
+    return {
+        "cost_usd": float(cost_usd or 0.0),
+        "qa_calls": qa_calls,
+        "qa_verdicts": qa_verdicts,
+        "invariants_above_threshold": invariants_above_threshold,
+        "mode_conflicts": mode_conflicts,
+    }
+
+
+def _should_render_run_summary_panel(
+    stats: dict[str, Any],
+    *,
+    is_compounding_mode: bool,
+    inline_qa: bool,
+) -> bool:
+    """Decide whether the Run Summary panel should print for this run.
+
+    Visibility gate (interview-derived; design-doc locked):
+
+    * ``is_compounding_mode`` — always show (compounding ALWAYS produces a
+      chain so the panel is informative even without QA).
+    * ``inline_qa`` — explicit caller request to surface QA stats.
+    * Any non-zero stat (cost, QA calls, mode conflicts, invariants) — keeps
+      parallel/single-call runs that *did* trip a counter visible too.
+
+    The panel itself uses an always-show-5-row format (zeros are rendered
+    as ``0``, not skipped) so downstream grep/parse stays stable.
+    """
+    if is_compounding_mode or inline_qa:
+        return True
+    return any(
+        [
+            stats.get("cost_usd", 0.0) > 0,
+            stats.get("qa_calls", 0) > 0,
+            stats.get("mode_conflicts", 0) > 0,
+            stats.get("invariants_above_threshold", 0) > 0,
+        ]
+    )
+
+
+def _render_run_summary_panel_text(
+    stats: dict[str, Any],
+    *,
+    ac_count: int,
+) -> str:
+    """Render the always-show-5-row body of the Run Summary panel.
+
+    Output is a fixed-shape five-line block (one per stat) so a downstream
+    consumer can ``grep "^Cost:"`` without worrying about conditional rows.
+    Pure / no I/O — the calling site is responsible for wrapping in a Rich
+    :class:`~rich.panel.Panel`.
+    """
+    qa_verdicts = stats.get("qa_verdicts") or {
+        "passed": 0,
+        "exhausted": 0,
+        "skipped_error": 0,
+        "skipped_delegated": 0,
+    }
+    cost = float(stats.get("cost_usd", 0.0) or 0.0)
+    qa_calls = int(stats.get("qa_calls", 0) or 0)
+    invariants = int(stats.get("invariants_above_threshold", 0) or 0)
+    conflicts = int(stats.get("mode_conflicts", 0) or 0)
+    threshold = _get_min_reliability()
+    lines = [
+        f"Cost:                ${cost:.2f} ({ac_count} ACs)",
+        f"QA calls:            {qa_calls} across {ac_count} ACs",
+        (
+            f"QA verdicts:         {qa_verdicts.get('passed', 0)} passed, "
+            f"{qa_verdicts.get('exhausted', 0)} exhausted, "
+            f"{qa_verdicts.get('skipped_error', 0)} errors"
+        ),
+        f"Invariants captured: {invariants} above threshold {threshold}",
+        f"Mode conflicts:      {conflicts}",
+    ]
+    return "\n".join(lines)
+
+
 class OrchestratorRunner:
     """Main orchestration runner for executing seeds via Claude Agent.
 
@@ -743,6 +926,50 @@ class OrchestratorRunner:
             "worktree_branch": self._task_workspace.branch,
             "task_cwd": self._task_workspace.effective_cwd,
         }
+
+    def _maybe_print_run_summary(
+        self,
+        stats: dict[str, Any],
+        *,
+        is_compounding_mode: bool,
+        inline_qa: bool,
+        ac_count: int,
+    ) -> None:
+        """Print the Run Summary panel below the existing completion panel.
+
+        Q4.1 / AC-4 sub-AC 5.  Visibility is gated by
+        :func:`_should_render_run_summary_panel` so non-compounding
+        non-inline-QA runs with all-zero stats keep producing the same
+        single-panel output as pre-Q4.1.  Render uses the always-show-5-row
+        format from :func:`_render_run_summary_panel_text` so downstream
+        grep/parse stays stable.
+
+        Failure mode: any exception during render or print is logged at
+        ``warning`` and swallowed — observability must never abort a
+        successful run.
+
+        [[INVARIANT: Run Summary panel print never raises into the runner]]
+        """
+        try:
+            if not _should_render_run_summary_panel(
+                stats,
+                is_compounding_mode=is_compounding_mode,
+                inline_qa=inline_qa,
+            ):
+                return
+            body = _render_run_summary_panel_text(stats, ac_count=ac_count)
+            self._console.print(
+                Panel(
+                    Text(body, style="cyan"),
+                    title="[cyan]Run Summary[/cyan]",
+                    border_style="cyan",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "orchestrator.runner.run_summary_panel.render_failed",
+                error=str(exc),
+            )
 
     def _effective_cwd(self, runtime_handle: RuntimeHandle | None = None) -> str | None:
         """Resolve the effective cwd for persisted runtime metadata."""
@@ -1805,9 +2032,17 @@ class OrchestratorRunner:
                 # Thread inline_qa / max_qa_retries through to the compounding executor.
                 # Only meaningful when mode == "compounding"; _execute_parallel
                 # passes them straight to _serial_kwargs and is otherwise inert.
+                #
+                # max_qa_retries is ALWAYS forwarded (not gated by `inline_qa`) so
+                # that an explicit caller-supplied retry budget reaches the executor
+                # even when inline_qa is False — e.g. the executor may run inline QA
+                # at a later stage if a sub-AC re-enables it, or surface the budget
+                # in completion summaries. inline_qa itself remains gated so the
+                # default-off path produces the same kwargs shape as before this
+                # change. (Q4.1 / AC-4 / item 2 — CodeRabbit deferral from PR #6.)
+                parallel_kwargs["max_qa_retries"] = max_qa_retries
                 if inline_qa:
                     parallel_kwargs["inline_qa"] = inline_qa
-                    parallel_kwargs["max_qa_retries"] = max_qa_retries
 
                 return await self._execute_parallel(**parallel_kwargs)
         except asyncio.CancelledError:
@@ -2088,9 +2323,24 @@ class OrchestratorRunner:
 
             # Emit completion event
             if success:
+                # Q4.1 / AC-4 sub-AC 5: aggregate Run Summary stats.
+                # Single-call path has no postmortem chain — pass None so QA /
+                # invariant counters return zero/empty.  Cost comes from the
+                # workflow state tracker (best-effort: degrades to 0.0 if the
+                # tracker hasn't been fed any token data yet).
+                _run_stats = _aggregate_run_summary_stats(
+                    chain=None,
+                    session_id=tracker.session_id,
+                    cost_usd=getattr(state_tracker.state, "estimated_cost_usd", 0.0),
+                )
                 completion_summary = {
                     "final_message": final_message[:500],
                     "messages_processed": messages_processed,
+                    "cost_usd": _run_stats["cost_usd"],
+                    "qa_calls": _run_stats["qa_calls"],
+                    "qa_verdicts": _run_stats["qa_verdicts"],
+                    "invariants_above_threshold": _run_stats["invariants_above_threshold"],
+                    "mode_conflicts": _run_stats["mode_conflicts"],
                     **self._task_summary(),
                 }
                 completed_event = create_session_completed_event(
@@ -2111,6 +2361,19 @@ class OrchestratorRunner:
                         title="[green]Execution Completed[/green]",
                         border_style="green",
                     )
+                )
+
+                # Q4.1 / AC-4 sub-AC 5: Run Summary panel (always-show-5-row).
+                # Single-call path has no compounding mode and no inline_qa, so
+                # the panel only fires when a stat is non-zero (typically a
+                # mode-conflict counter drained from the AC-2 site).  Print
+                # failure is swallowed — observability must never abort a
+                # successful run.
+                self._maybe_print_run_summary(
+                    _run_stats,
+                    is_compounding_mode=False,
+                    inline_qa=False,
+                    ac_count=len(seed.acceptance_criteria),
                 )
             else:
                 failed_event = create_session_failed_event(
@@ -2427,6 +2690,17 @@ class OrchestratorRunner:
             len(seed.acceptance_criteria),
             max_decomposition_depth=self._max_decomposition_depth,
         )
+        # Q4.1 / AC-4 sub-AC 5: aggregate Run Summary stats from the
+        # postmortem chain (compounding mode) or pass None (parallel mode —
+        # ParallelACExecutor doesn't expose a chain).  ``getattr`` keeps
+        # this resilient against a future executor that doesn't set
+        # ``last_completed_chain`` so callers don't crash on AttributeError.
+        _completed_chain = getattr(parallel_executor, "last_completed_chain", None)
+        _run_stats = _aggregate_run_summary_stats(
+            chain=_completed_chain,
+            session_id=tracker.session_id,
+            cost_usd=0.0,  # Cost tracker isn't fed in the staged path; degraded.
+        )
         execution_summary = {
             "goal": seed.goal,
             "acceptance_criteria_count": len(seed.acceptance_criteria),
@@ -2445,6 +2719,11 @@ class OrchestratorRunner:
             "max_decomposition_depth": self._max_decomposition_depth,
             "max_parallel_workers": self._max_parallel_workers,
             "verification_report": verification_report,
+            "cost_usd": _run_stats["cost_usd"],
+            "qa_calls": _run_stats["qa_calls"],
+            "qa_verdicts": _run_stats["qa_verdicts"],
+            "invariants_above_threshold": _run_stats["invariants_above_threshold"],
+            "mode_conflicts": _run_stats["mode_conflicts"],
             **self._task_summary(),
         }
 
@@ -2497,6 +2776,19 @@ class OrchestratorRunner:
                     border_style="yellow",
                 )
             )
+
+        # Q4.1 / AC-4 sub-AC 5: Run Summary panel (always-show-5-row).
+        # Compounding ALWAYS shows the panel (chain is informative regardless of
+        # QA); parallel mode keeps pre-Q4.1 behavior unless a counter is non-zero.
+        # Print runs after both success and partial-success branches so any
+        # mode-conflict counter drained by aggregate_run_summary_stats above is
+        # surfaced to the user even on a degraded run.
+        self._maybe_print_run_summary(
+            _run_stats,
+            is_compounding_mode=(mode == "compounding"),
+            inline_qa=inline_qa,
+            ac_count=len(seed.acceptance_criteria),
+        )
 
         await self._event_store.append(
             create_execution_terminal_event(

@@ -6,6 +6,7 @@ from ouroboros.orchestrator.capabilities import build_capability_graph
 from ouroboros.orchestrator.events import (
     create_ac_postmortem_captured_event,
     create_ac_qa_evaluated_event,
+    create_mode_conflict_event,
     create_policy_capabilities_evaluated_event,
     create_postmortem_chain_truncated_event,
     create_progress_event,
@@ -618,3 +619,67 @@ class TestACQAEvaluatedEvent:
         )
 
         assert event.aggregate_id == "ac_7"
+
+
+class TestModeConflictEvent:
+    """Tests for mcp.execute_seed.mode_conflict event (Q4.1 / AC-2).
+
+    Verifies that create_mode_conflict_event matches the existing factory
+    style: aggregate_type="session", aggregate_id=session_id, and the
+    payload carries caller_mode/seed_mode/seed_id alongside session_id and
+    a timestamp.
+
+    [[INVARIANT: mode_conflict event type is mcp.execute_seed.mode_conflict]]
+    [[INVARIANT: caller_mode wins on conflict — seed_mode is recorded but not honored]]
+    """
+
+    def test_create_mode_conflict_event_payload_shape(self) -> None:
+        """Verify event shape and full payload for a caller-vs-seed conflict.
+
+        Test 34 — Q4.1 / AC-2 sub-AC-2:
+        - event.type == "mcp.execute_seed.mode_conflict"
+        - aggregate_type == "session"
+        - aggregate_id == session_id
+        - data carries session_id, caller_mode, seed_mode, seed_id, timestamp
+        - timestamp parses as ISO-8601
+        """
+        event = create_mode_conflict_event(
+            session_id="sess_conflict_1",
+            caller_mode="parallel",
+            seed_mode="compounding",
+            seed_id="seed_demo_42",
+        )
+
+        # Envelope shape — mirrors orchestrator.session.* factories
+        assert event.type == "mcp.execute_seed.mode_conflict"
+        assert event.aggregate_type == "session"
+        assert event.aggregate_id == "sess_conflict_1"
+
+        # Full payload
+        assert event.data["session_id"] == "sess_conflict_1"
+        assert event.data["caller_mode"] == "parallel"
+        assert event.data["seed_mode"] == "compounding"
+        assert event.data["seed_id"] == "seed_demo_42"
+
+        # Timestamp present and parseable
+        assert "timestamp" in event.data
+        from datetime import datetime
+
+        datetime.fromisoformat(event.data["timestamp"])
+
+    def test_create_mode_conflict_event_reverse_direction(self) -> None:
+        """Caller=compounding vs seed=parallel is also a valid conflict.
+
+        The factory does not assume directionality — both fields are
+        recorded verbatim regardless of which mode is "winning".
+        """
+        event = create_mode_conflict_event(
+            session_id="sess_conflict_2",
+            caller_mode="compounding",
+            seed_mode="parallel",
+            seed_id="seed_legacy_7",
+        )
+
+        assert event.data["caller_mode"] == "compounding"
+        assert event.data["seed_mode"] == "parallel"
+        assert event.data["seed_id"] == "seed_legacy_7"

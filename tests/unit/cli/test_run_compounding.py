@@ -941,3 +941,115 @@ class TestInlineQAFlags:
         assert result.exit_code == 0, result.output
         # inline_qa should not be True when flag is absent
         assert not captured.get("inline_qa", False)
+
+    # --- Q4.1 / AC-4 item 1: max_qa_retries explicit-source gating ---
+    #
+    # The `run.max_qa_retries.ignored_without_inline_qa` warning must only
+    # fire when the user *explicitly* typed --max-qa-retries on the command
+    # line (not when typer/click filled in the default value, a default
+    # map, or an environment variable). Tests 52-54 lock that contract.
+
+    def test_max_qa_retries_default_does_not_warn(self, tmp_path: Path) -> None:
+        """Test 52: When --max-qa-retries is NOT passed (default 1), no warning fires.
+
+        ParameterSource is DEFAULT so the explicit-CLI gate is closed even
+        though `not inline_qa` is true. Confirms baseline silence — neither
+        the legacy `value != 1` test nor the new ParameterSource gate fire.
+        """
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            # --compounding (so we're in a mode where inline_qa is meaningful)
+            # but no --inline-qa and no --max-qa-retries: warning must stay
+            # silent because the user didn't ask for any non-default retries.
+            result = runner.invoke(
+                run_app,
+                ["workflow", str(seed_path), "--compounding"],
+            )
+        assert result.exit_code == 0, result.output
+        # The warning text must NOT appear in CLI output.
+        assert "max-qa-retries has no effect" not in result.output.lower()
+        assert "max_qa_retries.ignored_without_inline_qa" not in result.output
+
+    def test_max_qa_retries_explicit_default_value_does_not_warn(
+        self, tmp_path: Path
+    ) -> None:
+        """Test 53: --max-qa-retries 1 (explicit, matches default) does not warn.
+
+        ParameterSource is COMMANDLINE so the explicit-CLI gate opens, but
+        the legacy `max_qa_retries != 1` second gate stays closed because
+        the user re-stated the default value. Intent equals default, so no
+        warning. This locks the boundary case where someone scripts the
+        flag with the default value for clarity.
+        """
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                [
+                    "workflow",
+                    str(seed_path),
+                    "--compounding",
+                    "--max-qa-retries",
+                    "1",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "max-qa-retries has no effect" not in result.output.lower()
+        # max_qa_retries=1 must still be forwarded.
+        assert captured.get("max_qa_retries") == 1
+
+    def test_max_qa_retries_explicit_nondefault_without_inline_qa_warns(
+        self, tmp_path: Path
+    ) -> None:
+        """Test 54: --max-qa-retries 5 (explicit non-default) without --inline-qa warns.
+
+        ParameterSource is COMMANDLINE *and* value != 1 *and* inline_qa is
+        off — all three gates open, so the deprecation/ignore warning must
+        appear. This is the canonical "user wanted retries but forgot
+        --inline-qa" case the warning was designed to catch.
+        """
+        seed_path = _write_seed(tmp_path)
+        captured: dict = {}
+
+        async def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(side_effect=fake_run),
+        ):
+            result = runner.invoke(
+                run_app,
+                [
+                    "workflow",
+                    str(seed_path),
+                    "--compounding",
+                    "--max-qa-retries",
+                    "5",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        # Warning text must appear in CLI output.
+        assert (
+            "max-qa-retries has no effect" in result.output.lower()
+            or "no effect without --inline-qa" in result.output.lower()
+        )
+        # Even though we warn, the value still flows through to
+        # _run_orchestrator (forwarding is independent of warning emission).
+        assert captured.get("max_qa_retries") == 5

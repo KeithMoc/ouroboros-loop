@@ -604,8 +604,24 @@ class ACPostmortem:
     sub_postmortems: tuple["ACPostmortem", ...] = field(default_factory=tuple)
     # Q4 inline-QA fields — default None/0 preserves forward-compat with old chains
     qa_verdict: dict[str, Any] | None = None
-    qa_status: str | None = None  # None | "passed" | "exhausted" | "skipped_delegated"
+    qa_status: str | None = None
+    # qa_status enum:
+    #   None                 — inline QA not enabled / never invoked for this AC
+    #   "pending"            — Q4.1 / AC-3 sentinel: agent succeeded + checkpoint
+    #                          written, but the QA call has not yet returned a
+    #                          terminal verdict.  On resume the QA loop replays
+    #                          against the agent's already-committed work
+    #                          (no agent re-run).
+    #   "passed"             — QA judge returned a terminal pass verdict.
+    #   "exhausted"          — Q4 soft-pass: QA never reached pass within the
+    #                          retry budget; AC is allowed to proceed.
+    #   "skipped_delegated"  — QA was delegated out of the inline path.
     qa_attempts: int = 0
+    # Q4.1 / AC-3: final_message captured from the agent's last response so the
+    # QA-replay branch on resume can re-invoke ``run_inline_qa`` with the same
+    # artifact (final_message + diff_summary) the original attempt judged.
+    # Defaults to None for forward-compat with chains serialized before Q4.1.
+    final_message: str | None = None
 
     def to_digest(
         self,
@@ -768,6 +784,34 @@ class PostmortemChain:
     def append(self, postmortem: ACPostmortem) -> "PostmortemChain":
         """Return a new chain with ``postmortem`` appended (immutable)."""
         return PostmortemChain(postmortems=self.postmortems + (postmortem,))
+
+    def replace_last(self, postmortem: ACPostmortem) -> "PostmortemChain":
+        """Return a new chain with the most recent postmortem replaced.
+
+        Frozen-safe in-place-style update: the underlying ``postmortems``
+        tuple is rebuilt with the final entry swapped for ``postmortem``.
+        Used by the Q4.1 QA-replay-on-resume path (AC-3) to overwrite a
+        ``qa_status='pending'`` sentinel postmortem with the final verdict
+        without re-running the agent — and by the in-flight QA finalization
+        path to flip the sentinel to its terminal verdict.
+
+        The most recent postmortem is the chain's last element by index.
+        Re-using the same ``postmortem`` argument is idempotent (multiple
+        calls produce equivalent chains).
+
+        Raises:
+            IndexError: if the chain is empty. Callers must ensure at least
+                one postmortem has been appended (e.g., the phase-1 sentinel
+                write) before invoking ``replace_last``.
+
+        [[INVARIANT: PostmortemChain.replace_last is frozen-safe and replaces only the last postmortem]]
+        """
+        if not self.postmortems:
+            raise IndexError(
+                "PostmortemChain.replace_last called on an empty chain; "
+                "append a postmortem (e.g. qa_status='pending' sentinel) first."
+            )
+        return PostmortemChain(postmortems=self.postmortems[:-1] + (postmortem,))
 
     def cumulative_invariants(self) -> tuple[Invariant, ...]:
         """Deduplicated invariants across all ACs, in insertion order.
@@ -1200,6 +1244,9 @@ def _deserialize_postmortem(d: dict[str, Any]) -> ACPostmortem:
         qa_verdict=d.get("qa_verdict"),
         qa_status=d.get("qa_status"),
         qa_attempts=d.get("qa_attempts", 0),
+        # Q4.1 / AC-3: forward-compat — chains serialized before final_message
+        # was added hydrate as None and silently fall through.
+        final_message=d.get("final_message"),
     )
 
 
