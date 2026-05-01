@@ -17,7 +17,7 @@ This module defines:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -142,6 +142,13 @@ class SeedMetadata(BaseModel, frozen=True):
         created_at: When this seed was generated.
         ambiguity_score: The ambiguity score at generation time.
         interview_id: Reference to the source interview.
+        parent_seed_id: Reference to the parent seed when this seed was evolved.
+        execution_mode_required: Mode the seed expects ('parallel' or
+            'compounding'). ``None`` means the seed expresses no preference and
+            the caller / global default applies. Honored by the MCP
+            ``ouroboros_execute_seed`` handler under the caller-wins-and-warn
+            policy (see Q4.1 / AC-2 in
+            ``docs/brainstorm/phase-2-q4.1-hardening-design.md``).
     """
 
     seed_id: str = Field(default_factory=lambda: f"seed_{uuid4().hex[:12]}")
@@ -150,6 +157,10 @@ class SeedMetadata(BaseModel, frozen=True):
     ambiguity_score: float = Field(default=0.15, ge=0.0, le=1.0)
     interview_id: str | None = Field(default=None)
     parent_seed_id: str | None = Field(default=None)
+    execution_mode_required: Literal["parallel", "compounding"] | None = Field(
+        default=None,
+        description="Mode the seed expects. None = no preference.",
+    )
 
 
 class Seed(BaseModel, frozen=True):

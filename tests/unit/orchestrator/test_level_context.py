@@ -996,6 +996,37 @@ class TestPostmortemChain:
         assert c0.postmortems == ()
         assert len(c1.postmortems) == 1
 
+    def test_replace_last_swaps_only_terminal_entry(self) -> None:
+        pm0 = _mk_pm(0)
+        pm1 = _mk_pm(1)
+        pm1_final = _mk_pm(1, content="final_for_pm1")
+        chain = PostmortemChain(postmortems=(pm0, pm1))
+
+        replaced = chain.replace_last(pm1_final)
+
+        # Original chain unchanged (frozen).
+        assert chain.postmortems == (pm0, pm1)
+        # Replacement chain swaps only the last element.
+        assert len(replaced.postmortems) == 2
+        assert replaced.postmortems[0] is pm0
+        assert replaced.postmortems[1] is pm1_final
+
+    def test_replace_last_is_idempotent(self) -> None:
+        pm0 = _mk_pm(0)
+        pm1_final = _mk_pm(1, content="terminal")
+        chain = PostmortemChain(postmortems=(pm0, _mk_pm(1)))
+
+        once = chain.replace_last(pm1_final)
+        twice = once.replace_last(pm1_final)
+
+        assert once.postmortems == twice.postmortems
+
+    def test_replace_last_on_empty_chain_raises(self) -> None:
+        import pytest
+
+        with pytest.raises(IndexError):
+            PostmortemChain().replace_last(_mk_pm(0))
+
     def test_cumulative_invariants_deduplicated_in_order(self) -> None:
         chain = PostmortemChain(
             postmortems=(
@@ -2830,3 +2861,121 @@ class TestACPostmortemQAFields:
         pm = ACPostmortem(summary=summary)
         digest = pm.to_digest()
         assert "QA:" not in digest
+
+
+class TestACPostmortemQAPendingAndFinalMessage:
+    """Tests 35-38: Q4.1 / AC-3 schema additions on ACPostmortem.
+
+    Cycle Q4.1 (hardening for serial-compounding) extends ``ACPostmortem``
+    with two additive, forward-compatible fields:
+
+    * ``qa_status="pending"`` — sentinel written between phase-1 and phase-2
+      checkpoints so a Ctrl+C-during-QA crash on resume can replay QA-only
+      against the agent's already-committed work (no agent re-run).
+    * ``final_message: str | None`` — captured from the agent's last response
+      so the QA-replay branch on resume can re-invoke ``run_inline_qa`` with
+      the same artifact (final_message + diff_summary) the original attempt
+      judged.
+
+    These tests verify that the new schema additions are backward-compatible
+    with chains serialized before Q4.1 (old dicts hydrate cleanly via the
+    existing ``d.get(...)`` defaults pattern), that round-trip serialization
+    preserves both new fields, and that the ``"pending"`` enum value is a
+    legal qa_status that survives a serialize/deserialize round-trip.
+
+    See ``docs/brainstorm/phase-2-q4.1-hardening-design.md`` (AC-3).
+    """
+
+    def _make_summary(self, ac_index: int = 0, content: str = "Test AC") -> ACContextSummary:
+        return ACContextSummary(ac_index=ac_index, ac_content=content, success=True)
+
+    # Test 35 — Default construction yields final_message=None
+    def test_35_acpostmortem_default_final_message(self) -> None:
+        """ACPostmortem(summary=...) constructs with final_message=None by default.
+
+        This locks in the forward-compat invariant: the new field must default
+        to None so callers that don't set it (parallel mode, non-inline-QA
+        runs, older code paths) produce the same byte-shape as today.
+        """
+        summary = self._make_summary()
+        pm = ACPostmortem(summary=summary)
+        assert pm.final_message is None
+        # Other QA fields untouched by this addition
+        assert pm.qa_verdict is None
+        assert pm.qa_status is None
+        assert pm.qa_attempts == 0
+
+    # Test 36 — Round-trip serialization preserves final_message
+    def test_36_serialize_deserialize_roundtrip_final_message(self) -> None:
+        """serialize_postmortem_chain → deserialize_postmortem_chain
+        round-trip preserves final_message (str)."""
+        summary = self._make_summary(content="Implement feature W")
+        pm = ACPostmortem(
+            summary=summary,
+            final_message="Implemented widget; all tests pass.",
+            qa_verdict={"score": 0.91, "verdict": "pass"},
+            qa_status="passed",
+            qa_attempts=1,
+        )
+        chain = PostmortemChain(postmortems=(pm,))
+        serialized = serialize_postmortem_chain(chain)
+        # final_message must be present on the serialized side too
+        assert serialized[0].get("final_message") == "Implemented widget; all tests pass."
+
+        chain2 = deserialize_postmortem_chain(serialized)
+        pm2 = chain2.postmortems[0]
+        assert pm2.final_message == "Implemented widget; all tests pass."
+        # And the rest of the QA fields still round-trip
+        assert pm2.qa_status == "passed"
+        assert pm2.qa_attempts == 1
+
+    # Test 37 — Forward-compat: old chain dict missing final_message → None
+    def test_37_deserialize_old_chain_missing_final_message_yields_none(self) -> None:
+        """_deserialize_postmortem with a dict missing the final_message key
+        (forward-compat: chain serialized before Q4.1) hydrates final_message
+        as None without raising."""
+        # Pre-Q4.1 serialized shape: includes Q4 qa_* fields but NOT final_message.
+        old_dict: dict = {
+            "summary": {
+                "ac_index": 2,
+                "ac_content": "Pre-Q4.1 AC without final_message",
+                "success": True,
+            },
+            "status": "pass",
+            "diff_summary": "diff goes here",
+            "qa_verdict": {"score": 0.8, "verdict": "pass"},
+            "qa_status": "passed",
+            "qa_attempts": 1,
+        }
+        pm = _deserialize_postmortem(old_dict)
+        assert pm.final_message is None
+        # Old qa_* fields still hydrate correctly
+        assert pm.qa_status == "passed"
+        assert pm.qa_attempts == 1
+        assert pm.qa_verdict == {"score": 0.8, "verdict": "pass"}
+
+    # Test 38 — qa_status="pending" round-trips through serialization
+    def test_38_qa_status_pending_roundtrip(self) -> None:
+        """qa_status='pending' (Q4.1 / AC-3 sentinel) survives a
+        serialize/deserialize round-trip and is preserved verbatim — the
+        resume path's branch on ``qa_status == 'pending'`` therefore fires
+        correctly when a phase-1 checkpoint is rehydrated."""
+        summary = self._make_summary(content="Crash-during-QA AC")
+        pm = ACPostmortem(
+            summary=summary,
+            qa_status="pending",
+            qa_attempts=0,
+            qa_verdict=None,
+            final_message="Agent's final reply pre-QA.",
+        )
+        chain = PostmortemChain(postmortems=(pm,))
+        serialized = serialize_postmortem_chain(chain)
+        assert serialized[0].get("qa_status") == "pending"
+        assert serialized[0].get("final_message") == "Agent's final reply pre-QA."
+
+        chain2 = deserialize_postmortem_chain(serialized)
+        pm2 = chain2.postmortems[0]
+        assert pm2.qa_status == "pending"
+        assert pm2.qa_attempts == 0
+        assert pm2.qa_verdict is None
+        assert pm2.final_message == "Agent's final reply pre-QA."

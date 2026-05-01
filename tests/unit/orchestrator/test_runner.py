@@ -448,11 +448,17 @@ class TestOrchestratorRunner:
         assert result.is_ok
         assert result.value == orchestrator_result
         prepare_session.assert_awaited_once_with(sample_seed, execution_id="exec_delegated")
+        # Q4.1 / AC-4 (deferred CR item — addressed in PR #7 follow-up):
+        # max_qa_retries is now forwarded unconditionally (was previously
+        # only forwarded when inline_qa=True).  The default value of 1
+        # propagates through, mirroring prepare_session() +
+        # execute_precreated_session() behavior.
         execute_precreated.assert_awaited_once_with(
             seed=sample_seed,
             tracker=tracker,
             parallel=True,
             mode=None,
+            max_qa_retries=1,
         )
 
     @pytest.mark.asyncio
@@ -2211,6 +2217,101 @@ class TestOrchestratorRunner:
         assert "Write: /tmp/project/task_store.py" in verification_report
         assert "Decomposed placeholder should not leak" not in verification_report
 
+    # -----------------------------------------------------------------
+    # Test 55-56 — Q4.1 / AC-4 / item 2
+    #
+    # `parallel_kwargs['max_qa_retries']` must be ALWAYS forwarded to
+    # `_execute_parallel`, regardless of whether `inline_qa` is set, so an
+    # explicit caller-supplied retry budget reaches the executor even when
+    # inline QA is disabled at dispatch time.  `parallel_kwargs['inline_qa']`
+    # remains gated by the `if inline_qa:` block so the default-off path
+    # produces the same kwargs shape as before this change (no spurious
+    # `inline_qa=False` key).
+    # -----------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_execute_precreated_session_forwards_max_qa_retries_when_inline_qa_disabled(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """max_qa_retries is forwarded to _execute_parallel even when inline_qa=False.
+
+        Regression guard for Q4.1 / AC-4 / item 2: the de-indented assignment
+        must reach _execute_parallel kwargs whether or not inline_qa is True,
+        while inline_qa itself stays gated to preserve the historical kwargs
+        shape on the default-off path.
+        """
+        tracker = SessionTracker.create("exec_qa_budget", sample_seed.metadata.seed_id)
+
+        synthetic_result = OrchestratorResult(
+            success=True,
+            session_id=tracker.session_id,
+            execution_id=tracker.execution_id,
+        )
+
+        # Patch _execute_parallel to capture kwargs and short-circuit.
+        execute_parallel_mock = AsyncMock(return_value=Result.ok(synthetic_result))
+
+        with (
+            patch.object(runner, "_execute_parallel", execute_parallel_mock),
+            patch.object(runner._session_repo, "mark_completed", AsyncMock(return_value=Result.ok(None))),
+        ):
+            result = await runner.execute_precreated_session(
+                seed=sample_seed,
+                tracker=tracker,
+                inline_qa=False,
+                max_qa_retries=7,
+            )
+
+        assert result.is_ok
+        execute_parallel_mock.assert_awaited_once()
+        kwargs = execute_parallel_mock.await_args.kwargs
+        # Always-forward: max_qa_retries reaches the executor even with inline_qa=False.
+        assert kwargs.get("max_qa_retries") == 7
+        # Gate preserved: inline_qa key MUST be absent (not forwarded as False) so
+        # the default-off kwargs shape matches the pre-change behavior.
+        assert "inline_qa" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_execute_precreated_session_forwards_both_when_inline_qa_enabled(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """When inline_qa=True, both max_qa_retries and inline_qa are forwarded.
+
+        Companion to the previous test — confirms the gated `inline_qa` key is
+        added back into parallel_kwargs only when explicitly enabled, and that
+        max_qa_retries continues to be forwarded alongside it.
+        """
+        tracker = SessionTracker.create("exec_qa_full", sample_seed.metadata.seed_id)
+
+        synthetic_result = OrchestratorResult(
+            success=True,
+            session_id=tracker.session_id,
+            execution_id=tracker.execution_id,
+        )
+
+        execute_parallel_mock = AsyncMock(return_value=Result.ok(synthetic_result))
+
+        with (
+            patch.object(runner, "_execute_parallel", execute_parallel_mock),
+            patch.object(runner._session_repo, "mark_completed", AsyncMock(return_value=Result.ok(None))),
+        ):
+            result = await runner.execute_precreated_session(
+                seed=sample_seed,
+                tracker=tracker,
+                inline_qa=True,
+                max_qa_retries=3,
+            )
+
+        assert result.is_ok
+        execute_parallel_mock.assert_awaited_once()
+        kwargs = execute_parallel_mock.await_args.kwargs
+        assert kwargs.get("inline_qa") is True
+        assert kwargs.get("max_qa_retries") == 3
+
 
 class TestOrchestratorError:
     """Tests for OrchestratorError."""
@@ -3114,3 +3215,395 @@ class TestExecutionCancelledError:
         assert error.session_id == "sess_456"
         assert error.reason == "Auto-cleanup: stale"
         assert "Auto-cleanup: stale" in str(error)
+
+
+# ---------------------------------------------------------------------------
+# Q4.1 / AC-4 sub-AC 5 — Run Summary observability (Tests 60–64)
+# ---------------------------------------------------------------------------
+#
+# These tests cover the four pure helpers introduced in
+# ``runner.py`` (``_aggregate_run_summary_stats``,
+# ``_should_render_run_summary_panel``, ``_render_run_summary_panel_text``)
+# and the runner method ``_maybe_print_run_summary``.  Each helper is
+# exercised in isolation (no live runtime / event store) so the tests
+# stay fast and deterministic.
+#
+# [[INVARIANT: Run Summary tests cover empty-chain, populated-chain, gate, render, and graceful-degradation paths]]
+
+
+class TestRunSummaryAggregation:
+    """Run Summary stat aggregation + visibility gate + panel rendering."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_q41_state(self) -> Any:
+        """Reset the cross-module mode-conflict counter between tests.
+
+        ``_q41_state._mode_conflict_counter`` is a module-level dict shared
+        with the MCP execute-seed handler; leftover entries from another
+        test would corrupt assertions on counter draining.
+        """
+        from ouroboros.orchestrator import _q41_state
+
+        _q41_state._mode_conflict_counter.clear()
+        yield
+        _q41_state._mode_conflict_counter.clear()
+
+    def test_60_aggregate_empty_chain_yields_zero_counters(self) -> None:
+        """Test 60: empty chain + no conflict → all-zero stats with canonical keys.
+
+        The single-call (``parallel_degenerate``) path passes ``chain=None``;
+        aggregation must still return the five canonical keys with safe
+        zero/empty values so the completion summary dict is shape-stable.
+        """
+        from ouroboros.orchestrator.runner import _aggregate_run_summary_stats
+
+        stats = _aggregate_run_summary_stats(
+            chain=None,
+            session_id="sess_test60",
+            cost_usd=0.0,
+        )
+
+        assert stats == {
+            "cost_usd": 0.0,
+            "qa_calls": 0,
+            "qa_verdicts": {
+                "passed": 0,
+                "exhausted": 0,
+                "skipped_error": 0,
+                "skipped_delegated": 0,
+            },
+            "invariants_above_threshold": 0,
+            "mode_conflicts": 0,
+        }
+
+    def test_61_aggregate_populated_chain_sums_qa_and_invariants(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test 61: populated chain → qa_calls / qa_verdicts / invariants_above_threshold roll up.
+
+        Builds a 3-AC chain with mixed qa_status + a mix of below/above-
+        threshold invariants and a contradicted invariant.  Verifies the
+        counters reflect what the design doc spec'd at lines 287–339:
+
+        * ``qa_calls`` = sum of ``qa_attempts`` across all postmortems.
+        * ``qa_verdicts`` = per-status counts.
+        * ``invariants_above_threshold`` = non-contradicted with reliability
+          ≥ ``_get_min_reliability()``.
+
+        Hermeticity: ``_aggregate_run_summary_stats`` reads
+        ``_get_min_reliability()`` dynamically from
+        ``OUROBOROS_INVARIANT_MIN_RELIABILITY``.  Pin the threshold to 0.7
+        so the assertion below isn't sensitive to the developer's shell.
+        """
+        monkeypatch.setenv("OUROBOROS_INVARIANT_MIN_RELIABILITY", "0.7")
+
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            Invariant,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.runner import _aggregate_run_summary_stats
+
+        def _make_pm(
+            ac_index: int,
+            *,
+            qa_status: str | None,
+            qa_attempts: int,
+            invariants: tuple[Invariant, ...],
+        ) -> ACPostmortem:
+            return ACPostmortem(
+                summary=ACContextSummary(
+                    ac_index=ac_index,
+                    ac_content=f"AC {ac_index}",
+                    success=True,
+                ),
+                qa_status=qa_status,
+                qa_attempts=qa_attempts,
+                invariants_established=invariants,
+            )
+
+        chain = PostmortemChain(
+            postmortems=(
+                _make_pm(
+                    0,
+                    qa_status="passed",
+                    qa_attempts=1,
+                    invariants=(
+                        Invariant(text="A holds", reliability=0.9),
+                        # Below threshold (0.7) — should not count.
+                        Invariant(text="B unsure", reliability=0.5),
+                    ),
+                ),
+                _make_pm(
+                    1,
+                    qa_status="exhausted",
+                    qa_attempts=2,
+                    invariants=(
+                        # Contradicted — must not count even with high reliability.
+                        Invariant(text="C false", reliability=1.0, is_contradicted=True),
+                        Invariant(text="D holds", reliability=0.95),
+                    ),
+                ),
+                _make_pm(
+                    2,
+                    qa_status="skipped_error",
+                    qa_attempts=0,
+                    invariants=(),
+                ),
+            )
+        )
+
+        stats = _aggregate_run_summary_stats(
+            chain=chain,
+            session_id="sess_test61",
+            cost_usd=1.234,
+        )
+
+        # qa_calls = 1 + 2 + 0
+        assert stats["qa_calls"] == 3
+        # verdict distribution
+        assert stats["qa_verdicts"] == {
+            "passed": 1,
+            "exhausted": 1,
+            "skipped_error": 1,
+            "skipped_delegated": 0,
+        }
+        # 0.9 + 0.95 above 0.7 threshold; the 0.5 + the contradicted are excluded.
+        assert stats["invariants_above_threshold"] == 2
+        # Cost passes through.
+        assert stats["cost_usd"] == 1.234
+
+    def test_62_aggregate_drains_mode_conflict_counter_via_pop(self) -> None:
+        """Test 62: ``_mode_conflict_counter`` is drained exactly once per call.
+
+        The AC-2 caller-wins-and-warn site increments
+        ``_q41_state._mode_conflict_counter[session_id]``.  At end-of-run
+        the runner must consume that counter via ``dict.pop`` so a follow-up
+        aggregation against the same session id reads zero (no double-count
+        across e.g. resume + retry).
+
+        [[INVARIANT: aggregate_run_summary_stats drains _mode_conflict_counter exactly once per call]]
+        """
+        from ouroboros.orchestrator import _q41_state
+        from ouroboros.orchestrator.runner import _aggregate_run_summary_stats
+
+        _q41_state._mode_conflict_counter["sess_test62"] = 5
+
+        first = _aggregate_run_summary_stats(
+            chain=None,
+            session_id="sess_test62",
+            cost_usd=0.0,
+        )
+        assert first["mode_conflicts"] == 5
+        # Counter has been popped — the same session id reads zero now.
+        assert "sess_test62" not in _q41_state._mode_conflict_counter
+
+        second = _aggregate_run_summary_stats(
+            chain=None,
+            session_id="sess_test62",
+            cost_usd=0.0,
+        )
+        assert second["mode_conflicts"] == 0
+
+    def test_63_visibility_gate_compounding_or_inline_qa_or_nonzero_stat(self) -> None:
+        """Test 63: visibility gate — compounding mode OR inline_qa OR any non-zero stat.
+
+        Walks the gate truth table from the design doc:
+
+        * compounding mode → True (always show)
+        * inline_qa flag → True (always show)
+        * non-zero cost / qa_calls / mode_conflicts / invariants → True
+        * everything zero, parallel mode, no inline_qa → False (preserves
+          pre-Q4.1 byte-identical output for parallel runs).
+        """
+        from ouroboros.orchestrator.runner import _should_render_run_summary_panel
+
+        zero_stats: dict[str, Any] = {
+            "cost_usd": 0.0,
+            "qa_calls": 0,
+            "qa_verdicts": {
+                "passed": 0,
+                "exhausted": 0,
+                "skipped_error": 0,
+                "skipped_delegated": 0,
+            },
+            "invariants_above_threshold": 0,
+            "mode_conflicts": 0,
+        }
+
+        # All-zero + parallel mode + no inline_qa → hidden.
+        assert (
+            _should_render_run_summary_panel(
+                zero_stats, is_compounding_mode=False, inline_qa=False
+            )
+            is False
+        )
+        # Compounding mode → always shown.
+        assert (
+            _should_render_run_summary_panel(
+                zero_stats, is_compounding_mode=True, inline_qa=False
+            )
+            is True
+        )
+        # Inline-QA flag → always shown.
+        assert (
+            _should_render_run_summary_panel(
+                zero_stats, is_compounding_mode=False, inline_qa=True
+            )
+            is True
+        )
+        # Non-zero mode_conflicts trips the gate even in parallel mode.
+        assert (
+            _should_render_run_summary_panel(
+                {**zero_stats, "mode_conflicts": 1},
+                is_compounding_mode=False,
+                inline_qa=False,
+            )
+            is True
+        )
+        # Non-zero cost trips the gate.
+        assert (
+            _should_render_run_summary_panel(
+                {**zero_stats, "cost_usd": 0.01},
+                is_compounding_mode=False,
+                inline_qa=False,
+            )
+            is True
+        )
+        # Non-zero qa_calls trips the gate.
+        assert (
+            _should_render_run_summary_panel(
+                {**zero_stats, "qa_calls": 1},
+                is_compounding_mode=False,
+                inline_qa=False,
+            )
+            is True
+        )
+        # Non-zero invariants_above_threshold trips the gate.
+        assert (
+            _should_render_run_summary_panel(
+                {**zero_stats, "invariants_above_threshold": 1},
+                is_compounding_mode=False,
+                inline_qa=False,
+            )
+            is True
+        )
+
+    def test_64_panel_text_always_shows_5_rows_with_zero_explicit(
+        self, sample_seed: Seed
+    ) -> None:
+        """Test 64: panel text always shows 5 rows (zero-explicit) and graceful render.
+
+        The always-show-5-row format is interview-derived: a stable shape
+        keeps grep / parse stable for downstream tooling.  This test
+        confirms
+
+        1. exactly five rows are produced regardless of stat values;
+        2. zero values render as ``0`` (not omitted);
+        3. the threshold from ``_get_min_reliability`` appears in the
+           Invariants row;
+        4. the ``_maybe_print_run_summary`` runner method swallows render
+           failures so observability never aborts a successful run.
+        """
+        from ouroboros.orchestrator.runner import (
+            _render_run_summary_panel_text,
+            _should_render_run_summary_panel,
+        )
+
+        # All-zero stats still produce 5 rows.
+        zero_text = _render_run_summary_panel_text(
+            {
+                "cost_usd": 0.0,
+                "qa_calls": 0,
+                "qa_verdicts": {
+                    "passed": 0,
+                    "exhausted": 0,
+                    "skipped_error": 0,
+                    "skipped_delegated": 0,
+                },
+                "invariants_above_threshold": 0,
+                "mode_conflicts": 0,
+            },
+            ac_count=3,
+        )
+        zero_lines = zero_text.splitlines()
+        assert len(zero_lines) == 5
+        assert zero_lines[0].startswith("Cost:")
+        assert zero_lines[1].startswith("QA calls:")
+        assert zero_lines[2].startswith("QA verdicts:")
+        assert zero_lines[3].startswith("Invariants captured:")
+        assert zero_lines[4].startswith("Mode conflicts:")
+        # Zero values are rendered explicitly, not skipped.
+        assert "$0.00" in zero_lines[0]
+        assert "0 across 3 ACs" in zero_lines[1]
+        assert "0 passed, 0 exhausted, 0 errors" in zero_lines[2]
+        assert "0 above threshold" in zero_lines[3]
+        assert "Mode conflicts:      0" in zero_lines[4]
+
+        # Populated stats keep the same 5-row shape.
+        populated_text = _render_run_summary_panel_text(
+            {
+                "cost_usd": 0.42,
+                "qa_calls": 4,
+                "qa_verdicts": {
+                    "passed": 2,
+                    "exhausted": 1,
+                    "skipped_error": 1,
+                    "skipped_delegated": 0,
+                },
+                "invariants_above_threshold": 7,
+                "mode_conflicts": 1,
+            },
+            ac_count=4,
+        )
+        populated_lines = populated_text.splitlines()
+        assert len(populated_lines) == 5
+        assert "$0.42 (4 ACs)" in populated_lines[0]
+        assert "4 across 4 ACs" in populated_lines[1]
+        assert "2 passed, 1 exhausted, 1 errors" in populated_lines[2]
+        assert "7 above threshold" in populated_lines[3]
+        assert populated_lines[4] == "Mode conflicts:      1"
+
+        # Graceful render: a runner whose console raises on print must NOT
+        # propagate the exception out of ``_maybe_print_run_summary``.
+        from unittest.mock import MagicMock as _MagicMock
+
+        from ouroboros.orchestrator.runner import OrchestratorRunner
+
+        runner = OrchestratorRunner.__new__(OrchestratorRunner)
+        runner._console = _MagicMock()  # type: ignore[attr-defined]
+        runner._console.print.side_effect = RuntimeError("rich console exploded")
+        # Should not raise — error is logged at warning and swallowed.
+        runner._maybe_print_run_summary(  # type: ignore[attr-defined]
+            {
+                "cost_usd": 0.0,
+                "qa_calls": 0,
+                "qa_verdicts": {
+                    "passed": 0,
+                    "exhausted": 0,
+                    "skipped_error": 0,
+                    "skipped_delegated": 0,
+                },
+                "invariants_above_threshold": 0,
+                "mode_conflicts": 0,
+            },
+            is_compounding_mode=True,  # force the gate so print is attempted
+            inline_qa=False,
+            ac_count=len(sample_seed.acceptance_criteria),
+        )
+
+        # Sanity-check: gate would have allowed the print.
+        assert (
+            _should_render_run_summary_panel(
+                {
+                    "cost_usd": 0.0,
+                    "qa_calls": 0,
+                    "mode_conflicts": 0,
+                    "invariants_above_threshold": 0,
+                },
+                is_compounding_mode=True,
+                inline_qa=False,
+            )
+            is True
+        )

@@ -7473,12 +7473,23 @@ class TestInlineQAIntegration:
 
 
     @pytest.mark.asyncio
-    async def test_inline_qa_decomposed_ac_parent_only(self) -> None:
-        """10. Decomposed AC: QA runs once on parent, not per sub-AC. Sub-postmortems qa_status=None.
+    async def test_inline_qa_parent_only_is_intentional(self) -> None:
+        """Parent-only QA on decomposed ACs is deliberate, not a gap.
 
-        QA is called PARENT-AC only: sub-results are already aggregated into
-        parent.sub_postmortems by _build_postmortem_from_result; only the
-        parent-level QA evaluation runs once.
+        Sub-ACs created by _try_decompose_ac are agent-derived from
+        the parent's content and have no independent acceptance
+        criteria. Per Q4.1 design (docs/brainstorm/phase-2-q4.1-
+        hardening-design.md, AC-1), QA fires at the parent level
+        only. This test pins that contract.
+
+        Substrate detail: sub-results are already aggregated into
+        parent.sub_postmortems by _build_postmortem_from_result; the
+        parent-level QA verdict therefore judges the sum-of-sub-AC
+        outcome via the cumulative diff and Q3's sub-postmortem
+        flatten path.
+
+        See: docs/brainstorm/phase-2-q4-inline-qa-design.md (Q4
+        cycle-1 substrate reasoning).
         """
         seed = _make_seed("Decomposed AC with 3 sub-ACs")
         executor = _make_executor()
@@ -7857,11 +7868,25 @@ class TestRenderChainMarkdownQABlock:
         assert "Score:" not in content
         assert "Suggestions:" not in content
 
-    def test_render_chain_markdown_qa_block_uses_dynamic_fence(self) -> None:
-        """Suggestions in a fenced block use a fence longer than backtick runs in text.
+    def test_render_chain_markdown_qa_block_suggestions_survive_backticks_outside_fence(
+        self,
+    ) -> None:
+        """Suggestions render as plain Markdown bullets — backticks are inline code.
 
-        When suggestion text contains triple backticks (e.g. "use ```code```"),
-        the fence must grow to 4+ backticks to prevent premature block closure.
+        Replaces the prior ``test_render_chain_markdown_qa_block_uses_dynamic_fence``
+        which asserted a dynamic 4+ backtick fence.  After Q4.1 / AC-4 / item 3
+        (CodeRabbit deferral from PR #6), suggestions are emitted OUTSIDE any
+        fenced code block as real Markdown bullets, so triple-backtick content
+        within a suggestion is rendered as inline code spans rather than
+        threatening a fence collision.  The fence-collision logic is still
+        used at the diff_summary site (covered by
+        ``test_artifact_uses_dynamic_fence_when_diff_summary_contains_backticks``).
+
+        Contract verified here:
+          - The suggestion text appears verbatim (no escaping / mangling).
+          - The ``### QA`` block is present.
+          - The "- Suggestions:" header is followed by a "  - " child bullet
+            (real Markdown list item, not a code-block line).
         """
         # A suggestion that contains a triple-backtick run
         nasty_suggestion = "Replace ```old_call()``` with the new API"
@@ -7874,17 +7899,89 @@ class TestRenderChainMarkdownQABlock:
         )
         content = self._render(pm)
 
-        # The fence used must be at least 4 backticks (content has 3-backtick run)
-        assert "````" in content, (
-            "Expected at least 4-backtick fence when suggestion contains ``` runs; "
-            f"got:\n{content}"
-        )
-
-        # The suggestion text itself must still appear
+        # Suggestion text appears verbatim
         assert nasty_suggestion in content
 
-        # The ### QA block itself must be present
+        # ### QA block present
         assert "### QA" in content
+
+        # "- Suggestions:" parent bullet is followed by a 2-space-indented child
+        # list item — real Markdown, not a fenced code block.
+        assert "- Suggestions:\n" in content
+        assert f"  - {nasty_suggestion}" in content
+
+    def test_render_chain_markdown_qa_suggestions_outside_fence(self) -> None:
+        """Test 57 (Q4.1 / AC-4 / item 3) — QA suggestions are emitted as
+        real Markdown bullets OUTSIDE the fenced code block.
+
+        Asserts the precise structural contract that drove this CodeRabbit
+        deferral from PR #6:
+
+          1. The "- Suggestions:" parent bullet is present.
+          2. Each suggestion appears as a "  - {sug}" child bullet.
+          3. NO fenced code block (``` of any length) is opened between the
+             "- Suggestions:" line and the next blank line — i.e. the
+             suggestion list is real Markdown, not preformatted text.
+          4. Other fence sites (``diff_summary``) are untouched — fence-
+             collision logic is preserved there.
+
+        [[INVARIANT: QA suggestions render as real Markdown bullets, never inside a fenced code block]]
+        [[INVARIANT: fence-collision logic is preserved at the diff_summary site after AC-4 item 3]]
+        """
+        import re as _re
+
+        suggestions = [
+            "Add type hints to the new helper",
+            "Inline `foo()` at the call site",
+            "Replace ```legacy``` with the modern API",
+        ]
+        pm = self._make_pm_with_qa(
+            qa_status="passed",
+            score=0.92,
+            verdict="pass",
+            qa_attempts=1,
+            suggestions=suggestions,
+        )
+        content = self._render(pm)
+
+        # 1. Parent bullet present.
+        assert "- Suggestions:" in content
+
+        # 2. Every suggestion appears as a "  - " child bullet.  (Two-space
+        #    indent keeps the bullet a child of "- Suggestions:" under
+        #    CommonMark.)
+        for sug in suggestions:
+            assert f"  - {sug}" in content, (
+                f"Expected child bullet '  - {sug}' in rendered chain; got:\n{content}"
+            )
+
+        # 3. Slice from "- Suggestions:" through end-of-QA-block (next blank
+        #    line) and assert that NO fence-opener token appears inside the
+        #    slice.  This catches both the legacy "```text" opener and any
+        #    longer (4+) dynamic fence that might have been picked.
+        sug_idx = content.index("- Suggestions:")
+        # End of QA block = next blank line after the suggestions header.
+        tail = content[sug_idx:]
+        # Find the first blank line (paragraph separator) after the header.
+        # The header line itself is "- Suggestions:\n", so we search past it.
+        m = _re.search(r"\n\n", tail)
+        qa_slice = tail[: m.start()] if m else tail
+
+        # No fence opener (3+ backticks, optionally followed by an info string).
+        # If the suggestions were emitted inside a code fence, this slice would
+        # contain something like "  ```text" or "  ````text".
+        assert not _re.search(r"^\s*`{3,}", qa_slice, _re.MULTILINE), (
+            "Expected NO fenced code block within the Suggestions list; got:\n"
+            f"{qa_slice}"
+        )
+
+        # 4. Sanity — ### QA block itself is present.
+        assert "### QA" in content
+
+        # 5. Triple-backtick content within a suggestion appears verbatim
+        #    (rendered as inline code by the Markdown parser; no escaping
+        #    needed at the artifact-write layer).
+        assert "Replace ```legacy``` with the modern API" in content
 
 
 # =============================================================================
@@ -8089,3 +8186,1541 @@ class TestInlineQAEndToEnd:
         assert "Add a module-level docstring" in second_ctx, (
             "QA suggestions must appear in the retry context_override"
         )
+
+
+# =============================================================================
+# Q4.1 / AC-3 — phase-1 / phase-2 checkpoint write tests (tests 39-41)
+# =============================================================================
+
+
+class TestInlineQAPhase1Checkpoint:
+    """Q4.1 / AC-3: phase-1 ``qa_status='pending'`` sentinel + phase-2 overwrite.
+
+    These three tests pin the phase-1 / phase-2 checkpoint protocol added by
+    Q4.1 / AC-3.  The phase-1 write is a recovery aide: it persists the
+    agent's already-committed work BEFORE the QA call so a Ctrl+C-during-QA
+    crash leaves a recoverable artifact (resume can replay QA against the
+    persisted ``final_message + diff_summary`` rather than re-running the
+    agent from scratch).  Phase-2 then overwrites the sentinel in place at
+    the end of the AC body with the terminal QA verdict.
+
+    Tests pin the three branches of the gate from
+    ``serial_executor.py``'s phase-1 block:
+
+      * Test 39 — gate triggers (inline_qa=True, SUCCEEDED, store set):
+        TWO writes per AC, first with qa_status='pending', second with
+        the terminal verdict (UPDATE-IN-PLACE).
+      * Test 40 — gate suppressed (inline_qa=False): exactly ONE write
+        per AC, byte-identical to pre-Q4.1 behavior.
+      * Test 41 — phase-2 overwrites phase-1: write call 1 has
+        qa_status='pending'; write call 2 is the final terminal verdict
+        ('passed' here).  Same checkpoint key — single-row-per-seed
+        overwrite semantics from CheckpointStore.
+
+    [[INVARIANT: phase-1 sentinel write fires once per successful AC when inline_qa=True and a checkpoint store is configured]]
+    [[INVARIANT: phase-1 write is suppressed when inline_qa=False — non-inline-QA runs are byte-identical to pre-Q4.1]]
+    [[INVARIANT: phase-2 terminal write supersedes the phase-1 sentinel via UPDATE-IN-PLACE on the same checkpoint key]]
+    """
+
+    def _make_executor_with_mock_store(
+        self,
+    ) -> tuple[SerialCompoundingExecutor, MagicMock]:
+        """Build an executor wired to a mock CheckpointStore.write returning Ok."""
+        from ouroboros.core.types import Result
+
+        event_store, _ = _make_replaying_event_store()
+        mock_store = MagicMock()
+        mock_store.write.return_value = Result.ok(None)
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=mock_store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, mock_store
+
+    @staticmethod
+    def _decode_chain_qa_status(checkpoint: Any) -> list[str | None]:
+        """Extract ``qa_status`` for every postmortem in a serialized checkpoint.
+
+        Returns a list aligned with the chain order so callers can assert
+        per-AC qa_status (e.g. the most-recent postmortem's status reflects
+        the in-flight phase).
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        state = CompoundingCheckpointState.from_dict(checkpoint.state)
+        chain = state.postmortem_chain or []
+        return [pm.get("qa_status") for pm in chain]
+
+    @pytest.mark.asyncio
+    async def test_phase1_pending_checkpoint_fires_when_inline_qa_and_store_set(
+        self,
+    ) -> None:
+        """39. inline_qa=True + SUCCEEDED + store set → 2 writes per AC.
+
+        Phase-1 fires after _execute_single_ac succeeds (qa_status='pending'
+        in the chain's last postmortem); phase-2 then overwrites with the
+        terminal verdict ('passed').  Both writes target the same checkpoint
+        key (UPDATE-IN-PLACE).
+
+        Conditions verified:
+          * mock_store.write called exactly twice (phase-1 + phase-2).
+          * First write's chain has the most-recent postmortem at
+            qa_status='pending'.
+          * First write's pending postmortem carries the agent's
+            final_message so the resume QA-replay branch can re-invoke
+            run_inline_qa with the same artifact.
+          * Both writes carry last_completed_ac_index=ac_index — the
+            sentinel is not a "partial" / pre-completion checkpoint, just
+            a pre-QA snapshot.
+
+        [[INVARIANT: phase-1 sentinel write fires once per successful AC when inline_qa=True and a checkpoint store is configured]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        seed = _make_seed("Phase-1 sentinel coverage")
+        executor, mock_store = self._make_executor_with_mock_store()
+        _attach_fake_qa(
+            executor,
+            [_make_qa_ok_result(loop_action="pass", score=0.95, verdict="pass")],
+        )
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(
+                int(kwargs["ac_index"]),
+                str(kwargs["ac_content"]),
+                final_message="agent committed work",
+            )
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_phase1_fires",
+            execution_id="exec_phase1_fires",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert result.success_count == 1
+        # Two writes: phase-1 sentinel, then phase-2 terminal overwrite.
+        assert mock_store.write.call_count == 2, (
+            f"Expected 2 checkpoint writes per AC (phase-1 pending + "
+            f"phase-2 terminal); got {mock_store.write.call_count}"
+        )
+
+        call_args = [c.args[0] for c in mock_store.write.call_args_list]
+        ckpt_phase1, ckpt_phase2 = call_args
+
+        # Phase-1: most-recent postmortem must carry qa_status='pending'.
+        phase1_statuses = self._decode_chain_qa_status(ckpt_phase1)
+        assert phase1_statuses[-1] == "pending", (
+            f"Phase-1 checkpoint must persist qa_status='pending' on the "
+            f"AC under evaluation; got {phase1_statuses!r}"
+        )
+
+        # Phase-1 sentinel must carry the agent's final_message so the
+        # resume QA-replay branch can re-invoke run_inline_qa on the same
+        # artifact (no agent re-run).
+        state1 = CompoundingCheckpointState.from_dict(ckpt_phase1.state)
+        pending_pm = state1.postmortem_chain[-1]
+        assert pending_pm.get("final_message") == "agent committed work", (
+            f"Phase-1 pending postmortem must carry final_message="
+            f"result.final_message; got {pending_pm.get('final_message')!r}"
+        )
+
+        # Both writes must carry the same last_completed_ac_index (0).
+        assert state1.last_completed_ac_index == 0
+        state2 = CompoundingCheckpointState.from_dict(ckpt_phase2.state)
+        assert state2.last_completed_ac_index == 0
+
+        # Same checkpoint key (seed_id) — overwrite semantics, not a new row.
+        assert ckpt_phase1.seed_id == ckpt_phase2.seed_id == seed.metadata.seed_id
+
+    @pytest.mark.asyncio
+    async def test_phase1_does_not_fire_when_inline_qa_off(self) -> None:
+        """40. inline_qa=False → exactly 1 write per AC (byte-identical to pre-Q4.1).
+
+        Without ``--inline-qa`` there is no QA gate to crash inside, so the
+        phase-1 sentinel is unnecessary.  This test pins that the existing
+        non-QA path is unaffected by the AC-3 changes — a regression here
+        would mean every non-QA run pays double the checkpoint write cost.
+
+        Conditions verified:
+          * mock_store.write called exactly once per AC.
+          * The single write is the existing phase-2 terminal write
+            (qa_status is None — no QA was run).
+
+        [[INVARIANT: phase-1 write is suppressed when inline_qa=False — non-inline-QA runs are byte-identical to pre-Q4.1]]
+        """
+        seed = _make_seed("Pre-Q4.1 non-QA path")
+        executor, mock_store = self._make_executor_with_mock_store()
+        # Attach QA but expect zero calls — inline_qa=False suppresses it.
+        qa_call_args = _attach_fake_qa(executor, [])
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(int(kwargs["ac_index"]), str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="sess_phase1_off",
+            execution_id="exec_phase1_off",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=False,
+        )
+
+        assert result.success_count == 1
+        # Zero QA calls and exactly ONE checkpoint write per AC.
+        assert len(qa_call_args) == 0
+        assert mock_store.write.call_count == 1, (
+            f"inline_qa=False must produce 1 write per AC (pre-Q4.1 "
+            f"behavior); got {mock_store.write.call_count}"
+        )
+
+        ckpt = mock_store.write.call_args_list[0].args[0]
+        statuses = self._decode_chain_qa_status(ckpt)
+        # qa_status must be None (no QA run) — and crucially never 'pending'.
+        assert statuses[-1] is None, (
+            f"Non-QA run must persist qa_status=None; got {statuses!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_phase2_terminal_overwrite_supersedes_phase1_pending(self) -> None:
+        """41. Phase-2 terminal write overwrites phase-1 pending sentinel.
+
+        With inline_qa=True and a PASS verdict, the executor performs two
+        writes against the same checkpoint key.  Write call 1 records the
+        sentinel (qa_status='pending'); write call 2 records the terminal
+        verdict ('passed').  Because CheckpointStore.write is single-row-
+        per-seed_id with overwrite-in-place semantics, the second write
+        supersedes the first — leaving only the terminal state on disk.
+
+        Conditions verified:
+          * Two writes; first has qa_status='pending'; second has
+            qa_status='passed'.
+          * Both writes occur in order (the sentinel is never written
+            AFTER the terminal verdict).
+          * The terminal write also carries final_message so the chain
+            artifact + the resume path both retain the agent's last
+            response.
+
+        [[INVARIANT: phase-2 terminal write supersedes the phase-1 sentinel via UPDATE-IN-PLACE on the same checkpoint key]]
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        seed = _make_seed("Phase-2 supersede coverage")
+        executor, mock_store = self._make_executor_with_mock_store()
+        _attach_fake_qa(
+            executor,
+            [_make_qa_ok_result(loop_action="pass", score=0.91, verdict="pass")],
+        )
+
+        async def fake_ac(**kwargs: Any) -> ACExecutionResult:
+            return _ok_result(
+                int(kwargs["ac_index"]),
+                str(kwargs["ac_content"]),
+                final_message="terminal-checkpoint final_message",
+            )
+
+        executor._execute_single_ac = fake_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        await executor.execute_serial(
+            seed=seed,
+            session_id="sess_phase2_supersede",
+            execution_id="exec_phase2_supersede",
+            tools=[],
+            system_prompt="SYS",
+            execution_plan=plan,
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        assert mock_store.write.call_count == 2
+
+        call_args = [c.args[0] for c in mock_store.write.call_args_list]
+        ckpt1, ckpt2 = call_args
+
+        statuses1 = self._decode_chain_qa_status(ckpt1)
+        statuses2 = self._decode_chain_qa_status(ckpt2)
+        assert statuses1[-1] == "pending", (
+            f"First write must be the phase-1 sentinel "
+            f"(qa_status='pending'); got {statuses1!r}"
+        )
+        assert statuses2[-1] == "passed", (
+            f"Second write must be the phase-2 terminal verdict "
+            f"(qa_status='passed'); got {statuses2!r}"
+        )
+
+        # The terminal write must carry final_message so the chain artifact
+        # and the resume path both retain the agent's last response.
+        state2 = CompoundingCheckpointState.from_dict(ckpt2.state)
+        terminal_pm = state2.postmortem_chain[-1]
+        assert terminal_pm.get("final_message") == "terminal-checkpoint final_message", (
+            f"Phase-2 terminal postmortem must carry final_message="
+            f"result.final_message; got {terminal_pm.get('final_message')!r}"
+        )
+
+        # Both writes target the same seed_id (overwrite-in-place).
+        assert ckpt1.seed_id == ckpt2.seed_id == seed.metadata.seed_id
+
+
+class TestInlineQAResumeReplay:
+    """Q4.1 / AC-3 / Sub-AC 4: resume QA-replay branch on ``qa_status='pending'``.
+
+    These tests pin the resume-side counterpart to the phase-1 sentinel
+    write tested above.  When the prior run wrote a ``qa_status='pending'``
+    sentinel but never wrote the phase-2 terminal-state checkpoint (the
+    Ctrl+C-during-QA case), resume must replay QA-only against the
+    persisted ``final_message`` artifact — the agent is NOT re-invoked.
+
+    The three tests cover:
+      * Test 42 — pending + ``inline_qa=True`` → QA replay fires once
+        against the persisted artifact, agent is NOT called, audit-diff
+        sidecar is appended, terminal phase-2 checkpoint overwrites the
+        sentinel.
+      * Test 43 — pending + ``inline_qa=False`` → replay-skipped warning
+        log, ``qa_status`` cleared to ``None``, AC treated as terminal
+        without a QA verdict.
+      * Test 44 — terminal ``qa_status='passed'`` (or any non-``pending``
+        terminal value) bypasses the replay branch entirely; behavior is
+        identical to a normal mid-stream resume.
+
+    [[INVARIANT: resume QA-replay branch fires when chain[-1].qa_status='pending' AND inline_qa=True — agent is NOT re-invoked]]
+    [[INVARIANT: resume QA-replay-skipped branch fires when chain[-1].qa_status='pending' AND inline_qa=False — qa_status is cleared to None and AC marked terminal without verdict]]
+    [[INVARIANT: resume QA-replay branch is bypassed when chain[-1].qa_status is terminal (passed/exhausted/skipped_*/None)]]
+    """
+
+    def _make_executor_with_real_store(
+        self, tmp_path: Path
+    ) -> tuple[SerialCompoundingExecutor, Any]:
+        """Build an executor wired to a real CheckpointStore at tmp_path."""
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, store
+
+    @staticmethod
+    def _seed_pending_checkpoint(
+        store: Any,
+        *,
+        seed_id: str,
+        ac_index: int,
+        ac_content: str,
+        final_message: str,
+        prior_verdict_dict: dict[str, Any] | None = None,
+    ) -> None:
+        """Pre-write a phase-1 sentinel checkpoint (qa_status='pending').
+
+        Mirrors what the original (now-crashed) run would have written
+        immediately before the QA call that died.  The pending postmortem
+        carries ``final_message`` so the resume QA-replay branch can
+        re-invoke ``run_inline_qa`` with the same artifact the original
+        attempt was about to judge.
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _write_compounding_checkpoint,
+        )
+
+        summary = ACContextSummary(
+            ac_index=ac_index,
+            ac_content=ac_content,
+            success=True,
+            files_modified=("src/example.py",),
+        )
+        pending_pm = ACPostmortem(
+            summary=summary,
+            status="pass",
+            qa_status="pending",
+            qa_verdict=prior_verdict_dict,
+            qa_attempts=0,
+            final_message=final_message,
+        )
+        chain = PostmortemChain(postmortems=(pending_pm,))
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed_id,
+            session_id="prior_session_pending",
+            ac_index=ac_index,
+            chain=chain,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_replay_runs_qa_against_persisted_final_message_no_agent_rerun(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """42. pending + inline_qa=True → QA replays, agent is NOT re-invoked.
+
+        Setup:
+          * Pre-write a phase-1 sentinel checkpoint for AC 0 with
+            ``qa_status='pending'``, ``final_message='agent committed'``.
+          * Resume with ``inline_qa=True`` and the next AC (AC 1) wired
+            to a normal fake_ac so we can verify only AC 1 hits the agent.
+
+        Asserted:
+          * The fake QA handler was called for the replay (AC 0).
+          * The QA-replay invocation forwarded the persisted final_message
+            (not ``None`` and not ``key_output`` fallback).
+          * AC 0's ``_execute_single_ac`` was NEVER called (the agent's
+            prior commits stand in for re-execution).
+          * After replay, the chain's first postmortem has terminal
+            qa_status='passed' (the replay verdict).
+          * The audit-diff sidecar exists and contains a ``### Replay 1``
+            section (verdict-supersede history preserved).
+          * AC 1 was executed normally and the run completes.
+
+        [[INVARIANT: resume QA-replay branch fires when chain[-1].qa_status='pending' AND inline_qa=True — agent is NOT re-invoked]]
+        """
+        # Redirect chain artifact dir so the audit-diff sidecar lands in tmp_path.
+        artifact_dir = tmp_path / "chain_artifacts"
+        artifact_dir.mkdir()
+        monkeypatch.setenv(
+            "OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir)
+        )
+
+        seed = _make_seed("AC 0 (was QA-pending)", "AC 1 to be executed")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Pre-write the phase-1 sentinel checkpoint.
+        self._seed_pending_checkpoint(
+            store,
+            seed_id=seed.metadata.seed_id,
+            ac_index=0,
+            ac_content="AC 0 (was QA-pending)",
+            final_message="agent committed work for AC 0",
+            prior_verdict_dict=None,  # phase-1 wrote before any verdict landed
+        )
+
+        # Wire a fake QA handler that returns 'pass' on every call.  Two
+        # QA calls are expected on this run: (1) the replay against AC 0's
+        # pending sentinel, then (2) the normal inline QA on AC 1.  We
+        # capture call args so we can assert the FIRST call is the replay
+        # (it forwards the persisted final_message under the
+        # ``qa-replay-ac0-...`` session id).
+        qa_call_args = _attach_fake_qa(
+            executor,
+            [
+                _make_qa_ok_result(loop_action="pass", score=0.93, verdict="pass"),
+                _make_qa_ok_result(loop_action="pass", score=0.91, verdict="pass"),
+            ],
+        )
+
+        # Track which ACs hit the agent.  AC 0 must NOT be in this list —
+        # its prior commits are the artifact for replay.
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            return _ok_result(
+                ac_index, str(kwargs["ac_content"]), final_message="ac1 done"
+            )
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_replay_42",
+            execution_id="exec_resume_replay_42",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_pending",
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Critical: AC 0 was NOT re-executed by the agent.
+        assert 0 not in executed_indices, (
+            f"AC 0 must not be re-invoked on resume; the agent's prior "
+            f"commits are the replay artifact. executed: {executed_indices}"
+        )
+        # AC 1 was executed normally as the next AC after replay.
+        assert 1 in executed_indices, (
+            f"AC 1 must execute as the next AC after QA replay; "
+            f"executed: {executed_indices}"
+        )
+
+        # Two QA calls: (1) the replay against AC 0's pending sentinel,
+        # (2) the normal inline QA on AC 1.  The replay must come FIRST
+        # (before the AC loop processes AC 1).
+        assert len(qa_call_args) == 2, (
+            f"Expected two QA calls (replay for AC 0 + normal QA for AC 1); "
+            f"got {len(qa_call_args)}"
+        )
+
+        # The first call is the replay — it must forward the persisted
+        # final_message AND use the dedicated ``qa-replay-ac0-...`` session
+        # id so audit logs distinguish replays from in-flight QA calls.
+        replay_args = qa_call_args[0]
+        artifact = replay_args.get("artifact", "")
+        assert "agent committed work for AC 0" in artifact, (
+            f"QA replay must judge the persisted final_message; got "
+            f"artifact={artifact!r}"
+        )
+        replay_session_id = replay_args.get("qa_session_id", "")
+        assert replay_session_id.startswith("qa-replay-ac0-"), (
+            f"Replay must use the dedicated qa-replay-* session id so audit "
+            f"trails distinguish replays; got qa_session_id={replay_session_id!r}"
+        )
+
+        # After replay, the persisted checkpoint's first postmortem must
+        # have terminal qa_status='passed' (overwriting the 'pending'
+        # sentinel via UPDATE-IN-PLACE on the same seed_id key).
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        load_result = store.load(seed.metadata.seed_id)
+        assert load_result.is_ok
+        state = CompoundingCheckpointState.from_dict(load_result.value.state)
+        chain_dicts = state.postmortem_chain
+        assert chain_dicts, "Persisted chain must be non-empty after replay"
+        # AC 0's postmortem should now reflect terminal verdict.
+        ac0_pm = next(
+            (pm for pm in chain_dicts if pm.get("summary", {}).get("ac_index") == 0),
+            None,
+        )
+        assert ac0_pm is not None, "AC 0 postmortem missing from persisted chain"
+        assert ac0_pm.get("qa_status") == "passed", (
+            f"AC 0's qa_status must transition pending → passed via replay; "
+            f"got {ac0_pm.get('qa_status')!r}"
+        )
+
+        # Audit-diff sidecar must exist and carry one '### Replay' section.
+        diff_path = (
+            artifact_dir
+            / f"chain-resume_replay_42-ac0-qa.original.diff"
+        )
+        assert diff_path.exists(), (
+            f"Audit-diff sidecar must be written at {diff_path}"
+        )
+        diff_text = diff_path.read_text(encoding="utf-8")
+        assert "### Replay 1 (" in diff_text, (
+            f"Audit-diff must include a '### Replay 1' section; got: "
+            f"{diff_text[:300]}"
+        )
+
+        # Run completed: 2 results, both at terminal success.  AC 0 lands as
+        # SATISFIED_EXTERNALLY (skipped via last_completed_ac_index after the
+        # replay finalizes the chain), AC 1 lands as SUCCEEDED.
+        assert len(result.results) == 2
+        assert result.success_count + result.externally_satisfied_count == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_replay_skipped_when_inline_qa_off_clears_pending_to_none(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """43. pending + inline_qa=False → replay skipped, qa_status cleared to None.
+
+        The user opted out of inline-QA on this resume.  Respect the
+        opt-out: do NOT replay (no QA call), clear ``qa_status`` to
+        ``None`` so the AC is no longer pending, log a warning, and
+        proceed with the next AC.
+
+        Setup:
+          * Pre-write a phase-1 sentinel checkpoint for AC 0
+            (qa_status='pending').
+          * Resume with ``inline_qa=False``.
+
+        Asserted:
+          * Zero QA handler calls (replay was skipped).
+          * AC 0's ``_execute_single_ac`` was NEVER called.
+          * The replay-skipped warning fired
+            (``serial_executor.resume.qa_replay_skipped``).
+          * Persisted checkpoint's AC 0 postmortem has ``qa_status=None``
+            (the pending sentinel was cleared, not left to re-trigger
+            replay on the next resume).
+          * Run still completes successfully (no QA verdict but the AC
+            is terminal).
+
+        [[INVARIANT: resume QA-replay-skipped branch fires when chain[-1].qa_status='pending' AND inline_qa=False — qa_status is cleared to None and AC marked terminal without verdict]]
+        """
+        import logging
+
+        seed = _make_seed("AC 0 (was QA-pending)", "AC 1 to be executed")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        self._seed_pending_checkpoint(
+            store,
+            seed_id=seed.metadata.seed_id,
+            ac_index=0,
+            ac_content="AC 0 (was QA-pending)",
+            final_message="agent committed work for AC 0",
+            prior_verdict_dict={"verdict": "(in-flight)"},
+        )
+
+        # Attach a fake QA handler but expect ZERO calls — the skip path
+        # must not invoke the QA judge at all.
+        qa_call_args = _attach_fake_qa(executor, [])
+
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        # Belt-and-braces: structlog routing through stdlib's caplog can be
+        # config-dependent.  Patch the executor module's ``log.warning`` to
+        # record calls directly so the assertion below isn't sensitive to
+        # the test runner's structlog configuration.
+        from ouroboros.orchestrator import serial_executor as _exec_module
+
+        warning_calls: list[tuple[str, dict[str, Any]]] = []
+        original_warning = _exec_module.log.warning
+
+        def _capture_warning(event: str, **kwargs: Any) -> None:
+            warning_calls.append((event, kwargs))
+            return original_warning(event, **kwargs)
+
+        monkeypatch.setattr(_exec_module.log, "warning", _capture_warning)
+
+        plan = _make_plan((0,), (1,))
+        with caplog.at_level(logging.WARNING):
+            result = await executor.execute_serial(
+                seed=seed,
+                session_id="resume_replay_skipped_43",
+                execution_id="exec_resume_replay_skipped_43",
+                tools=[],
+                system_prompt="SYSTEM",
+                execution_plan=plan,
+                resume_session_id="prior_session_pending",
+                inline_qa=False,
+            )
+
+        # Zero QA calls — skip path must not invoke the QA judge.
+        assert len(qa_call_args) == 0, (
+            f"inline_qa=False on resume must not run QA replay; got "
+            f"{len(qa_call_args)} calls"
+        )
+        # AC 0 was NOT re-invoked (still skipped via last_completed_ac_index).
+        assert 0 not in executed_indices
+        # AC 1 executed normally.
+        assert 1 in executed_indices
+
+        # Replay-skipped warning fired.  Search both caplog and structlog
+        # records (the codebase uses structured logging via ``log.warning``;
+        # the event-name string lands in the message).  Patch the module's
+        # ``log.warning`` directly as a belt-and-braces fallback in case the
+        # test runner's structlog config doesn't route through stdlib's
+        # caplog in this environment.
+        skip_log_seen = any(
+            "resume.qa_replay_skipped" in record.getMessage()
+            or "resume.qa_replay_skipped" in str(record)
+            for record in caplog.records
+        ) or any(
+            "resume.qa_replay_skipped" in str(call)
+            for call in warning_calls
+        )
+        assert skip_log_seen, (
+            "expected 'serial_executor.resume.qa_replay_skipped' warning "
+            "to be logged when inline_qa=False on resume from a "
+            "qa_status='pending' sentinel; AC-3 contract requires it"
+        )
+
+        # Persisted-state contract: qa_status flipped from pending to None.
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        load_result = store.load(seed.metadata.seed_id)
+        assert load_result.is_ok
+        state = CompoundingCheckpointState.from_dict(load_result.value.state)
+        chain_dicts = state.postmortem_chain
+        ac0_pm = next(
+            (pm for pm in chain_dicts if pm.get("summary", {}).get("ac_index") == 0),
+            None,
+        )
+        assert ac0_pm is not None, "AC 0 postmortem missing from persisted chain"
+        assert ac0_pm.get("qa_status") is None, (
+            f"AC 0's qa_status must be cleared to None when inline_qa=False "
+            f"on resume; got {ac0_pm.get('qa_status')!r}.  Leaving 'pending' "
+            f"would re-trigger replay forever."
+        )
+
+        # Run completed both ACs (AC 0 SATISFIED_EXTERNALLY, AC 1 SUCCEEDED).
+        assert len(result.results) == 2
+        assert result.success_count + result.externally_satisfied_count == 2
+
+    @pytest.mark.asyncio
+    async def test_resume_replay_branch_bypassed_when_terminal_qa_status_passed(
+        self, tmp_path: Path
+    ) -> None:
+        """44. Terminal qa_status='passed' bypasses the replay branch.
+
+        A normal mid-stream resume (no in-flight QA crash) has the chain's
+        last postmortem at a terminal qa_status — typically 'passed' for an
+        inline-QA run, or ``None`` for a non-inline-QA run.  Either way the
+        replay branch must NOT fire.
+
+        Setup:
+          * Pre-write a phase-2 terminal checkpoint for AC 0 with
+            ``qa_status='passed'`` (the normal end-of-AC state).
+          * Resume with ``inline_qa=True`` so an over-eager replay path
+            would fire a QA call.
+
+        Asserted:
+          * Zero QA handler calls (replay branch did not fire).
+          * AC 0's ``_execute_single_ac`` was NEVER called (last_completed_ac_index
+            skip handled it as in TestCheckpointResume).
+          * The persisted AC 0 postmortem still has ``qa_status='passed'``
+            (the terminal value was not overwritten).
+          * AC 1 was executed normally.
+
+        [[INVARIANT: resume QA-replay branch is bypassed when chain[-1].qa_status is terminal (passed/exhausted/skipped_*/None)]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _write_compounding_checkpoint,
+        )
+
+        seed = _make_seed("AC 0 (terminal passed)", "AC 1 to be executed")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # Pre-write a TERMINAL phase-2 checkpoint — qa_status='passed', not pending.
+        summary_ac0 = ACContextSummary(
+            ac_index=0,
+            ac_content="AC 0 (terminal passed)",
+            success=True,
+            files_modified=("src/ac0.py",),
+        )
+        terminal_pm = ACPostmortem(
+            summary=summary_ac0,
+            status="pass",
+            qa_status="passed",
+            qa_verdict={"verdict": "pass", "score": 0.95},
+            qa_attempts=1,
+            final_message="ac0 final message",
+        )
+        prior_chain = PostmortemChain(postmortems=(terminal_pm,))
+        _write_compounding_checkpoint(
+            store=store,
+            seed_id=seed.metadata.seed_id,
+            session_id="prior_session_terminal",
+            ac_index=0,
+            chain=prior_chain,
+        )
+
+        # Attach a fake QA handler that returns 'pass' for AC 1's normal
+        # inline QA call.  The replay branch must NOT fire (terminal
+        # qa_status='passed' bypasses it), so the only QA call seen here
+        # is AC 1's normal inline QA — never an AC 0 replay.
+        qa_call_args = _attach_fake_qa(
+            executor,
+            [_make_qa_ok_result(loop_action="pass", score=0.92, verdict="pass")],
+        )
+
+        executed_indices: list[int] = []
+
+        async def fake_single_ac(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices.append(ac_index)
+            return _ok_result(
+                ac_index, str(kwargs["ac_content"]), final_message="ac1 done"
+            )
+
+        executor._execute_single_ac = fake_single_ac  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        result = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_terminal_44",
+            execution_id="exec_resume_terminal_44",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_terminal",
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Exactly one QA call — and it's NOT a replay.  The terminal
+        # qa_status='passed' on AC 0 bypasses the replay branch entirely;
+        # only AC 1's normal inline QA fires.
+        assert len(qa_call_args) == 1, (
+            f"Terminal qa_status='passed' must bypass the AC 0 replay branch; "
+            f"only AC 1's normal inline QA should fire.  Got "
+            f"{len(qa_call_args)} QA calls"
+        )
+        only_call_session_id = qa_call_args[0].get("qa_session_id", "")
+        assert not only_call_session_id.startswith("qa-replay-"), (
+            f"Replay branch must not fire on terminal qa_status; got "
+            f"qa_session_id={only_call_session_id!r}"
+        )
+        # AC 0 was skipped via the existing last_completed_ac_index path, not
+        # re-executed.  AC 1 executed normally.
+        assert 0 not in executed_indices, (
+            f"Terminal AC must skip via last_completed_ac_index; "
+            f"executed: {executed_indices}"
+        )
+        assert 1 in executed_indices
+
+        # The persisted AC 0 postmortem still has qa_status='passed' — the
+        # bypass branch did not overwrite it.
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        load_result = store.load(seed.metadata.seed_id)
+        assert load_result.is_ok
+        state = CompoundingCheckpointState.from_dict(load_result.value.state)
+        chain_dicts = state.postmortem_chain
+        ac0_pm = next(
+            (pm for pm in chain_dicts if pm.get("summary", {}).get("ac_index") == 0),
+            None,
+        )
+        assert ac0_pm is not None
+        assert ac0_pm.get("qa_status") == "passed", (
+            f"Terminal qa_status must remain 'passed' after a normal resume; "
+            f"got {ac0_pm.get('qa_status')!r}"
+        )
+
+        # Run completed both ACs (AC 0 SATISFIED_EXTERNALLY, AC 1 SUCCEEDED).
+        assert len(result.results) == 2
+        assert result.success_count + result.externally_satisfied_count == 2
+
+
+# =============================================================================
+# Q4.1 / AC-3 / Sub-AC 5 — end-to-end crash-resume integration tests (50-51)
+# =============================================================================
+
+
+class TestInlineQACrashResumeE2E:
+    """Q4.1 / AC-3 / Sub-AC 5: end-to-end Ctrl+C-during-QA crash + resume.
+
+    These two tests exercise the **full** AC-3 flow — phase-1 sentinel
+    write, crash propagation, resume detection, QA replay against the
+    persisted artifact, audit-diff sidecar accumulation — through real
+    :class:`SerialCompoundingExecutor` ``execute_serial`` calls against
+    a real :class:`CheckpointStore`.  The earlier unit-style tests in
+    :class:`TestInlineQAPhase1Checkpoint` and
+    :class:`TestInlineQAResumeReplay` cover individual gates with mocks;
+    these two tests close the loop end-to-end.
+
+      * Test 50 — 2-AC compounding run.  AC 0 succeeds with a normal QA
+        pass; AC 1's QA call raises :exc:`asyncio.CancelledError`
+        (the canonical Ctrl+C-during-QA case) so the run aborts WITH
+        AC 1's phase-1 sentinel persisted.  A second ``execute_serial``
+        call resumes against the seed, replays QA against AC 1's
+        persisted ``final_message``, and lands a terminal verdict.  The
+        audit-diff sidecar
+        ``chain-<resume-session>-ac1-qa.original.diff`` exists with
+        exactly one ``### Replay 1`` section.
+      * Test 51 — idempotent re-replay.  After the first replay
+        succeeds and writes ``### Replay 1`` to the sidecar, the
+        checkpoint is artificially reset to the phase-1 sentinel so a
+        SECOND resume run replays again.  Both resume runs use the
+        same ``session_id`` so the audit-diff file accumulates two
+        ``### Replay N`` sections in cumulative order, with the second
+        section's lineage label flipping from ``original`` to
+        ``post-replay-1``.
+
+    Together these tests exercise all five AC-3 invariants:
+
+      1. ``phase-1 sentinel write fires once per successful AC when
+         inline_qa=True and a checkpoint store is configured`` — Test 50
+         observes the phase-1 sentinel persisted on disk after the
+         original-run crash.
+      2. ``phase-2 terminal write supersedes the phase-1 sentinel via
+         UPDATE-IN-PLACE on the same checkpoint key`` — both tests
+         observe the chain transitioning ``pending → terminal`` after
+         the resume's QA replay completes.
+      3. ``resume QA-replay branch fires when chain[-1].qa_status='pending'
+         AND inline_qa=True — agent is NOT re-invoked`` — both tests
+         observe the replay running while ``_execute_single_ac`` is
+         not called for the previously-pending AC.
+      4. ``resume QA-replay-skipped branch fires when ... inline_qa=False —
+         qa_status is cleared to None`` — covered by test 43; mentioned
+         here for cross-reference.
+      5. ``resume QA-replay branch is bypassed when chain[-1].qa_status
+         is terminal`` — Test 51 observes that after the replay
+         finalizes the chain to ``passed``, a subsequent resume against
+         the same terminal-status chain (without artificial reset)
+         would NOT re-trigger the replay branch.  The reset between
+         resumes therefore demonstrates the bypass-vs-fire distinction.
+
+    [[INVARIANT: resume QA-replay branch fires when chain[-1].qa_status='pending' AND inline_qa=True — agent is NOT re-invoked]]
+    [[INVARIANT: phase-1 sentinel write fires once per successful AC when inline_qa=True and a checkpoint store is configured]]
+    [[INVARIANT: phase-2 terminal write supersedes the phase-1 sentinel via UPDATE-IN-PLACE on the same checkpoint key]]
+    [[INVARIANT: _append_qa_audit_diff appends a new '### Replay N' section per call, preserving prior sections]]
+    [[INVARIANT: resume QA-replay branch is bypassed when chain[-1].qa_status is terminal (passed/exhausted/skipped_*/None)]]
+    """
+
+    def _make_executor_with_real_store(
+        self, tmp_path: Path
+    ) -> tuple[SerialCompoundingExecutor, Any]:
+        """Build an executor wired to a real CheckpointStore at tmp_path."""
+        from ouroboros.persistence.checkpoint import CheckpointStore
+
+        store = CheckpointStore(base_path=tmp_path / "checkpoints")
+        store.initialize()
+        event_store, _ = _make_replaying_event_store()
+        executor = SerialCompoundingExecutor(
+            adapter=MagicMock(),
+            event_store=event_store,
+            console=MagicMock(),
+            enable_decomposition=False,
+            checkpoint_store=store,
+        )
+        executor._coordinator.detect_file_conflicts = MagicMock(return_value=[])
+        return executor, store
+
+    @staticmethod
+    def _make_crashing_qa_handler(
+        executor: SerialCompoundingExecutor,
+        *,
+        crash_on_ac_indices: set[int],
+        pass_results_for_others: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Wire a fake QA handler that raises CancelledError on listed AC indices.
+
+        The crash mimics the canonical Ctrl+C-during-QA failure — the
+        ``QAHandler.handle`` coroutine is awaited inside ``run_inline_qa``
+        which has no ``except CancelledError`` catch, so the exception
+        propagates up through ``execute_serial``.  The phase-1 sentinel
+        for the AC under evaluation has already been written before the
+        QA call, so the persisted state is the sentinel.
+
+        ``pass_results_for_others`` supplies QA results for ACs NOT in
+        the crash set, consumed left-to-right.  When exhausted, falls
+        back to a default ``pass`` result so the test does not need to
+        spell out a result for every QA call (e.g. AC 0 in test 50).
+
+        Returns the call-args list so callers can introspect what the
+        QA handler saw before the crash.
+        """
+        import asyncio as _asyncio
+
+        results_queue: list[Any] = list(pass_results_for_others or [])
+        call_args: list[dict[str, Any]] = []
+
+        async def fake_handle(arguments: dict[str, Any]) -> Any:
+            call_args.append(arguments)
+            # Identify which AC this QA call belongs to from the
+            # qa_session_id — the executor builds it as
+            # ``qa-ac{ac_index}-...`` (or ``qa-replay-ac{ac_index}-...``
+            # on resume); both prefixes contain the literal ``ac{N}``
+            # token.  Replays bypass the crash so resumes can finalize.
+            qa_session_id = str(arguments.get("qa_session_id", ""))
+            for ac_idx in crash_on_ac_indices:
+                token = f"ac{ac_idx}-"
+                if token in qa_session_id and not qa_session_id.startswith(
+                    "qa-replay-"
+                ):
+                    raise _asyncio.CancelledError(
+                        f"simulated Ctrl+C during QA for ac{ac_idx}"
+                    )
+            if results_queue:
+                return results_queue.pop(0)
+            return _make_qa_ok_result()
+
+        executor._qa_handler.handle = fake_handle  # type: ignore[method-assign]
+        return call_args
+
+    @staticmethod
+    def _load_chain_dicts(store: Any, seed_id: str) -> list[dict[str, Any]]:
+        """Load the persisted chain as a list of postmortem dicts.
+
+        Helper for assertions on the post-resume terminal state.
+        """
+        from ouroboros.persistence.checkpoint import CompoundingCheckpointState
+
+        load_result = store.load(seed_id)
+        assert load_result.is_ok, (
+            f"checkpoint load failed: {getattr(load_result, 'error', None)}"
+        )
+        state = CompoundingCheckpointState.from_dict(load_result.value.state)
+        return list(state.postmortem_chain or [])
+
+    @pytest.mark.asyncio
+    async def test_50_two_ac_run_crashes_mid_qa_then_resume_replays_qa_only(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """50. 2-AC compounding run crashes mid-QA on AC-2; resume replays QA-only.
+
+        End-to-end exercise of the AC-3 phase-1 sentinel → crash →
+        resume → replay loop:
+
+        Setup (Run 1, ``session_id='orig_session_50'``, ``inline_qa=True``):
+          * 2-AC compounding plan: AC 0 + AC 1.
+          * AC 0's QA call returns 'pass' normally.
+          * AC 1's QA call raises :exc:`asyncio.CancelledError` (the
+            canonical Ctrl+C-during-QA failure mode).
+          * Expected: AC 0 reaches a terminal ``qa_status='passed'``;
+            AC 1 reaches a phase-1 ``qa_status='pending'`` sentinel
+            (written BEFORE the QA call), then the run aborts when the
+            CancelledError propagates up.
+
+        Setup (Run 2, ``session_id='resume_session_50'``,
+        ``resume_session_id='orig_session_50'``, ``inline_qa=True``):
+          * The replay branch detects ``chain[-1].qa_status='pending'``
+            for AC 1 and replays QA against the persisted
+            ``final_message``.  The QA mock returns 'pass' for the
+            replay.  ``_execute_single_ac`` for AC 1 is NEVER called.
+          * Expected: AC 1's persisted ``qa_status`` flips
+            ``pending → passed``; the audit-diff sidecar
+            ``chain-resume_session_50-ac1-qa.original.diff`` is written
+            with exactly one ``### Replay 1`` section.
+
+        Asserted invariants:
+          * AC 1's ``_execute_single_ac`` is NEVER called on the resume
+            (the agent's prior commits are the artifact for replay).
+          * Exactly one QA call on the resume — the replay against AC 1.
+            The ``qa-replay-ac1-...`` session-id prefix distinguishes
+            it from a normal in-flight QA call.
+          * Persisted AC 1 postmortem transitions
+            ``pending → passed``.
+          * Audit-diff sidecar exists with one ``### Replay 1`` section.
+
+        [[INVARIANT: resume QA-replay branch fires when chain[-1].qa_status='pending' AND inline_qa=True — agent is NOT re-invoked]]
+        [[INVARIANT: phase-1 sentinel write fires once per successful AC when inline_qa=True and a checkpoint store is configured]]
+        """
+        import asyncio as _asyncio
+
+        # Redirect chain artifact dir so the audit-diff sidecar lands in tmp_path.
+        artifact_dir = tmp_path / "chain_artifacts"
+        artifact_dir.mkdir()
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir))
+
+        seed = _make_seed(
+            "AC 0 — completes normally with QA pass",
+            "AC 1 — crashes mid-QA via mocked CancelledError",
+        )
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        # ---------- Run 1 (original) — crashes mid-QA on AC 1 ----------
+        # AC 0: QA pass.  AC 1: QA call raises CancelledError.  AC 0's
+        # 'pass' result is supplied via pass_results_for_others; the
+        # crash for AC 1 is wired by ``crash_on_ac_indices``.
+        run1_qa_calls = self._make_crashing_qa_handler(
+            executor,
+            crash_on_ac_indices={1},
+            pass_results_for_others=[
+                _make_qa_ok_result(loop_action="pass", score=0.93, verdict="pass"),
+            ],
+        )
+
+        run1_executed_indices: list[int] = []
+
+        async def fake_single_ac_run1(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            run1_executed_indices.append(ac_index)
+            return _ok_result(
+                ac_index,
+                str(kwargs["ac_content"]),
+                final_message=f"ac{ac_index} agent output (run 1)",
+            )
+
+        executor._execute_single_ac = fake_single_ac_run1  # type: ignore[method-assign]
+
+        plan = _make_plan((0,), (1,))
+        with pytest.raises(_asyncio.CancelledError):
+            await executor.execute_serial(
+                seed=seed,
+                session_id="orig_session_50",
+                execution_id="exec_orig_50",
+                tools=[],
+                system_prompt="SYSTEM",
+                execution_plan=plan,
+                inline_qa=True,
+                max_qa_retries=1,
+            )
+
+        # Both ACs were attempted by the agent during run 1; QA only
+        # crashed for AC 1, so AC 0's QA + AC 1's QA were both invoked.
+        assert run1_executed_indices == [0, 1], (
+            f"Run 1 must execute both ACs at the agent layer; got "
+            f"{run1_executed_indices}"
+        )
+        assert len(run1_qa_calls) == 2, (
+            f"Run 1 must invoke QA for AC 0 (pass) and AC 1 (crash); got "
+            f"{len(run1_qa_calls)} QA calls"
+        )
+
+        # The persisted state after the crash must show:
+        #   * AC 0 with terminal qa_status='passed'
+        #   * AC 1 with phase-1 sentinel qa_status='pending'
+        chain_after_crash = self._load_chain_dicts(store, seed.metadata.seed_id)
+        assert len(chain_after_crash) == 2, (
+            f"Chain after crash must have both AC postmortems (AC 0 "
+            f"terminal + AC 1 sentinel); got {len(chain_after_crash)}"
+        )
+        ac0_after_crash = chain_after_crash[0]
+        ac1_after_crash = chain_after_crash[1]
+        assert ac0_after_crash.get("qa_status") == "passed", (
+            f"AC 0 must reach terminal qa_status='passed' before the "
+            f"AC 1 crash; got {ac0_after_crash.get('qa_status')!r}"
+        )
+        assert ac1_after_crash.get("qa_status") == "pending", (
+            f"AC 1 must persist a phase-1 'pending' sentinel before the "
+            f"crash; got {ac1_after_crash.get('qa_status')!r}.  Without "
+            f"this sentinel, resume would re-invoke the agent."
+        )
+        # The sentinel must carry final_message so the resume QA-replay
+        # branch can re-invoke run_inline_qa with the same artifact.
+        assert ac1_after_crash.get("final_message") == "ac1 agent output (run 1)", (
+            f"AC 1 sentinel must carry final_message for replay; got "
+            f"{ac1_after_crash.get('final_message')!r}"
+        )
+
+        # ---------- Run 2 (resume) — QA-replays AC 1 only ----------
+        # Wire a replay-friendly QA handler: the crash set is empty
+        # (replay calls are never crashed), and we supply a single 'pass'
+        # result for the replay.
+        run2_qa_calls = self._make_crashing_qa_handler(
+            executor,
+            crash_on_ac_indices=set(),
+            pass_results_for_others=[
+                _make_qa_ok_result(loop_action="pass", score=0.94, verdict="pass"),
+            ],
+        )
+
+        # Track agent calls on resume.  AC 1 must NOT be re-invoked.
+        run2_executed_indices: list[int] = []
+
+        async def fake_single_ac_run2(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            run2_executed_indices.append(ac_index)
+            return _ok_result(
+                ac_index,
+                str(kwargs["ac_content"]),
+                final_message=f"ac{ac_index} agent output (run 2)",
+            )
+
+        executor._execute_single_ac = fake_single_ac_run2  # type: ignore[method-assign]
+
+        result_run2 = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_session_50",
+            execution_id="exec_resume_50",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="orig_session_50",
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Critical: AC 1 must NOT be re-invoked at the agent layer on
+        # resume.  Its prior commits are the artifact for the QA replay.
+        assert 1 not in run2_executed_indices, (
+            f"AC 1 must not be re-invoked on resume — its prior commits "
+            f"are the artifact for QA replay.  executed: {run2_executed_indices}"
+        )
+        # AC 0 is also not re-invoked — it has terminal qa_status='passed',
+        # the existing last_completed_ac_index skip path handles it.
+        assert 0 not in run2_executed_indices, (
+            f"AC 0 must not be re-invoked on resume; got {run2_executed_indices}"
+        )
+
+        # Exactly one QA call on resume — the replay against AC 1 — and
+        # it must use the dedicated qa-replay-ac1-... session id so audit
+        # logs distinguish replays from in-flight QA.
+        assert len(run2_qa_calls) == 1, (
+            f"Resume must invoke QA exactly once (replay against AC 1's "
+            f"sentinel); got {len(run2_qa_calls)} calls"
+        )
+        replay_session_id = str(run2_qa_calls[0].get("qa_session_id", ""))
+        assert replay_session_id.startswith("qa-replay-ac1-"), (
+            f"Replay must use the dedicated qa-replay-ac1-* session id; "
+            f"got {replay_session_id!r}"
+        )
+        # The replay's artifact must contain the persisted final_message
+        # (proving replay judges the persisted artifact, not a fresh
+        # agent execution).
+        replay_artifact = str(run2_qa_calls[0].get("artifact", ""))
+        assert "ac1 agent output (run 1)" in replay_artifact, (
+            f"Replay must judge the persisted final_message from run 1; "
+            f"got artifact={replay_artifact[:200]!r}"
+        )
+
+        # AC 1's persisted qa_status must transition pending → passed.
+        chain_after_resume = self._load_chain_dicts(store, seed.metadata.seed_id)
+        ac1_after_resume = next(
+            (
+                pm
+                for pm in chain_after_resume
+                if pm.get("summary", {}).get("ac_index") == 1
+            ),
+            None,
+        )
+        assert ac1_after_resume is not None, (
+            "AC 1 postmortem must remain in chain after resume"
+        )
+        assert ac1_after_resume.get("qa_status") == "passed", (
+            f"AC 1 must transition pending → passed via QA replay; "
+            f"got {ac1_after_resume.get('qa_status')!r}"
+        )
+
+        # Audit-diff sidecar must exist and carry exactly one '### Replay 1'
+        # section.  Filename is namespaced by the resume run's session_id.
+        diff_path = artifact_dir / "chain-resume_session_50-ac1-qa.original.diff"
+        assert diff_path.exists(), (
+            f"Audit-diff sidecar must be written at {diff_path}.  "
+            f"Existing files in {artifact_dir}: "
+            f"{[p.name for p in artifact_dir.iterdir()]}"
+        )
+        diff_text = diff_path.read_text(encoding="utf-8")
+        replay_headers = [
+            line for line in diff_text.splitlines()
+            if line.startswith("### Replay ")
+        ]
+        assert len(replay_headers) == 1, (
+            f"Audit-diff must have exactly one '### Replay N' section "
+            f"after the first replay; got {len(replay_headers)} "
+            f"headers: {replay_headers!r}"
+        )
+        assert replay_headers[0].startswith("### Replay 1 ("), (
+            f"First replay section must be labelled 'Replay 1'; got "
+            f"{replay_headers[0]!r}"
+        )
+
+        # Run completed both ACs at terminal success.
+        assert len(result_run2.results) == 2, (
+            f"Resume run must produce 2 results; got {len(result_run2.results)}"
+        )
+        assert (
+            result_run2.success_count + result_run2.externally_satisfied_count
+            == 2
+        )
+
+    @pytest.mark.asyncio
+    async def test_51_idempotent_re_replay_accumulates_two_replay_sections(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """51. Idempotent re-replay accumulates two '### Replay N' sections.
+
+        The audit-diff sidecar's design (``_append_qa_audit_diff``) is
+        cumulative-append: each successful replay appends a new
+        ``### Replay N`` section and labels its lineage
+        (``original`` for the first, ``post-replay-1`` for the second,
+        and so on) so the full overwrite history is preserved.  This
+        test exercises that accumulation by triggering TWO successful
+        replays against the same pending sentinel under a shared
+        ``session_id`` (which is what determines the sidecar filename).
+
+        Setup (Resume #1, ``session_id='resume_session_51'``,
+        ``inline_qa=True``):
+          * Pre-write a phase-1 sentinel checkpoint for AC 0 with
+            ``qa_status='pending'``,
+            ``final_message='persisted artifact for replay'``.
+          * QA mock returns 'pass'; replay #1 succeeds.
+          * Expected: audit-diff written to
+            ``chain-resume_session_51-ac0-qa.original.diff`` with one
+            ``### Replay 1`` section labelled ``--- original``.
+            Persisted AC 0 transitions ``pending → passed``.
+
+        Reset (artificial — simulates a second crash-then-resume cycle
+        without re-running the entire executor twice):
+          * Manually overwrite the checkpoint with a fresh phase-1
+            sentinel so the second resume sees ``qa_status='pending'``
+            again.  The 'prior verdict' for the sentinel is the
+            terminal verdict from replay #1, so the sidecar's lineage
+            label flips ``original → post-replay-1``.
+
+        Setup (Resume #2, same ``session_id='resume_session_51'``,
+        ``inline_qa=True``):
+          * QA mock returns 'pass'; replay #2 succeeds.
+          * Expected: audit-diff APPENDS a ``### Replay 2`` section to
+            the same file (NOT a new file).  Lineage label is
+            ``--- post-replay-1`` per the helper's cumulative-history
+            convention.
+
+        Asserted (idempotency):
+          * Both resume runs produce a terminal ``qa_status='passed'``
+            for AC 0.  Re-replay against the same fixed artifact
+            converges deterministically.
+          * The audit-diff file contains BOTH ``### Replay 1`` and
+            ``### Replay 2`` headers, in cumulative order.
+          * The lineage labels reflect the overwrite history
+            (``original`` for replay 1, ``post-replay-1`` for replay
+            2).
+          * The agent's ``_execute_single_ac`` is NEVER called for
+            AC 0 in either resume — the persisted artifact stands in
+            for re-execution across BOTH replays (idempotent: no
+            agent re-run regardless of how many replays happen).
+
+        [[INVARIANT: _append_qa_audit_diff appends a new '### Replay N' section per call, preserving prior sections]]
+        [[INVARIANT: phase-2 terminal write supersedes the phase-1 sentinel via UPDATE-IN-PLACE on the same checkpoint key]]
+        [[INVARIANT: resume QA-replay branch is bypassed when chain[-1].qa_status is terminal (passed/exhausted/skipped_*/None)]]
+        """
+        from ouroboros.orchestrator.level_context import (
+            ACContextSummary,
+            ACPostmortem,
+            PostmortemChain,
+        )
+        from ouroboros.orchestrator.serial_executor import (
+            _write_compounding_checkpoint,
+        )
+
+        # Redirect chain artifact dir so the sidecar lands in tmp_path.
+        artifact_dir = tmp_path / "chain_artifacts"
+        artifact_dir.mkdir()
+        monkeypatch.setenv("OUROBOROS_CHAIN_ARTIFACT_DIR", str(artifact_dir))
+
+        seed = _make_seed("AC 0 — replayed twice for idempotency check")
+        executor, store = self._make_executor_with_real_store(tmp_path)
+
+        def _seed_pending(prior_verdict_dict: dict[str, Any] | None) -> None:
+            """Pre-write (or reset) a phase-1 sentinel checkpoint for AC 0.
+
+            Reused for both the initial sentinel (no prior verdict) and
+            the artificial reset between resumes (terminal verdict from
+            replay #1 becomes the 'original' that replay #2 overwrites
+            — driving the ``post-replay-1`` lineage label in the
+            sidecar's second section).
+            """
+            summary = ACContextSummary(
+                ac_index=0,
+                ac_content="AC 0 — replayed twice for idempotency check",
+                success=True,
+                files_modified=("src/ac0.py",),
+            )
+            pending_pm = ACPostmortem(
+                summary=summary,
+                status="pass",
+                qa_status="pending",
+                qa_verdict=prior_verdict_dict,
+                qa_attempts=0,
+                final_message="persisted artifact for replay",
+            )
+            chain = PostmortemChain(postmortems=(pending_pm,))
+            _write_compounding_checkpoint(
+                store=store,
+                seed_id=seed.metadata.seed_id,
+                session_id="prior_session_pending",
+                ac_index=0,
+                chain=chain,
+            )
+
+        # ---------- Pre-state: phase-1 sentinel from a hypothetical crash ----------
+        _seed_pending(prior_verdict_dict=None)
+
+        # ---------- Resume #1 — replay #1 succeeds, '### Replay 1' written ----------
+        replay1_qa_calls = self._make_crashing_qa_handler(
+            executor,
+            crash_on_ac_indices=set(),
+            pass_results_for_others=[
+                _make_qa_ok_result(
+                    loop_action="pass", score=0.91, verdict="pass-replay-1"
+                ),
+            ],
+        )
+
+        executed_indices_resume1: list[int] = []
+
+        async def fake_single_ac_resume1(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices_resume1.append(ac_index)
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac_resume1  # type: ignore[method-assign]
+
+        plan = _make_plan((0,))
+        result_resume1 = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_session_51",
+            execution_id="exec_resume_51_a",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_pending",
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Replay #1 ran, AC 0 was NOT re-invoked at the agent layer.
+        assert 0 not in executed_indices_resume1, (
+            f"AC 0 must not be re-invoked on resume #1 — its persisted "
+            f"final_message is the replay artifact.  executed: "
+            f"{executed_indices_resume1}"
+        )
+        assert len(replay1_qa_calls) == 1, (
+            f"Resume #1 must invoke QA exactly once (replay #1); got "
+            f"{len(replay1_qa_calls)} calls"
+        )
+        # AC 0's persisted qa_status must transition pending → passed
+        # (idempotent terminal state after the first successful replay).
+        chain_after_resume1 = self._load_chain_dicts(store, seed.metadata.seed_id)
+        ac0_after_resume1 = next(
+            (
+                pm
+                for pm in chain_after_resume1
+                if pm.get("summary", {}).get("ac_index") == 0
+            ),
+            None,
+        )
+        assert ac0_after_resume1 is not None
+        assert ac0_after_resume1.get("qa_status") == "passed", (
+            f"AC 0 must transition pending → passed via replay #1; got "
+            f"{ac0_after_resume1.get('qa_status')!r}"
+        )
+        # Audit-diff has one '### Replay 1' section so far.
+        diff_path = artifact_dir / "chain-resume_session_51-ac0-qa.original.diff"
+        assert diff_path.exists(), (
+            f"Audit-diff sidecar must be written at {diff_path}"
+        )
+        diff_text_after_resume1 = diff_path.read_text(encoding="utf-8")
+        headers_after_resume1 = [
+            line
+            for line in diff_text_after_resume1.splitlines()
+            if line.startswith("### Replay ")
+        ]
+        assert len(headers_after_resume1) == 1, (
+            f"After resume #1 audit-diff must have one '### Replay N' "
+            f"section; got {headers_after_resume1!r}"
+        )
+        assert headers_after_resume1[0].startswith("### Replay 1 ("), (
+            f"First section must be 'Replay 1'; got {headers_after_resume1[0]!r}"
+        )
+        # The first section's lineage label is '--- original' (no prior
+        # replay history).
+        assert "--- original" in diff_text_after_resume1, (
+            f"Replay #1's lineage label must be '--- original'; sidecar "
+            f"text head:\n{diff_text_after_resume1[:600]}"
+        )
+        # Sanity: result counts.
+        assert result_resume1.externally_satisfied_count == 1
+
+        # ---------- Reset: artificially re-write phase-1 sentinel ----------
+        # The 'prior verdict' is the terminal verdict from replay #1 —
+        # this is what makes the sidecar's second section label its
+        # lineage as 'post-replay-1' rather than 'original' (replay #2
+        # overwrites replay #1's verdict, not the original none-verdict).
+        replay1_terminal_verdict = ac0_after_resume1.get("qa_verdict")
+        _seed_pending(prior_verdict_dict=replay1_terminal_verdict)
+
+        # ---------- Resume #2 — replay #2 succeeds, '### Replay 2' appended ----------
+        # Same session_id so the sidecar filename is identical and the
+        # second section APPENDS to the first.
+        replay2_qa_calls = self._make_crashing_qa_handler(
+            executor,
+            crash_on_ac_indices=set(),
+            pass_results_for_others=[
+                _make_qa_ok_result(
+                    loop_action="pass", score=0.95, verdict="pass-replay-2"
+                ),
+            ],
+        )
+
+        executed_indices_resume2: list[int] = []
+
+        async def fake_single_ac_resume2(**kwargs: Any) -> ACExecutionResult:
+            ac_index = int(kwargs["ac_index"])
+            executed_indices_resume2.append(ac_index)
+            return _ok_result(ac_index, str(kwargs["ac_content"]))
+
+        executor._execute_single_ac = fake_single_ac_resume2  # type: ignore[method-assign]
+
+        result_resume2 = await executor.execute_serial(
+            seed=seed,
+            session_id="resume_session_51",  # same session_id as resume #1
+            execution_id="exec_resume_51_b",
+            tools=[],
+            system_prompt="SYSTEM",
+            execution_plan=plan,
+            resume_session_id="prior_session_pending",
+            inline_qa=True,
+            max_qa_retries=1,
+        )
+
+        # Replay #2 ran; AC 0 still NOT re-invoked at the agent layer
+        # (idempotency: no agent re-run regardless of replay count).
+        assert 0 not in executed_indices_resume2, (
+            f"AC 0 must not be re-invoked on resume #2 — idempotent "
+            f"replay never re-runs the agent.  executed: "
+            f"{executed_indices_resume2}"
+        )
+        assert len(replay2_qa_calls) == 1, (
+            f"Resume #2 must invoke QA exactly once (replay #2); got "
+            f"{len(replay2_qa_calls)} calls"
+        )
+        # Idempotency: replay #2 also produces qa_status='passed'.
+        chain_after_resume2 = self._load_chain_dicts(store, seed.metadata.seed_id)
+        ac0_after_resume2 = next(
+            (
+                pm
+                for pm in chain_after_resume2
+                if pm.get("summary", {}).get("ac_index") == 0
+            ),
+            None,
+        )
+        assert ac0_after_resume2 is not None
+        assert ac0_after_resume2.get("qa_status") == "passed", (
+            f"Replay #2 must also produce qa_status='passed' (idempotent "
+            f"convergence to terminal state); got "
+            f"{ac0_after_resume2.get('qa_status')!r}"
+        )
+
+        # Critical: audit-diff file now has BOTH '### Replay 1' and
+        # '### Replay 2' sections in the same file (cumulative append).
+        diff_text_after_resume2 = diff_path.read_text(encoding="utf-8")
+        headers_after_resume2 = [
+            line
+            for line in diff_text_after_resume2.splitlines()
+            if line.startswith("### Replay ")
+        ]
+        assert len(headers_after_resume2) == 2, (
+            f"After resume #2 audit-diff must have TWO '### Replay N' "
+            f"sections (cumulative append); got {len(headers_after_resume2)} "
+            f"headers: {headers_after_resume2!r}.\n\n"
+            f"Sidecar contents:\n{diff_text_after_resume2}"
+        )
+        assert headers_after_resume2[0].startswith("### Replay 1 ("), (
+            f"First section must remain 'Replay 1' after the append; got "
+            f"{headers_after_resume2[0]!r}"
+        )
+        assert headers_after_resume2[1].startswith("### Replay 2 ("), (
+            f"Second section must be 'Replay 2'; got "
+            f"{headers_after_resume2[1]!r}"
+        )
+
+        # Lineage labels: 'original' for replay 1, 'post-replay-1' for
+        # replay 2.  Confirms the cumulative-history convention from
+        # _append_qa_audit_diff is preserved across runs.
+        assert "--- post-replay-1" in diff_text_after_resume2, (
+            f"Replay #2's lineage label must be '--- post-replay-1' "
+            f"(overwriting replay #1, not the original); sidecar "
+            f"contents:\n{diff_text_after_resume2}"
+        )
+        # The 'original' label from replay #1's section must still be
+        # present (prior section preserved, not clobbered by the append).
+        assert "--- original" in diff_text_after_resume2, (
+            f"Replay #1's '--- original' lineage label must be preserved "
+            f"after the append; sidecar contents:\n{diff_text_after_resume2}"
+        )
+
+        # Sanity: both resume runs report success.
+        assert result_resume2.externally_satisfied_count == 1

@@ -8,7 +8,8 @@ Key public surface:
     _assemble_qa_artifact   — compose the text block sent to QAHandler as artifact
     _assemble_qa_quality_bar — compose the quality-bar prompt
     _format_qa_feedback_section — build the retry-context injection block
-    _serialize_qa_verdict   — convert QAVerdict → JSON-safe dict
+    _serialize_qa_verdict   — convert QAVerdict → JSON-safe dict (canonical shape)
+    _meta_to_qaverdict_kwargs — pick QAVerdict-shaped fields out of raw meta
     InlineQAOutcome         — frozen dataclass wrapping loop_action + score
     run_inline_qa           — async entry-point called by the executor
 """
@@ -158,11 +159,13 @@ def _serialize_qa_verdict(verdict: QAVerdict) -> dict[str, Any]:
 
     Tuple fields (``differences``, ``suggestions``) become lists.
 
-    Intended for callers that already hold a parsed :class:`QAVerdict`
-    dataclass — :func:`run_inline_qa` reads the same fields directly off
-    ``MCPToolResult.meta`` and does not flow through this helper, which is
-    deliberate: ``meta`` is already a JSON-shaped dict, so an extra
-    serialization round-trip would be wasted work.
+    This is the **canonical-shape source of truth** for verdict_dict across
+    the codebase: both callers that already hold a parsed :class:`QAVerdict`
+    dataclass and :func:`run_inline_qa` (which reconstructs a QAVerdict from
+    ``MCPToolResult.meta`` via :func:`_meta_to_qaverdict_kwargs`) flow through
+    this helper. Centralizing the shape here keeps postmortem dicts byte-
+    identical regardless of provenance — see PR #6 CodeRabbit item 4 and
+    docs/brainstorm/phase-2-q4.1-hardening-design.md (AC-4 item 4, path 4a).
 
     Args:
         verdict: The QAVerdict dataclass instance.
@@ -178,6 +181,77 @@ def _serialize_qa_verdict(verdict: QAVerdict) -> dict[str, Any]:
         "differences": list(verdict.differences),
         "suggestions": list(verdict.suggestions),
         "reasoning": verdict.reasoning,
+    }
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort float coercion. Returns ``default`` on failure."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_str_list(value: Any) -> list[str]:
+    """Coerce ``value`` to a ``list[str]`` without splitting strings into chars.
+
+    A bare string yields a single-element list; ``None`` yields an empty list;
+    list/tuple inputs are stringified element-wise; anything else falls back
+    to an empty list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item is not None]
+    return []
+
+
+def _meta_to_qaverdict_kwargs(meta: dict[str, Any]) -> dict[str, Any]:
+    """Extract and normalize QAVerdict-shaped fields from a raw meta dict.
+
+    Picks only the six fields :class:`QAVerdict` accepts, supplying safe
+    defaults for missing/None values and coercing types so the resulting
+    kwargs construct a valid :class:`QAVerdict` instance even when the
+    meta payload is partially malformed.
+
+    Used by :func:`run_inline_qa` to round-trip ``MCPToolResult.meta``
+    through :class:`QAVerdict` → :func:`_serialize_qa_verdict`, ensuring
+    the returned ``verdict_dict`` matches the canonical shape.
+
+    Coercions are defensive: ``score`` accepts numeric strings via a
+    try/except wrapper; ``differences`` / ``suggestions`` accept bare
+    strings (treated as single-element lists, never iterable-to-chars);
+    ``dimensions`` only retains dict entries with numeric values.  This
+    preserves the QA-path contract that ``run_inline_qa`` degrades to
+    ``skipped_error`` rather than surfacing exceptions on malformed
+    LLM payloads.
+
+    Args:
+        meta: Raw meta dict from ``MCPToolResult.meta`` (may contain extra
+            keys like ``loop_action``, ``qa_session_id``, ``passed`` that
+            are not part of QAVerdict).
+
+    Returns:
+        Dict suitable for ``QAVerdict(**kwargs)`` with exactly the six
+        QAVerdict fields.
+    """
+    raw_dimensions = meta.get("dimensions")
+    dimensions: dict[str, float] = {}
+    if isinstance(raw_dimensions, dict):
+        for key, value in raw_dimensions.items():
+            try:
+                dimensions[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+    return {
+        "score": _coerce_float(meta.get("score"), 0.0),
+        "verdict": str(meta.get("verdict") or ""),
+        "dimensions": dimensions,
+        "differences": _coerce_str_list(meta.get("differences")),
+        "suggestions": _coerce_str_list(meta.get("suggestions")),
+        "reasoning": str(meta.get("reasoning") or ""),
     }
 
 
@@ -358,16 +432,13 @@ async def run_inline_qa(
         )
         raw_loop_action = "skipped_delegated"
     loop_action: str = raw_loop_action
-    score: float = float(meta.get("score", 0.0))
 
-    verdict_dict: dict[str, Any] = {
-        "score": score,
-        "verdict": meta.get("verdict", ""),
-        "dimensions": meta.get("dimensions", {}),
-        "differences": list(meta.get("differences") or []),
-        "suggestions": list(meta.get("suggestions") or []),
-        "reasoning": meta.get("reasoning", ""),
-    }
+    # Round-trip meta → QAVerdict → _serialize_qa_verdict so the returned
+    # verdict_dict matches the canonical shape used everywhere else in the
+    # codebase (PR #6 CodeRabbit item 4 / Q4.1 design AC-4 path 4a).
+    verdict = QAVerdict(**_meta_to_qaverdict_kwargs(meta))
+    verdict_dict: dict[str, Any] = _serialize_qa_verdict(verdict)
+    score: float = verdict_dict["score"]
 
     return InlineQAOutcome(
         loop_action=loop_action,

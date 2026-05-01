@@ -2,6 +2,8 @@
 
 Tests 1-10 cover the pure helper functions and the InlineQAOutcome dataclass.
 Tests 11-17 cover run_inline_qa with fake QAHandler instances.
+Tests 58-59 cover Q4.1 / AC-4 / item 4 — the verdict_dict canonical-shape
+unification through `_serialize_qa_verdict` (PR #6 CodeRabbit deferred item).
 
 Coverage:
     _assemble_qa_artifact          tests 1-2
@@ -10,6 +12,7 @@ Coverage:
     _serialize_qa_verdict          test 9
     InlineQAOutcome                test 10
     run_inline_qa                  tests 11-17
+    canonical-shape unification    tests 58-59
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from ouroboros.orchestrator.inline_qa import (
     _assemble_qa_artifact,
     _assemble_qa_quality_bar,
     _format_qa_feedback_section,
+    _meta_to_qaverdict_kwargs,
     _serialize_qa_verdict,
     run_inline_qa,
 )
@@ -611,3 +615,154 @@ class TestRunInlineQa:
         )
 
         assert outcome.loop_action == "skipped_delegated"
+
+    # -----------------------------------------------------------------
+    # Tests 58-59: PR-#6 CodeRabbit item 4 — verdict_dict canonical shape
+    # (Q4.1 design AC-4, path 4a — round-trip via _serialize_qa_verdict)
+    # -----------------------------------------------------------------
+
+    async def test_58_verdict_dict_matches_serialize_qa_verdict_canonical_shape(self) -> None:
+        """Test 58: run_inline_qa's verdict_dict equals _serialize_qa_verdict(QAVerdict(**fields)).
+
+        After Q4.1 / AC-4 / item 4, run_inline_qa must round-trip
+        ``MCPToolResult.meta`` through QAVerdict → _serialize_qa_verdict so
+        the returned verdict_dict is byte-identical to dicts produced by
+        callers that construct QAVerdict directly.  This single source of
+        truth keeps postmortem dicts comparable across provenance paths.
+        """
+        meta = _make_ok_meta(
+            score=0.83,
+            verdict="pass",
+            loop_action="pass",
+            differences=["minor wording diff"],
+            suggestions=["use docstring", "add type hints"],
+            reasoning="Solid implementation.",
+            dimensions={"correctness": 0.9, "completeness": 0.76},
+        )
+        handler = FakeQAHandler([_make_ok_result(meta)])
+        seed = FakeSeed()
+
+        outcome = await run_inline_qa(
+            handler,  # type: ignore[arg-type]
+            postmortem=self._pm(),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+        )
+
+        # Build the canonical reference dict via the same _serialize_qa_verdict
+        # path used elsewhere in the codebase.
+        reference = _serialize_qa_verdict(
+            QAVerdict(
+                score=0.83,
+                verdict="pass",
+                dimensions={"correctness": 0.9, "completeness": 0.76},
+                differences=["minor wording diff"],
+                suggestions=["use docstring", "add type hints"],
+                reasoning="Solid implementation.",
+            )
+        )
+
+        assert outcome.verdict_dict == reference
+        # Canonical shape: exactly the six QAVerdict-shaped keys, no leakage
+        # of meta-only keys (loop_action, qa_session_id, passed, status).
+        assert outcome.verdict_dict is not None
+        assert set(outcome.verdict_dict.keys()) == {
+            "score",
+            "verdict",
+            "dimensions",
+            "differences",
+            "suggestions",
+            "reasoning",
+        }
+        # Score is also propagated to the InlineQAOutcome scalar field.
+        assert outcome.score == 0.83
+        # Type discipline — score is a Python float, not a numeric string.
+        assert isinstance(outcome.verdict_dict["score"], float)
+        # Sequence types are JSON-safe lists (not tuples).
+        assert isinstance(outcome.verdict_dict["differences"], list)
+        assert isinstance(outcome.verdict_dict["suggestions"], list)
+
+    async def test_59_meta_to_qaverdict_kwargs_normalizes_partial_meta(self) -> None:
+        """Test 59: _meta_to_qaverdict_kwargs survives missing/None/wrong-type meta fields.
+
+        Path 4a relies on QAVerdict(**_meta_to_qaverdict_kwargs(meta)) succeeding
+        even when the LLM returned a partially malformed payload — so the helper
+        must apply safe defaults (score 0.0, empty strings, empty collections)
+        and coerce types (e.g., dimensions=None → {}).  This guards against a
+        TypeError on the QAVerdict ctor crashing the QA path on malformed meta.
+        """
+        # Direct unit coverage of the helper — partial / wrong-typed meta.
+        kwargs = _meta_to_qaverdict_kwargs(
+            {
+                # score missing entirely
+                "verdict": None,  # explicit None should normalize to ""
+                "dimensions": None,  # wrong type should normalize to {}
+                # differences omitted
+                "suggestions": [],  # already empty
+                "reasoning": None,  # explicit None should normalize to ""
+                # extra keys MUST be filtered out so QAVerdict(**kwargs) works
+                "loop_action": "skipped_delegated",
+                "qa_session_id": "qa-fake",
+                "passed": False,
+                "status": "ok",
+            }
+        )
+        # Filtered down to exactly QAVerdict's six fields:
+        assert set(kwargs.keys()) == {
+            "score",
+            "verdict",
+            "dimensions",
+            "differences",
+            "suggestions",
+            "reasoning",
+        }
+        # Defaults applied:
+        assert kwargs["score"] == 0.0
+        assert kwargs["verdict"] == ""
+        assert kwargs["dimensions"] == {}
+        assert kwargs["differences"] == []
+        assert kwargs["suggestions"] == []
+        assert kwargs["reasoning"] == ""
+
+        # The kwargs MUST construct a valid QAVerdict (no TypeError).
+        verdict = QAVerdict(**kwargs)
+        # Round-trip through _serialize_qa_verdict yields canonical-shape dict:
+        serialized = _serialize_qa_verdict(verdict)
+        assert serialized == {
+            "score": 0.0,
+            "verdict": "",
+            "dimensions": {},
+            "differences": [],
+            "suggestions": [],
+            "reasoning": "",
+        }
+
+        # End-to-end: feed the same partial meta through run_inline_qa and
+        # confirm its returned verdict_dict matches the canonical empty shape.
+        partial_meta = {
+            "loop_action": "fail",  # valid loop_action so we hit the
+                                    # serialization branch, not skip path
+            "qa_session_id": "qa-fake",
+        }
+        handler = FakeQAHandler([_make_ok_result(partial_meta)])
+        seed = FakeSeed()
+
+        outcome = await run_inline_qa(
+            handler,  # type: ignore[arg-type]
+            postmortem=self._pm(),
+            ac_index=0,
+            ac_content="AC",
+            seed=seed,  # type: ignore[arg-type]
+        )
+
+        assert outcome.loop_action == "fail"
+        assert outcome.verdict_dict == {
+            "score": 0.0,
+            "verdict": "",
+            "dimensions": {},
+            "differences": [],
+            "suggestions": [],
+            "reasoning": "",
+        }
+        assert outcome.score == 0.0

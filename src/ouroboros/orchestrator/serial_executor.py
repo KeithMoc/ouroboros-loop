@@ -27,6 +27,9 @@ Out of scope for phase 1 (follow-up milestones):
 
 from __future__ import annotations
 
+import dataclasses
+import difflib
+import json
 import os
 import re
 from datetime import UTC, datetime
@@ -45,6 +48,7 @@ from ouroboros.orchestrator.events import (
     create_sub_postmortem_resume_event,
 )
 from ouroboros.orchestrator.inline_qa import (
+    InlineQAOutcome,
     _format_qa_feedback_section,
     run_inline_qa,
 )
@@ -392,16 +396,25 @@ def _render_chain_as_markdown(
             lines.append(f"- Status: {qa_status} (attempt {qa_attempts})")
             lines.append(f"- Score: {score:.2f} / 1.00 — {verdict_label}")
             if suggestions:
-                # Dynamic-fence defense: pick a fence longer than any
-                # backtick run already present in the suggestion text so
-                # a suggestion like "use ```foo```" cannot break the block.
-                all_suggestions_text = "\n".join(str(s) for s in suggestions)
-                sug_fence = _pick_fence_for_text(all_suggestions_text)
+                # Q4.1 / AC-4 / item 3 — CodeRabbit deferral from PR #6.
+                # Render suggestion bullets as REAL Markdown OUTSIDE a fenced
+                # code block so each `- {sug}` line is parsed as a list item
+                # (not as fixed-width preformatted text).  Backticks within a
+                # suggestion become inline code spans, which is the desired
+                # rendering — copy-paste-friendly references to symbols /
+                # filenames.  The 2-space indent under "- Suggestions:" keeps
+                # each suggestion as a child of the parent bullet under
+                # CommonMark, matching the existing diff-summary indentation
+                # convention.
+                #
+                # Fence-collision protection (`_pick_fence_for_text`) is
+                # preserved at the OTHER fence site — `diff_summary` above —
+                # which still wraps a stat blob in a fence to keep it
+                # rendered as preformatted text.  See test 57 for the
+                # contract that suggestion bullets are never inside a fence.
                 lines.append("- Suggestions:")
-                lines.append(f"  {sug_fence}text")
                 for sug in suggestions:
                     lines.append(f"  - {sug}")
-                lines.append(f"  {sug_fence}")
             else:
                 lines.append("- Suggestions: (none)")
             lines.append("")
@@ -981,6 +994,314 @@ def _load_compounding_checkpoint(
     return chain, state.last_completed_ac_index
 
 
+# ---------------------------------------------------------------------------
+# Q4.1 / AC-3 helpers — qa_status pending-sentinel finalization + audit-diff
+# ---------------------------------------------------------------------------
+#
+# These three helpers support the AC-3 phase-1/phase-2 checkpoint flow:
+#   - _replace_pm_qa_state         — frozen-safe rewrite of qa_* fields on
+#                                    an existing ACPostmortem.
+#   - _finalize_pm_from_qa_outcome — apply an InlineQAOutcome to a pending
+#                                    postmortem, mapping loop_action → the
+#                                    terminal qa_status enum value.
+#   - _append_qa_audit_diff        — best-effort sidecar writer for the
+#                                    cumulative '### Replay N' audit diff.
+#
+# All three are pure / idempotent — safe to call multiple times.  None of
+# them raise on a typical input; the audit-diff writer additionally swallows
+# any filesystem error so a side-channel write failure cannot abort the run
+# (per the design's graceful_degradation principle).
+
+# Map InlineQAOutcome.loop_action → terminal ACPostmortem.qa_status value.
+# Used by _finalize_pm_from_qa_outcome below.  Mapping rationale:
+#   "pass"             → "passed"             — terminal pass verdict.
+#   "revise" / "fail"  → "exhausted"          — on a QA-replay branch the
+#       budget is effectively 1 (one replay attempt against the persisted
+#       artifact); a non-pass replay verdict is therefore a soft-pass
+#       "exhausted" rather than a continuation of the in-flight retry loop.
+#   "skipped_delegated" → "skipped_delegated" — opencode plugin-dispatch.
+#   "skipped_error"     → "skipped_error"     — handler / timeout failure.
+_QA_LOOP_ACTION_TO_QA_STATUS: dict[str, str] = {
+    "pass": "passed",
+    "revise": "exhausted",
+    "fail": "exhausted",
+    "skipped_delegated": "skipped_delegated",
+    "skipped_error": "skipped_error",
+}
+
+
+def _replace_pm_qa_state(
+    postmortem: ACPostmortem,
+    *,
+    qa_status: str | None,
+    qa_verdict: dict[str, Any] | None | object = ...,
+    qa_attempts: int | None = None,
+    final_message: str | None | object = ...,
+) -> ACPostmortem:
+    """Return a copy of ``postmortem`` with QA fields rewritten.
+
+    :class:`ACPostmortem` is a ``frozen=True``, ``slots=True`` dataclass —
+    direct attribute assignment raises ``FrozenInstanceError``.  This helper
+    wraps :func:`dataclasses.replace` so the QA-finalization paths (in-flight
+    pass / exhausted / skipped finalization, AC-3 phase-1 sentinel write,
+    AC-3 QA-replay-on-resume final write) share a single rewrite call site.
+
+    The sentinel default ``...`` (Ellipsis) lets callers distinguish
+    "leave the field as-is" from "explicitly set to None".  This matters for
+    ``qa_verdict`` and ``final_message`` because ``None`` is a valid
+    terminal value (e.g. a ``skipped_error`` outcome stores
+    ``qa_verdict=None``), so a plain ``=None`` default would be ambiguous.
+
+    Args:
+        postmortem: The source postmortem to rewrite.
+        qa_status: The new ``qa_status`` value.  Required (no sentinel) — the
+            whole point of this helper is to set qa_status, so a "leave as-is"
+            shortcut would be misleading.  Pass the existing value explicitly
+            if you need a no-op for that field.
+        qa_verdict: New verdict dict, or ``None`` to clear it, or ``...``
+            (default) to keep the existing verdict.
+        qa_attempts: New attempt counter.  ``None`` (default) keeps the
+            existing counter.
+        final_message: New final-message text, or ``None`` to clear it, or
+            ``...`` (default) to keep the existing value.
+
+    Returns:
+        A new :class:`ACPostmortem` with the requested QA fields replaced
+        and all other fields preserved.
+
+    [[INVARIANT: _replace_pm_qa_state preserves all non-QA fields of the source postmortem]]
+    [[INVARIANT: _replace_pm_qa_state is frozen-safe — never mutates the input]]
+    """
+    changes: dict[str, Any] = {"qa_status": qa_status}
+    if qa_verdict is not ...:
+        changes["qa_verdict"] = qa_verdict
+    if qa_attempts is not None:
+        changes["qa_attempts"] = qa_attempts
+    if final_message is not ...:
+        changes["final_message"] = final_message
+    return dataclasses.replace(postmortem, **changes)
+
+
+def _finalize_pm_from_qa_outcome(
+    pending_postmortem: ACPostmortem,
+    outcome: InlineQAOutcome,
+) -> ACPostmortem:
+    """Apply an :class:`InlineQAOutcome` to a pending postmortem.
+
+    Maps :attr:`InlineQAOutcome.loop_action` to the terminal
+    ``qa_status`` enum value via :data:`_QA_LOOP_ACTION_TO_QA_STATUS` and
+    writes the verdict dict + bumped attempt counter into a frozen-safe copy
+    of ``pending_postmortem``.  The intended caller is the AC-3 QA-replay
+    branch on resume (where the original attempt's checkpoint was written
+    with ``qa_status='pending'`` and the agent is NOT re-run); the same
+    helper is also valid for in-flight finalization of a pending sentinel.
+
+    ``loop_action`` values outside the closed enum from
+    :class:`InlineQAOutcome` are mapped to ``"exhausted"`` defensively so a
+    malformed payload can never produce a postmortem stuck on
+    ``qa_status='pending'`` (which would re-trigger replay forever).
+
+    The attempt counter is bumped by 1 from the pending postmortem's prior
+    value.  When the original phase-1 sentinel was written before any QA
+    attempt completed, ``qa_attempts == 0`` and the replay therefore lands as
+    ``qa_attempts == 1``.
+
+    Args:
+        pending_postmortem: The postmortem written at phase-1 (typically with
+            ``qa_status='pending'``).  All non-QA fields are preserved.
+        outcome: The replay's :class:`InlineQAOutcome`.
+
+    Returns:
+        A new :class:`ACPostmortem` with terminal ``qa_status``,
+        ``qa_verdict`` from the outcome (may be ``None`` for skipped /
+        errored outcomes), and ``qa_attempts`` bumped by 1.
+
+    [[INVARIANT: _finalize_pm_from_qa_outcome maps every InlineQAOutcome.loop_action to a non-pending qa_status]]
+    [[INVARIANT: _finalize_pm_from_qa_outcome bumps qa_attempts by exactly 1 from the pending postmortem]]
+    """
+    terminal_status = _QA_LOOP_ACTION_TO_QA_STATUS.get(outcome.loop_action)
+    if terminal_status is None:
+        log.warning(
+            "serial_executor.qa_finalize.unexpected_loop_action",
+            loop_action=str(outcome.loop_action),
+            qa_session_id=outcome.qa_session_id,
+        )
+        terminal_status = "exhausted"
+
+    return _replace_pm_qa_state(
+        pending_postmortem,
+        qa_status=terminal_status,
+        qa_verdict=outcome.verdict_dict,
+        qa_attempts=pending_postmortem.qa_attempts + 1,
+    )
+
+
+def _append_qa_audit_diff(
+    *,
+    session_id: str,
+    ac_index: int,
+    original_verdict_dict: dict[str, Any] | None,
+    replay_verdict_dict: dict[str, Any] | None,
+    artifact_dir: str | None = None,
+    timestamp: datetime | None = None,
+) -> Path | None:
+    """Append a unified-diff audit section for an overwritten QA verdict.
+
+    Writes (creating if missing, otherwise appending) a sidecar diff file
+    paired with the existing markdown chain artifact:
+
+        ``<artifact_dir>/chain-<session_id>-ac<N>-qa.original.diff``
+
+    Each call adds a new ``### Replay N (timestamp UTC)`` section showing
+    the unified diff between ``original_verdict_dict`` and
+    ``replay_verdict_dict``, both JSON-serialized for stable line-by-line
+    comparison.  The replay number ``N`` is derived from the count of
+    existing ``### Replay`` headers in the file so consecutive crashes
+    accumulate without overwriting prior audit history.
+
+    The live event stream uses *supersede* semantics (the replay's
+    ``ac_qa_evaluated`` event silently overwrites the original verdict);
+    this sidecar is the out-of-band audit record so the original verdict
+    is never silently lost.
+
+    Best-effort: any filesystem / serialization error is caught and logged
+    under ``serial_executor.qa_audit_diff.write_failed`` — the helper
+    returns ``None`` rather than propagating the exception.  The AC-3
+    design treats audit-diff writes as a recovery aide, not a correctness
+    boundary; a failed write must never abort the run.
+
+    Args:
+        session_id: Session id used in the filename (matches the
+            ``chain-<session_id>-...md`` artifact written by
+            :func:`write_chain_artifact`).
+        ac_index: 0-based AC index used in the filename.
+        original_verdict_dict: The verdict that was overwritten.  ``None``
+            is allowed (e.g. a phase-1 sentinel without a prior verdict)
+            and is rendered as the literal JSON string ``"null"`` for
+            diff-stability.
+        replay_verdict_dict: The new verdict produced by the replay.
+            ``None`` allowed under the same rules.
+        artifact_dir: Override directory.  Falls back to
+            ``OUROBOROS_CHAIN_ARTIFACT_DIR`` env var, then
+            :data:`_DEFAULT_CHAIN_ARTIFACT_DIR`.  Mirrors
+            :func:`write_chain_artifact`'s resolution policy so both files
+            land alongside each other.
+        timestamp: Override timestamp for the section header (UTC).
+            Defaults to ``datetime.now(UTC)``; primarily a test seam.
+
+    Returns:
+        :class:`~pathlib.Path` of the written file on success; ``None``
+        when the write was skipped or failed.
+
+    [[INVARIANT: _append_qa_audit_diff is best-effort — write failures never raise]]
+    [[INVARIANT: _append_qa_audit_diff appends a new '### Replay N' section per call, preserving prior sections]]
+    """
+    try:
+        if artifact_dir is None:
+            artifact_dir = os.environ.get(
+                "OUROBOROS_CHAIN_ARTIFACT_DIR", _DEFAULT_CHAIN_ARTIFACT_DIR
+            )
+        out_dir = Path(artifact_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        diff_path = (
+            out_dir / f"chain-{session_id}-ac{ac_index}-qa.original.diff"
+        )
+
+        # Determine replay number from existing content.  Count of lines
+        # starting with the literal '### Replay' header gives the prior
+        # replay count; the new replay is N+1.
+        prior_replays = 0
+        existing_text = ""
+        if diff_path.exists():
+            try:
+                existing_text = diff_path.read_text(encoding="utf-8")
+            except OSError:
+                existing_text = ""
+            prior_replays = sum(
+                1
+                for line in existing_text.splitlines()
+                if line.startswith("### Replay ")
+            )
+        replay_number = prior_replays + 1
+
+        ts = timestamp if timestamp is not None else datetime.now(UTC)
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Render both verdicts as pretty-printed JSON for line-by-line
+        # comparison.  ``sort_keys=True`` keeps key ordering stable across
+        # processes so diff noise is restricted to actual value changes.
+        original_json = json.dumps(
+            original_verdict_dict, indent=2, sort_keys=True, default=str
+        )
+        replay_json = json.dumps(
+            replay_verdict_dict, indent=2, sort_keys=True, default=str
+        )
+
+        # ``splitlines(keepends=True)`` preserves trailing newlines so the
+        # unified-diff markers (``--- a``, ``+++ b``, hunk headers) sit on
+        # their own lines without phantom no-newline-at-end-of-file noise.
+        original_lines = original_json.splitlines(keepends=True)
+        replay_lines = replay_json.splitlines(keepends=True)
+        if original_lines and not original_lines[-1].endswith("\n"):
+            original_lines[-1] += "\n"
+        if replay_lines and not replay_lines[-1].endswith("\n"):
+            replay_lines[-1] += "\n"
+
+        # Cumulative-history label: replay 1 compares against "original";
+        # replay 2+ compares against "post-replay-(N-1)" so the lineage of
+        # overwrites is unambiguous in the audit file.
+        from_label = (
+            "original" if replay_number == 1 else f"post-replay-{replay_number - 1}"
+        )
+        diff_lines = list(
+            difflib.unified_diff(
+                original_lines,
+                replay_lines,
+                fromfile=from_label,
+                tofile="replay",
+                lineterm="\n",
+            )
+        )
+        diff_block = "".join(diff_lines)
+
+        section_parts: list[str] = []
+        if not existing_text:
+            section_parts.append(
+                f"# QA verdict audit diff — session {session_id}, "
+                f"AC {ac_index}\n\n"
+            )
+        elif not existing_text.endswith("\n"):
+            section_parts.append("\n")
+        section_parts.append(f"### Replay {replay_number} ({ts_str})\n\n")
+        if diff_block:
+            section_parts.append(diff_block)
+        else:
+            section_parts.append("(no textual difference)\n")
+        section_parts.append("\n")
+        new_section = "".join(section_parts)
+
+        with diff_path.open("a", encoding="utf-8") as fh:
+            fh.write(new_section)
+
+        log.info(
+            "serial_executor.qa_audit_diff.written",
+            session_id=session_id,
+            ac_index=ac_index,
+            replay_number=replay_number,
+            path=str(diff_path),
+        )
+        return diff_path
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "serial_executor.qa_audit_diff.write_failed",
+            session_id=session_id,
+            ac_index=ac_index,
+            error=str(exc),
+        )
+        return None
+
+
 def linearize_execution_plan(execution_plan: "StagedExecutionPlan") -> tuple[int, ...]:
     """Flatten a staged execution plan into a total AC order.
 
@@ -1028,6 +1349,14 @@ class SerialCompoundingExecutor(ParallelACExecutor):
         """
         super().__init__(*args, **kwargs)
         self._qa_handler: QAHandler = qa_handler if qa_handler is not None else QAHandler()
+        # Q4.1 / AC-4 sub-AC 5: end-of-run chain handle for the runner's
+        # Run Summary aggregation.  Initialized to None and populated just
+        # before :meth:`execute_serial` returns its
+        # :class:`ParallelExecutionResult`.  The runner reads this attribute
+        # via ``getattr(executor, "last_completed_chain", None)`` so a future
+        # executor swap that doesn't expose the field degrades cleanly to an
+        # empty Run Summary.
+        self.last_completed_chain: PostmortemChain | None = None
 
     async def execute_serial(
         self,
@@ -1092,6 +1421,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 
         [[INVARIANT: resume_session_id triggers checkpoint loading by seed_id, not by session_id]]
         [[INVARIANT: deserialized chain is injected before the AC loop so resumed ACs see prior postmortems]]
+        [[INVARIANT: resume QA-replay branch fires when chain[-1].qa_status='pending' AND inline_qa=True — agent is NOT re-invoked]]
+        [[INVARIANT: resume QA-replay-skipped branch fires when chain[-1].qa_status='pending' AND inline_qa=False — qa_status is cleared to None and AC marked terminal without verdict]]
+        [[INVARIANT: resume QA-replay branch is bypassed when chain[-1].qa_status is terminal (passed/exhausted/skipped_*/None)]]
         """
         if execution_plan is None:
             if dependency_graph is None:
@@ -1148,6 +1480,130 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 seed_id=seed.metadata.seed_id,
                 detail="--resume requested but checkpoint store is not configured; starting fresh",
             )
+
+        # ----- AC-3 / Q4.1 — resume QA-replay branch (pending sentinel) -----
+        #
+        # When the prior run wrote a phase-1 ``qa_status='pending'`` sentinel
+        # but never produced the phase-2 terminal-state checkpoint (the
+        # canonical Ctrl+C-during-QA crash), the rehydrated chain's last
+        # postmortem is the sentinel.  The agent's work is already committed
+        # (preserved by the phase-1 write); the only thing that died is the
+        # QA call.  This branch replays QA-only against the persisted
+        # ``final_message + diff_summary`` artifact — no agent re-run — and
+        # writes a phase-2 terminal-state checkpoint so subsequent resumes
+        # see a normal terminal status.
+        #
+        # The pending postmortem already sits at chain.postmortems[-1] and
+        # ``last_completed_ac_index`` already points at the AC whose QA was
+        # in flight (set by the phase-1 write at the original run).  After
+        # finalization, the main AC loop's existing ``ac_index <=
+        # last_completed_ac_index`` skip path treats the pending AC as
+        # terminal and proceeds with ``ac_index + 1`` as usual.
+        #
+        # Edge cases:
+        #   * inline_qa=False on resume — user opted out of QA on this run.
+        #     Mark qa_status=None, log a warning, treat the AC as terminal
+        #     without verdict (per design doc AC-3 P1-derived semantic).
+        #   * Idempotent re-replay: if the replay itself crashes, next
+        #     resume sees ``pending`` again (the helper writes back the
+        #     non-pending finalized state, so a successful replay flips it).
+        #     The audit-diff sidecar accumulates one ``### Replay N``
+        #     section per replay so verdict-supersede history is preserved.
+        #   * Checkpoint store unavailable — phase-2 write skipped via
+        #     existing ``self._checkpoint_store is None`` guard.  Replay
+        #     still finalizes in-memory chain so the run proceeds.
+        #
+        # See docs/brainstorm/phase-2-q4.1-hardening-design.md (AC-3, resume
+        # path + edge cases section) for the full design.
+        if (
+            resume_session_id is not None
+            and chain.postmortems
+            and chain.postmortems[-1].qa_status == "pending"
+        ):
+            pending_pm = chain.postmortems[-1]
+            pending_ac_index = pending_pm.summary.ac_index
+
+            if inline_qa:
+                original_verdict_dict = pending_pm.qa_verdict
+                replay_qa_session_id = (
+                    f"qa-replay-ac{pending_ac_index}-{session_id[:8]}"
+                )
+                log.info(
+                    "serial_executor.resume.qa_replay.start",
+                    session_id=session_id,
+                    resume_session_id=resume_session_id,
+                    ac_index=pending_ac_index,
+                    qa_session_id=replay_qa_session_id,
+                )
+                replay_outcome = await run_inline_qa(
+                    self._qa_handler,
+                    postmortem=pending_pm,
+                    ac_index=pending_ac_index,
+                    ac_content=seed.acceptance_criteria[pending_ac_index],
+                    seed=seed,
+                    qa_session_id=replay_qa_session_id,
+                    final_message=pending_pm.final_message,
+                    iteration_history=None,  # fresh replay against fixed artifact
+                )
+                # Best-effort sidecar: record original→replay verdict overwrite
+                # under the live event-stream's supersede semantics.  Failures
+                # here never abort the run (helper swallows exceptions).
+                _append_qa_audit_diff(
+                    session_id=session_id,
+                    ac_index=pending_ac_index,
+                    original_verdict_dict=original_verdict_dict,
+                    replay_verdict_dict=replay_outcome.verdict_dict,
+                )
+                finalized_pm = _finalize_pm_from_qa_outcome(
+                    pending_pm, replay_outcome
+                )
+                chain = chain.replace_last(finalized_pm)
+                log.info(
+                    "serial_executor.resume.qa_replay.completed",
+                    session_id=session_id,
+                    ac_index=pending_ac_index,
+                    loop_action=replay_outcome.loop_action,
+                    qa_status=finalized_pm.qa_status,
+                )
+                # Phase-2 write supersedes the phase-1 sentinel (UPDATE-IN-PLACE
+                # under the same checkpoint key).  Skipped silently when the
+                # store is unavailable — degrades to status-quo (next resume
+                # would replay again with the same artifact).
+                if self._checkpoint_store is not None:
+                    _write_compounding_checkpoint(
+                        store=self._checkpoint_store,
+                        seed_id=seed.metadata.seed_id,
+                        session_id=session_id,
+                        ac_index=pending_ac_index,
+                        chain=chain,
+                    )
+            else:
+                # User did not pass --inline-qa on this resume — respect the
+                # opt-out.  Clear the sentinel (qa_status=None) and treat the
+                # AC as terminal without a verdict.  Audit-diff is intentionally
+                # NOT written: there's no replay verdict to record, and the
+                # user explicitly opted out of QA.
+                log.warning(
+                    "serial_executor.resume.qa_replay_skipped",
+                    session_id=session_id,
+                    resume_session_id=resume_session_id,
+                    ac_index=pending_ac_index,
+                    detail=(
+                        "Resume detected qa_status='pending' but --inline-qa "
+                        "is not set on this run; AC marked terminal without "
+                        "QA verdict."
+                    ),
+                )
+                cleared_pm = _replace_pm_qa_state(pending_pm, qa_status=None)
+                chain = chain.replace_last(cleared_pm)
+                if self._checkpoint_store is not None:
+                    _write_compounding_checkpoint(
+                        store=self._checkpoint_store,
+                        seed_id=seed.metadata.seed_id,
+                        session_id=session_id,
+                        ac_index=pending_ac_index,
+                        chain=chain,
+                    )
 
         results: list[ACExecutionResult] = []
         stages: list[ParallelExecutionStageResult] = []
@@ -1510,6 +1966,73 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         qa_attempts=prior_qa_attempts,
                     )
 
+                # ----- Inline QA (Q4) — parent-only by design -----
+                #
+                # QA fires at the PARENT AC level only. Sub-ACs created by
+                # _try_decompose_ac (parallel_executor.py:2169) are NOT
+                # independently QA'd. This is intentional, not a TODO:
+                #
+                #   1. Sub-ACs are agent-derived from the parent's content.
+                #      The seed provides acceptance criteria only at the parent
+                #      AC level — sub-AC QA would have no crisp pass/fail bar.
+                #   2. Sub-AC work flows into the parent's diff via the
+                #      commit-per-AC pattern AND into the parent's invariants
+                #      via Q3's sub-postmortem flatten path (see lines ~1703-
+                #      1722). The parent's QA verdict therefore judges the
+                #      sum-of-sub-AC outcome.
+                #   3. Inline-retry on parent QA fail re-decomposes the whole
+                #      parent (Q4 cycle-1 default). Deferred end-of-run sweep
+                #      mode is tracked as Q4.2 in the master brainstorm doc.
+                #
+                # See docs/brainstorm/phase-2-q4.1-hardening-design.md (AC-1)
+                # for the full design rationale.
+
+                # ----- AC-3 / Q4.1 — phase-1 checkpoint (qa_status='pending') -----
+                #
+                # A Ctrl+C (or rare OOM/system-death) DURING the QA call below
+                # leaves the agent's already-committed work without a recoverable
+                # checkpoint, because the existing per-AC checkpoint at the end
+                # of the AC body (phase-2, see line ~2099) only fires AFTER the
+                # QA loop has finalized.  Without this phase-1 write, on resume
+                # the agent re-runs from scratch and sees its prior attempt's
+                # commits as pre-existing state — which makes the run
+                # non-deterministic and nullifies the per-AC retry semantics.
+                #
+                # Phase-1 persists a sentinel postmortem (qa_status='pending')
+                # under the same checkpoint key that phase-2 writes — the two
+                # are an UPDATE-IN-PLACE pair (phase-2 supersedes phase-1).
+                # Gates: inline_qa=True (no sentinel needed when QA is off),
+                # result.outcome=SUCCEEDED (failed agent runs follow the
+                # existing FAILED-path; no QA replay), and a configured
+                # _checkpoint_store (resume is impossible without one — degrades
+                # to status-quo / pre-Q4.1 behavior, agent re-runs on resume).
+                #
+                # ``final_message=result.final_message`` is required so the
+                # resume QA-replay branch can re-invoke ``run_inline_qa`` with
+                # the same artifact (final_message + diff_summary) the original
+                # attempt judged.
+                #
+                # See docs/brainstorm/phase-2-q4.1-hardening-design.md (AC-3)
+                # for the full phase-1 / phase-2 design.
+                if (
+                    inline_qa
+                    and result.outcome == ACExecutionOutcome.SUCCEEDED
+                    and self._checkpoint_store is not None
+                ):
+                    pending_postmortem = _replace_pm_qa_state(
+                        postmortem,
+                        qa_status="pending",
+                        final_message=result.final_message,
+                    )
+                    pending_chain = chain.append(pending_postmortem)
+                    _write_compounding_checkpoint(
+                        store=self._checkpoint_store,
+                        seed_id=seed.metadata.seed_id,
+                        session_id=session_id,
+                        ac_index=ac_index,
+                        chain=pending_chain,
+                    )
+
                 # Q4: Skip QA when disabled or when the execution itself
                 # failed/stalled.  Failed/stalled ACs follow the existing
                 # FAILED-path below; QA on a stall result would judge out of context.
@@ -1551,6 +2074,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 
                 # Rebuild postmortem with QA verdict + attempt count.
                 # ACPostmortem is frozen — must reconstruct; qa_status finalized below.
+                # AC-3 / Q4.1: ``final_message`` populated from ``result.final_message``
+                # so the terminal phase-2 checkpoint carries the artifact the QA
+                # judge evaluated (mirrors the phase-1 sentinel above).
                 postmortem = ACPostmortem(
                     summary=postmortem.summary,
                     diff_summary=postmortem.diff_summary,
@@ -1565,6 +2091,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     sub_postmortems=postmortem.sub_postmortems,
                     qa_verdict=inline_qa_outcome.verdict_dict,
                     qa_attempts=qa_attempt + 1,
+                    final_message=result.final_message,
                 )
 
                 # Emit QA evaluated event for observability.
@@ -1597,6 +2124,8 @@ class SerialCompoundingExecutor(ParallelACExecutor):
 
                 if inline_qa_outcome.loop_action == "pass":
                     # PASS — finalize with qa_status="passed" and exit loop.
+                    # AC-3 / Q4.1: keep ``final_message`` populated so the terminal
+                    # phase-2 checkpoint reflects the artifact QA approved.
                     postmortem = ACPostmortem(
                         summary=postmortem.summary,
                         diff_summary=postmortem.diff_summary,
@@ -1612,6 +2141,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         qa_verdict=postmortem.qa_verdict,
                         qa_attempts=postmortem.qa_attempts,
                         qa_status="passed",
+                        final_message=result.final_message,
                     )
                     break
 
@@ -1620,6 +2150,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     # (unexpected) — both bypass the retry loop without blocking
                     # the run.  qa_status preserves the distinction so postmortem
                     # auditing can tell intentional skips from real outages.
+                    # AC-3 / Q4.1: ``final_message`` populated so a subsequent
+                    # resume can still see the agent's last response in the
+                    # terminal checkpoint, even when QA itself was bypassed.
                     postmortem = ACPostmortem(
                         summary=postmortem.summary,
                         diff_summary=postmortem.diff_summary,
@@ -1635,6 +2168,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         qa_verdict=postmortem.qa_verdict,
                         qa_attempts=postmortem.qa_attempts,
                         qa_status=inline_qa_outcome.loop_action,
+                        final_message=result.final_message,
                     )
                     break
 
@@ -1645,6 +2179,9 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                 # Q4=B soft-pass: budget exhausted without a PASS verdict.
                 # Keep the last attempt's postmortem; mark qa_status='exhausted'.
                 # A flaky LLM judge cannot nuke a long compounding chain.
+                # AC-3 / Q4.1: ``final_message`` populated from the last
+                # iteration's ``result.final_message`` so the terminal checkpoint
+                # records the artifact the soft-passing AC actually produced.
                 postmortem = ACPostmortem(
                     summary=postmortem.summary,
                     diff_summary=postmortem.diff_summary,
@@ -1660,6 +2197,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     qa_verdict=postmortem.qa_verdict,
                     qa_attempts=postmortem.qa_attempts,
                     qa_status="exhausted",
+                    final_message=result.final_message,
                 )
                 log.info(
                     "serial_executor.inline_qa.exhausted",
@@ -1721,6 +2259,10 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     source_ac_id=f"ac_{ac_index}",
                 )
                 if merged:
+                    # AC-3 / Q4.1: ``final_message`` preserved through the
+                    # invariants-merge rebuild so the field set by the QA-loop
+                    # rebuilds (1887/1933/1956/1981) survives into the terminal
+                    # phase-2 checkpoint at the bottom of the AC body.
                     postmortem = ACPostmortem(
                         summary=postmortem.summary,
                         diff_summary=postmortem.diff_summary,
@@ -1736,6 +2278,7 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                         qa_verdict=postmortem.qa_verdict,
                         qa_status=postmortem.qa_status,
                         qa_attempts=postmortem.qa_attempts,
+                        final_message=postmortem.final_message,
                     )
                     min_rel = _get_min_reliability()
                     above_threshold = sum(
@@ -1873,6 +2416,12 @@ class SerialCompoundingExecutor(ParallelACExecutor):
                     session_id=session_id,
                     error=str(artifact_exc),
                 )
+
+        # Q4.1 / AC-4 sub-AC 5: expose the chain so the runner can aggregate
+        # Run Summary stats (qa_calls / qa_verdicts / invariants_above_threshold)
+        # without re-querying the event store.  Stored unconditionally — even an
+        # empty chain (zero ACs ran) gives the runner a safe handle to introspect.
+        self.last_completed_chain = chain
 
         return ParallelExecutionResult(
             results=tuple(results),

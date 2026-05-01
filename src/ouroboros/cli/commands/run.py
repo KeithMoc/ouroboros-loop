@@ -693,6 +693,7 @@ async def _run_orchestrator(
 
 @app.command()
 def workflow(
+    ctx: typer.Context,
     seed_file: Annotated[
         Path,
         typer.Argument(
@@ -887,7 +888,19 @@ def workflow(
         inline_qa = False
 
     # --max-qa-retries without --inline-qa: warn and ignore.
-    if max_qa_retries != 1 and not inline_qa:
+    #
+    # Q4.1 / AC-4 item 1: gate the warning behind ParameterSource.COMMANDLINE
+    # so it only fires when the user *explicitly* passed --max-qa-retries on
+    # the command line (not when typer/click filled in the default, the
+    # context default-map, or an environment variable). The legacy
+    # `max_qa_retries != 1` check is kept as the second gate so an explicit
+    # `--max-qa-retries 1` (matching the default value) stays silent — the
+    # user's intent in that case is identical to the default.
+    if (
+        ctx.get_parameter_source("max_qa_retries") == click.core.ParameterSource.COMMANDLINE
+        and max_qa_retries != 1
+        and not inline_qa
+    ):
         log.warning("run.max_qa_retries.ignored_without_inline_qa")
         print_warning(
             "--max-qa-retries has no effect without --inline-qa; flag ignored."

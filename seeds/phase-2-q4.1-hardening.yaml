@@ -1,0 +1,1021 @@
+# Phase-2 Dogfood Seed — Q4.1: Hardening Cycle
+#
+# Four ACs.  Closes the workflow-assumption gotcha class (the Q2.1 / Q4×decomposition lesson)
+# without expanding scope into a new feature surface:
+#
+#   AC-1 — Document the parent-only QA design choice (~10 LOC, docs-only).
+#   AC-2 — MCP execution_mode_required honoring + soft-flip default (~50 LOC).
+#   AC-3 — QA-pending sentinel resume + audit-diff sidecar (~125 LOC).
+#   AC-4 — Deferred CodeRabbit items + Run Summary observability (~170 LOC).
+#
+# Total ~355 LOC across ~10 files. Q4 (PR #6, ce5ad1e) shipped inline QA at the parent-AC
+# level; Q4.1 makes the QA story crash-resistant, the MCP mode-routing seed-aware, and
+# adds a user-facing end-of-run surface that consolidates cost, QA, invariant, and
+# mode-conflict telemetry.
+#
+# Run:
+#   ooo run workflow seeds/phase-2-q4.1-hardening.yaml --compounding --inline-qa
+#
+# Full reasoning:
+#   docs/brainstorm/phase-2-q4.1-hardening-design.md
+#   docs/brainstorm/phase-2-q4-inline-qa-design.md (predecessor)
+#   docs/brainstorm/serial-compounding-open-questions.md (master Q-list)
+#
+# Three-pass procedure trial: this is the FIRST cycle prepared via the
+# P0-recon → brainstorm → P1-edge-case-mining → ooo-interview pipeline.
+# The interview MCP tool errored mid-cycle (`No module named ouroboros.events.interview`),
+# so the interview ran via Path B fallback. The procedure will be evaluated post-cycle —
+# preliminary signal: each pass produced material design refinements.
+
+goal: "Implement Q4.1 (hardening cycle for serial-compounding) for Ouroboros: (1) document the parent-only QA design choice as deliberate, with the substrate reasoning at the QA call site so future readers don't read it as a TODO; (2) honor `seed.metadata.execution_mode_required` in the MCP execute-seed handler with caller-wins-and-warn conflict policy and a soft-flip of the global default from `parallel` to `compounding` (one-time-per-session deprecation warning); (3) add a `qa_status='pending'` sentinel + phase-1/phase-2 checkpoint write so a Ctrl+C-during-QA crash on resume replays QA-only against the agent's already-committed work (no agent re-run), with an audit-diff sidecar capturing every overwritten verdict in unified-diff format; (4) ship the four PR-#6-deferred CodeRabbit items (max_qa_retries explicit-source detection, always-forward through runner, render suggestions outside fence, unify run_inline_qa serialization through _serialize_qa_verdict) plus extend completion_summary with cost / QA / invariant / mode-conflict counters and print a Run Summary panel below the existing completion panel (always-show-5-row format for grep/parse stability)."
+
+constraints:
+  - "Python 3.10+ (matches existing codebase)"
+  - "Keep the full existing test suite green (`uv run pytest tests/unit/` after each AC's commit)"
+  - "Parallel mode (`mode='parallel'`) must remain byte-identical to pre-change — parallel_executor.py is NOT touched"
+  - "Non-compounding non-inline-QA runs must produce the SAME completion panel output as today (Run Summary panel only appears when applicable per AC-4)"
+  - "ACPostmortem schema additions are forward-compatible: serialized chains from v0.30 (post-Q4) must hydrate cleanly under Q4.1; new fields default to None/empty via `d.get(...)` per the existing pattern"
+  - "SeedMetadata schema addition is forward-compatible: old seed YAML files (without `execution_mode_required`) must hydrate as `None` and silently fall through to the global default; the 4 existing seed YAMLs that already have the field must START being honored"
+  - "QA replay on resume MUST NOT re-execute the agent. The agent's prior commits are the artifact for replay; only `run_inline_qa` re-fires"
+  - "Audit-diff sidecar writes MUST NOT block or fail the run. File-write errors degrade to a logged warning (`serial_executor.qa_audit_diff.write_failed`)"
+  - "Use a conventional-commit message for each AC's commit (`feat(compounding): Q4.1 — <AC scope>`)"
+  - "Before starting, read docs/brainstorm/phase-2-q4.1-hardening-design.md for the full design and locked decisions"
+  - "Emit at least one [[INVARIANT: ...]] tag per AC's final message so Q3's verifier can score the work"
+  - "Q1 was decided as 'parent-only QA + document'; AC-1 is documentation-only. Do NOT extend QA to sub-ACs in any AC of this cycle"
+  - "End-of-run-sweep mode (`--qa-mode=defer`) is explicitly DEFERRED to Q4.2; do not implement here"
+  - "Prompt-caching adapter rewrites are blocked by Claude Code subscription runtime constraint; do not propose them"
+  - "MCP tool name shape preserved: `ouroboros_execute_seed` continues to accept `mode` arg as caller override; the new behavior is fallback-to-seed-metadata when caller omits, NOT replacement of the caller arg"
+
+acceptance_criteria:
+  - |
+    AC-1 (Q4.1 / part 1) — Parent-only QA design rationale + test rename
+
+    Deliverable: documentation-only AC. Adds a docstring block at the
+    QA call site in serial_executor.py that explains parent-only QA is
+    a deliberate design choice (not a TODO), and renames the existing
+    test that locks the contract to make the design intent legible.
+    No code-flow change.
+
+    REQUIREMENTS:
+
+    - In `src/ouroboros/orchestrator/serial_executor.py`, immediately
+      ABOVE the QA-loop gate at line ~1516 (`if not inline_qa or
+      result.outcome != ACExecutionOutcome.SUCCEEDED: break`), insert a
+      docstring-style comment block. Format:
+
+        # ----- Inline QA (Q4) — parent-only by design -----
+        #
+        # QA fires at the PARENT AC level only. Sub-ACs created by
+        # _try_decompose_ac (parallel_executor.py:2169) are NOT
+        # independently QA'd. This is intentional, not a TODO:
+        #
+        #   1. Sub-ACs are agent-derived from the parent's content.
+        #      The seed provides acceptance criteria only at the parent
+        #      AC level — sub-AC QA would have no crisp pass/fail bar.
+        #   2. Sub-AC work flows into the parent's diff via the
+        #      commit-per-AC pattern AND into the parent's invariants
+        #      via Q3's sub-postmortem flatten path (see lines ~1703-
+        #      1722). The parent's QA verdict therefore judges the
+        #      sum-of-sub-AC outcome.
+        #   3. Inline-retry on parent QA fail re-decomposes the whole
+        #      parent (Q4 cycle-1 default). Deferred end-of-run sweep
+        #      mode is tracked as Q4.2 in the master brainstorm doc.
+        #
+        # See docs/brainstorm/phase-2-q4.1-hardening-design.md (AC-1)
+        # for the full design rationale.
+
+    - In `tests/unit/orchestrator/test_serial_executor.py`, locate
+      `test_inline_qa_decomposed_ac_parent_only` (around line 7476-7582).
+      Rename it to `test_inline_qa_parent_only_is_intentional`.
+
+    - Add a docstring to the renamed test that references this design
+      doc and explains the substrate reason — so a future reader does
+      not read the test as a TODO. Format:
+
+        def test_inline_qa_parent_only_is_intentional(...):
+            """Parent-only QA on decomposed ACs is deliberate, not a gap.
+
+            Sub-ACs created by _try_decompose_ac are agent-derived from
+            the parent's content and have no independent acceptance
+            criteria. Per Q4.1 design (docs/brainstorm/phase-2-q4.1-
+            hardening-design.md, AC-1), QA fires at the parent level
+            only. This test pins that contract.
+
+            See: docs/brainstorm/phase-2-q4-inline-qa-design.md (Q4
+            cycle-1 substrate reasoning).
+            """
+            ...
+
+    - Update any other docstring or comment in the codebase that
+      describes QA-on-decomposed behavior as a TODO or open question.
+      Run `rg -n 'sub-AC.*QA|QA.*sub-AC|TODO.*QA' src/ouroboros tests/`
+      and reword any hits that suggest the behavior is provisional.
+
+    TESTS:
+
+    - The renamed test must pass with the same assertions as before
+      (1 QA call, all sub-postmortems retain qa_status=None).
+    - No new tests required — AC-1 is documentation-only.
+
+    INVARIANTS / GOTCHAS:
+
+    - [[INVARIANT: AC-1 introduces zero behavior change. Running the
+      existing 5699-test suite before and after AC-1's commit must
+      produce byte-identical pass/fail counts]]
+    - [[INVARIANT: the docstring at serial_executor.py:~1516 cites
+      docs/brainstorm/phase-2-q4.1-hardening-design.md for the full
+      rationale, not just inline reasoning]]
+    - GOTCHA: do NOT add an `assert sub_postmortems[i].qa_status is
+      None` for every sub-postmortem in the test — the existing test
+      already checks the aggregate; over-asserting makes the test
+      brittle to future flatten-path changes.
+
+  - |
+    AC-2 (Q4.1 / part 2) — SeedMetadata schema extension + MCP execution_mode_required honoring + soft-flip default
+
+    Deliverable: the MCP execute-seed handler reads
+    `seed.metadata.execution_mode_required` when the caller omits the
+    `mode` arg; emits a structured warning + event when caller and seed
+    disagree (caller wins); soft-flips the global default from
+    `parallel` to `compounding` with a one-time-per-session deprecation
+    warning. The handler also moves the mode-resolution block BELOW
+    the seed-parsing line (P1 finding C — today the handler reads `mode`
+    at line 286, before `seed = Seed.from_dict(seed_dict)` at line 348).
+
+    REQUIREMENTS:
+
+    - In `src/ouroboros/core/seed.py`, extend `SeedMetadata` with a new
+      field BELOW `parent_seed_id`:
+
+        execution_mode_required: Literal["parallel", "compounding"] | None = Field(
+            default=None,
+            description=(
+                "Mode the seed expects. None = no preference (handler falls "
+                "back to caller arg or global default). When set, takes effect "
+                "if the MCP execute_seed caller omits the 'mode' arg."
+            ),
+        )
+
+      Import `Literal` from `typing` if not already imported. The field
+      MUST be `frozen` (already inherited from BaseModel(frozen=True)).
+      Old YAML files (without the field) hydrate as `None` —
+      backward-compat preserved. The 4 existing seed YAMLs that already
+      have `execution_mode_required: "compounding"` start being honored.
+
+    - In `src/ouroboros/mcp/tools/execution_handlers.py`, RELOCATE the
+      mode-resolution block. Today (line 286-293):
+
+        execution_mode = arguments.get("mode", "parallel")
+        if execution_mode not in {"parallel", "compounding"}:
+            return Result.err(MCPToolError(...))
+
+      Move this block to BELOW the seed-parsing site at line ~349
+      (`seed = Seed.from_dict(seed_dict)`). The new block:
+
+        # AC-2: mode resolution AFTER seed parsing so seed metadata is available.
+        caller_mode = arguments.get("mode")  # may be None now
+        seed_mode = seed.metadata.execution_mode_required  # may be None
+
+        if caller_mode is not None:
+            execution_mode = caller_mode
+            if seed_mode is not None and caller_mode != seed_mode:
+                log.warning(
+                    "mcp.execute_seed.mode_override",
+                    caller=caller_mode,
+                    seed=seed_mode,
+                    seed_id=seed.metadata.seed_id,
+                    session_id=session_id,
+                )
+                await event_store.append(
+                    create_mode_conflict_event(
+                        session_id=session_id,
+                        caller_mode=caller_mode,
+                        seed_mode=seed_mode,
+                        seed_id=seed.metadata.seed_id,
+                        timestamp=datetime.now(UTC),
+                    )
+                )
+                _mode_conflict_counter[session_id] = (
+                    _mode_conflict_counter.get(session_id, 0) + 1
+                )
+        elif seed_mode is not None:
+            execution_mode = seed_mode
+        else:
+            execution_mode = "compounding"  # NEW global default
+            global _SOFT_FLIP_WARNED_THIS_SESSION
+            if not _SOFT_FLIP_WARNED_THIS_SESSION:
+                log.warning(
+                    "mcp.execute_seed.default_flipped",
+                    message=(
+                        "No mode specified — defaulting to 'compounding' "
+                        "(was 'parallel' before this release). "
+                        "Set mode='parallel' or "
+                        "metadata.execution_mode_required='parallel' "
+                        "to silence this warning."
+                    ),
+                )
+                _SOFT_FLIP_WARNED_THIS_SESSION = True
+
+        if execution_mode not in {"parallel", "compounding"}:
+            return Result.err(
+                MCPToolError(
+                    f"Invalid mode {execution_mode!r}: "
+                    "expected 'parallel' or 'compounding'.",
+                    tool_name="ouroboros_execute_seed",
+                )
+            )
+
+    - At the TOP of `execution_handlers.py`, declare the module-level
+      state used by the soft-flip warning and the mode-conflict counter:
+
+        # Q4.1 AC-2 state — module-level so it persists across calls
+        # within a single process but is reset on restart.
+        _SOFT_FLIP_WARNED_THIS_SESSION: bool = False
+        _mode_conflict_counter: dict[str, int] = {}
+
+      The conflict counter is read by AC-4's Run Summary surface and
+      drained on read (`pop(session_id, 0)`).
+
+    - Add a new event factory in `src/ouroboros/orchestrator/events.py`:
+
+        def create_mode_conflict_event(
+            *,
+            session_id: str,
+            caller_mode: str,
+            seed_mode: str,
+            seed_id: str,
+            timestamp: datetime,
+        ) -> BaseEvent:
+            """Emitted when MCP execute_seed caller passes a `mode` arg
+            that disagrees with `seed.metadata.execution_mode_required`.
+            Caller-wins policy applies (see Q4.1 AC-2 design).
+
+            [[INVARIANT: event type is mcp.execute_seed.mode_conflict]]
+            """
+            return BaseEvent(
+                type="mcp.execute_seed.mode_conflict",
+                aggregate_id=f"session/{session_id}",
+                payload={
+                    "caller_mode": caller_mode,
+                    "seed_mode": seed_mode,
+                    "seed_id": seed_id,
+                },
+                timestamp=timestamp,
+            )
+
+      Export it from `events.py.__all__`. Match the existing event
+      factory style in the file.
+
+    TESTS:
+
+    - In `tests/unit/core/test_seed.py` (or wherever SeedMetadata
+      tests live; grep `class.*TestSeedMetadata` to locate):
+
+        24. SeedMetadata constructed without execution_mode_required
+            yields field=None.
+        25. SeedMetadata serialized + deserialized round-trips with
+            execution_mode_required="compounding".
+        26. Old YAML dict (no execution_mode_required key) hydrates
+            via Seed.from_dict() with metadata.execution_mode_required
+            == None.
+        27. SeedMetadata rejects execution_mode_required="invalid"
+            (not in Literal["parallel","compounding","None"]) — Pydantic
+            ValidationError.
+
+    - In `tests/unit/mcp/tools/test_execution_handlers.py` (create if
+      missing — match the existing test file naming pattern):
+
+        28. Caller passes mode="compounding", seed says "compounding"
+            → execution_mode="compounding", no conflict warning, no
+            mode_conflict event emitted.
+        29. Caller passes mode="parallel", seed says "compounding"
+            → execution_mode="parallel" (caller wins), warning logged,
+            mode_conflict event in event_store, _mode_conflict_counter[
+            session_id] == 1.
+        30. Caller passes mode=None (omitted), seed says "compounding"
+            → execution_mode="compounding" (seed wins), no warning,
+            no event.
+        31. Caller passes mode=None, seed says None
+            → execution_mode="compounding" (global default), soft-flip
+            warning logged ONCE per session.
+        32. Two consecutive handler calls in the same session, both
+            with no mode and no seed metadata → soft-flip warning
+            logged exactly once total (not twice).
+        33. Caller passes mode="invalid" → Result.err with the same
+            error shape as before (no breaking change).
+
+    - In `tests/unit/orchestrator/test_events.py`:
+
+        34. create_mode_conflict_event with all 5 fields produces a
+            BaseEvent with type="mcp.execute_seed.mode_conflict" and
+            payload containing caller_mode, seed_mode, seed_id.
+
+    INVARIANTS / GOTCHAS:
+
+    - [[INVARIANT: caller_mode wins on disagreement; the warning +
+      event are pure observability and never alter execution]]
+    - [[INVARIANT: soft-flip warning fires AT MOST ONCE per process —
+      a module-level flag guards the warn site]]
+    - [[INVARIANT: SeedMetadata.execution_mode_required defaults to
+      None; old YAML files hydrate cleanly without the field]]
+    - GOTCHA: the `_SOFT_FLIP_WARNED_THIS_SESSION` flag is a process-
+      scoped global. Concurrent MCP calls in the same process may
+      race; the worst case is the warning prints twice. Document but
+      don't lock — the cost of a mutex would dwarf the benefit.
+    - GOTCHA: the mode_conflict_counter MUST `pop(session_id, 0)` on
+      read so subsequent reads of the same session_id don't double-
+      count. This couples AC-2 with AC-4's Run Summary read site.
+    - GOTCHA: the validation block (`if execution_mode not in
+      {"parallel","compounding"}`) MUST run AFTER the resolution
+      block, not before. Otherwise valid seed-metadata values that
+      were never passed by the caller are rejected as invalid mode.
+
+  - |
+    AC-3 (Q4.1 / part 3) — QA-pending sentinel resume + audit-diff sidecar
+
+    Deliverable: a Ctrl+C (or any process death) during the QA call
+    no longer forces the agent to re-run on resume. Phase-1 checkpoint
+    captures `qa_status="pending"` BEFORE the QA call; phase-2
+    overwrite-in-place lands the terminal status. Resume detects the
+    pending sentinel and replays QA only against the agent's already-
+    committed work. An audit-diff sidecar records every overwritten
+    verdict in unified-diff format, with cumulative replay sections
+    appended on multi-replay scenarios.
+
+    REQUIREMENTS:
+
+    - In `src/ouroboros/orchestrator/level_context.py`, extend
+      `ACPostmortem`:
+
+        a) Update the `qa_status` enum docstring at line 607:
+           "qa_status: str | None = None  # None | 'pending' | 'passed'
+           | 'exhausted' | 'skipped_delegated' | 'skipped_error'"
+
+        b) Add a NEW field after `qa_attempts: int = 0`:
+           "final_message: str | None = None"
+
+        Forward-compat: `_deserialize_postmortem` already uses
+        `d.get(...)` defaults — old chains hydrate `final_message` as
+        None.
+
+    - In `src/ouroboros/orchestrator/serial_executor.py`, modify the
+      per-AC body to write a phase-1 checkpoint BEFORE the QA loop:
+
+        After `_execute_single_ac` succeeds and the postmortem is
+        built (around line 1485-1515, before line 1516's QA gate):
+
+        # AC-3 phase-1: write a "QA-pending" checkpoint so a crash
+        # during the QA loop preserves the agent's already-committed
+        # work. Resume reads this state and replays QA only.
+        if (
+            inline_qa
+            and result.outcome == ACExecutionOutcome.SUCCEEDED
+            and self._checkpoint_store is not None
+        ):
+            pending_postmortem = ACPostmortem(
+                summary=postmortem.summary,
+                diff_summary=postmortem.diff_summary,
+                tool_trace_digest=postmortem.tool_trace_digest,
+                gotchas=postmortem.gotchas,
+                qa_suggestions=postmortem.qa_suggestions,
+                invariants_established=postmortem.invariants_established,
+                retry_attempts=postmortem.retry_attempts,
+                status=postmortem.status,
+                duration_seconds=postmortem.duration_seconds,
+                ac_native_session_id=postmortem.ac_native_session_id,
+                sub_postmortems=postmortem.sub_postmortems,
+                qa_verdict=postmortem.qa_verdict,
+                qa_status="pending",
+                qa_attempts=postmortem.qa_attempts,
+                final_message=result.final_message,
+            )
+            pending_chain = chain.append(pending_postmortem)
+            _write_compounding_checkpoint(
+                store=self._checkpoint_store,
+                seed_id=seed.metadata.seed_id,
+                session_id=session_id,
+                ac_index=ac_index,
+                chain=pending_chain,
+            )
+
+      The existing `_write_compounding_checkpoint` call at line ~1765
+      remains UNCHANGED — it overwrites the phase-1 entry with the
+      terminal-state chain because CheckpointStore.save() keys by
+      seed_id (verified P1 finding B). When `inline_qa` is off, NO
+      phase-1 write happens — the legacy checkpoint flow is byte-
+      identical.
+
+    - In `src/ouroboros/orchestrator/serial_executor.py` (or a new
+      helper module if cleaner), add the resume QA-replay branch
+      INSIDE `execute_serial`, AFTER the chain rehydration call at
+      line ~1124 but BEFORE the main AC loop:
+
+        # AC-3 resume: detect a QA-pending sentinel from a prior crash.
+        if chain.entries:
+            last_pm = chain.entries[-1]
+            if last_pm.qa_status == "pending":
+                last_ac_index = last_completed_ac_index  # the AC the pending postmortem describes
+
+                if not inline_qa:
+                    # User opted out of QA on this resume — respect it.
+                    # Mark the AC terminal without a verdict, log warning.
+                    log.warning(
+                        "serial_executor.resume.qa_replay_skipped",
+                        message=(
+                            "Found qa_status='pending' on resume but "
+                            "--inline-qa is not set. Marking AC terminal "
+                            "without QA verdict."
+                        ),
+                        session_id=session_id,
+                        ac_index=last_ac_index,
+                    )
+                    finalized = _replace_pm_qa_state(last_pm, qa_status=None)
+                    chain = chain.replace_last(finalized)
+                    _write_compounding_checkpoint(
+                        store=self._checkpoint_store,
+                        seed_id=seed.metadata.seed_id,
+                        session_id=session_id,
+                        ac_index=last_ac_index,
+                        chain=chain,
+                    )
+                else:
+                    # Replay QA against the persisted final_message + diff_summary.
+                    inline_qa_outcome = await run_inline_qa(
+                        self._qa_handler,
+                        postmortem=last_pm,
+                        ac_index=last_ac_index,
+                        ac_content=seed.acceptance_criteria[last_ac_index],
+                        seed=seed,
+                        qa_session_id=f"qa-ac{last_ac_index}-{session_id[:8]}",
+                        final_message=last_pm.final_message,
+                        iteration_history=None,
+                    )
+
+                    # AC-3 audit-diff: record original verdict before overwrite.
+                    _append_qa_audit_diff(
+                        chain_artifact_dir=_resolve_chain_artifact_dir(),
+                        session_id=session_id,
+                        ac_index=last_ac_index,
+                        original_verdict=last_pm.qa_verdict,
+                        replay_verdict=inline_qa_outcome.verdict_dict,
+                    )
+
+                    finalized = _finalize_pm_from_qa_outcome(
+                        last_pm, inline_qa_outcome
+                    )
+                    chain = chain.replace_last(finalized)
+                    _write_compounding_checkpoint(
+                        store=self._checkpoint_store,
+                        seed_id=seed.metadata.seed_id,
+                        session_id=session_id,
+                        ac_index=last_ac_index,
+                        chain=chain,
+                    )
+
+                # Either branch: continue with NEXT AC normally.
+                # last_completed_ac_index already covers this AC.
+
+    - Add helper functions in `serial_executor.py`:
+
+        def _replace_pm_qa_state(pm: ACPostmortem, *, qa_status: str | None) -> ACPostmortem:
+            """Return a copy of `pm` with `qa_status` replaced. Frozen-dataclass-safe."""
+            return ACPostmortem(
+                summary=pm.summary, diff_summary=pm.diff_summary,
+                tool_trace_digest=pm.tool_trace_digest, gotchas=pm.gotchas,
+                qa_suggestions=pm.qa_suggestions,
+                invariants_established=pm.invariants_established,
+                retry_attempts=pm.retry_attempts, status=pm.status,
+                duration_seconds=pm.duration_seconds,
+                ac_native_session_id=pm.ac_native_session_id,
+                sub_postmortems=pm.sub_postmortems,
+                qa_verdict=pm.qa_verdict, qa_status=qa_status,
+                qa_attempts=pm.qa_attempts, final_message=pm.final_message,
+            )
+
+        def _finalize_pm_from_qa_outcome(
+            pm: ACPostmortem, outcome: InlineQAOutcome
+        ) -> ACPostmortem:
+            """Apply a fresh QA outcome to a pending postmortem, picking the
+            terminal qa_status from outcome.loop_action."""
+            qa_status = (
+                "passed" if outcome.loop_action == "pass"
+                else "skipped_delegated" if outcome.loop_action == "skipped_delegated"
+                else "skipped_error" if outcome.loop_action == "skipped_error"
+                else "exhausted"  # REVISE/FAIL on a single-shot replay
+            )
+            return ACPostmortem(
+                summary=pm.summary, diff_summary=pm.diff_summary,
+                tool_trace_digest=pm.tool_trace_digest, gotchas=pm.gotchas,
+                qa_suggestions=pm.qa_suggestions,
+                invariants_established=pm.invariants_established,
+                retry_attempts=pm.retry_attempts, status=pm.status,
+                duration_seconds=pm.duration_seconds,
+                ac_native_session_id=pm.ac_native_session_id,
+                sub_postmortems=pm.sub_postmortems,
+                qa_verdict=outcome.verdict_dict,
+                qa_status=qa_status,
+                qa_attempts=pm.qa_attempts + 1,
+                final_message=pm.final_message,
+            )
+
+        def _append_qa_audit_diff(
+            *, chain_artifact_dir: Path, session_id: str, ac_index: int,
+            original_verdict: dict[str, Any] | None,
+            replay_verdict: dict[str, Any] | None,
+        ) -> None:
+            """Append a unified-diff section to the audit sidecar. Best-
+            effort — write failures are logged, never raised."""
+            import difflib, json
+            from datetime import datetime, UTC
+            try:
+                target = (
+                    chain_artifact_dir
+                    / f"chain-{session_id}-ac{ac_index}-qa.original.diff"
+                )
+                target.parent.mkdir(parents=True, exist_ok=True)
+
+                # Determine replay number: count existing "### Replay N" headers.
+                existing = target.read_text() if target.exists() else ""
+                replay_n = existing.count("### Replay ") + 1
+                ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
+
+                lhs = json.dumps(original_verdict or {}, indent=2, sort_keys=True).splitlines(keepends=True)
+                rhs = json.dumps(replay_verdict or {}, indent=2, sort_keys=True).splitlines(keepends=True)
+                fromfile = "original" if replay_n == 1 else f"original (post-replay-{replay_n - 1})"
+                diff_lines = list(difflib.unified_diff(
+                    lhs, rhs, fromfile=fromfile, tofile="replay", n=3,
+                ))
+
+                section = (
+                    f"\n### Replay {replay_n} ({ts})\n"
+                    + "".join(diff_lines)
+                    + "\n"
+                )
+                with target.open("a") as f:
+                    f.write(section)
+            except Exception as exc:
+                log.warning(
+                    "serial_executor.qa_audit_diff.write_failed",
+                    session_id=session_id, ac_index=ac_index,
+                    error=str(exc),
+                )
+
+    - During the NORMAL (non-resume) per-AC flow inside the QA loop,
+      ALSO populate `final_message` on the postmortem. Update the
+      postmortem-rebuild sites (lines ~1554, ~1600, ~1623, ~1648) to
+      include `final_message=result.final_message` so it lands in the
+      checkpoint chain.
+
+    TESTS:
+
+    - In `tests/unit/orchestrator/test_level_context.py`:
+
+        35. ACPostmortem default construction yields final_message=None.
+        36. ACPostmortem with final_message="hello" round-trips through
+            serialize → deserialize.
+        37. Old chain dict (without final_message key) hydrates with
+            final_message=None.
+        38. qa_status="pending" round-trips through serialize → deserialize.
+
+    - In `tests/unit/orchestrator/test_serial_executor.py`:
+
+        39. Phase-1 checkpoint write fires when inline_qa=True and
+            result.outcome=SUCCEEDED — checkpoint chain's last entry
+            has qa_status="pending", final_message populated.
+        40. Phase-1 checkpoint write does NOT fire when inline_qa=False
+            — checkpoint flow is byte-identical to pre-Q4.1.
+        41. Phase-2 overwrite: after the QA loop completes, the
+            checkpoint at the same seed_id has qa_status="passed"
+            (or terminal value) and the chain's last entry replaces
+            the pending one (CheckpointStore.save overwrites).
+        42. Resume with chain[-1].qa_status="pending", inline_qa=True
+            triggers the QA-replay branch — agent is NOT re-invoked,
+            run_inline_qa IS called once with final_message from the
+            persisted postmortem, terminal qa_status is written.
+        43. Resume with chain[-1].qa_status="pending", inline_qa=False
+            marks the AC terminal with qa_status=None and logs the
+            replay-skipped warning. Agent NOT invoked.
+        44. Resume with chain[-1].qa_status="passed" (terminal) does
+            NOT trigger the replay branch — normal resume continues
+            with the next AC.
+
+    - In a NEW `tests/unit/orchestrator/test_qa_audit_diff.py`:
+
+        45. _append_qa_audit_diff with no existing file creates one
+            with a "### Replay 1" section in unified-diff format.
+        46. _append_qa_audit_diff called twice on the same path
+            appends "### Replay 2" below the first section; both
+            sections present in the final file.
+        47. _append_qa_audit_diff with original_verdict=None renders
+            "{}" as the lhs (sorted JSON empty dict).
+        48. _append_qa_audit_diff with a write failure logs a warning
+            but does NOT raise (use a fake path / read-only dir).
+        49. The diff format passes a basic round-trip: feeding the
+            output through `patch -p0` (or equivalent) reconstructs
+            the replay verdict from the original.
+
+    - In `tests/unit/orchestrator/test_serial_executor.py` (integration):
+
+        50. End-to-end: simulate a 2-AC compounding run, force a
+            crash between phase-1 write and phase-2 write on AC-2
+            (use a mocked QAHandler that raises asyncio.CancelledError
+            on first call), resume the session, QA replays once, AC-2
+            reaches terminal qa_status, run completes successfully.
+            Audit-diff file at chain-<session>-ac1-qa.original.diff
+            exists with one "### Replay 1" section.
+        51. Idempotent re-replay: same scenario as test 50, but force
+            the FIRST replay to also crash. Resume again, QA replays
+            successfully on the second attempt. Audit-diff file has
+            TWO sections, one per replay.
+
+    INVARIANTS / GOTCHAS:
+
+    - [[INVARIANT: phase-1 checkpoint write fires only when inline_qa
+      is True AND result.outcome == SUCCEEDED. inline_qa-off runs are
+      byte-identical to pre-Q4.1]]
+    - [[INVARIANT: CheckpointStore.save() keys by seed_id and overwrites
+      in place — phase-2's checkpoint write at line ~1765 transparently
+      supersedes phase-1's pending sentinel]]
+    - [[INVARIANT: QA replay on resume does NOT re-execute the agent;
+      it calls run_inline_qa against the persisted final_message +
+      diff_summary]]
+    - [[INVARIANT: audit-diff sidecar appends cumulative "### Replay N"
+      sections; multi-replay history is preserved, not overwritten]]
+    - [[INVARIANT: audit-diff write failures NEVER raise into the
+      executor — they degrade to a logged warning]]
+    - GOTCHA: `chain.replace_last()` may not exist as a method today.
+      Implement it as a simple helper in PostmortemChain that returns
+      a new chain with the last entry replaced (frozen dataclass
+      semantics). If preferred, build the new chain via the existing
+      append after stripping the last entry.
+    - GOTCHA: when `inline_qa` is off and we encounter pending state
+      on resume, mark `qa_status=None` (NOT "skipped_error" or
+      "skipped_delegated") — the AC is fully complete, just without
+      a verdict. The chain renderer's QA suffix is omitted naturally.
+    - GOTCHA: the chain artifact dir resolver must respect the
+      `OUROBOROS_CHAIN_ARTIFACT_DIR` env var; the autouse pytest
+      fixture in tests/conftest.py already redirects this for tests.
+    - GOTCHA: do NOT add a new event type for the QA-replay outcome.
+      The existing `create_ac_qa_evaluated_event` fires from
+      run_inline_qa; the audit-diff sidecar IS the replay-vs-original
+      audit trail (per the interview decision).
+
+  - |
+    AC-4 (Q4.1 / part 4) — Deferred CodeRabbit items + Run Summary observability
+
+    Deliverable: ship the four PR-#6-deferred CodeRabbit items, extend
+    `completion_summary` with cost / QA / invariant / mode-conflict
+    counters, and print a "Run Summary" Rich panel below the existing
+    completion panel. Always-show-5-row format for grep/parse stability.
+
+    REQUIREMENTS — DEFERRED ITEMS (1-4):
+
+    - Item 1 (run.py: get_parameter_source for --max-qa-retries):
+      In `src/ouroboros/cli/commands/run.py`, locate the warning at
+      ~line 889-893 that fires when `max_qa_retries != 1 and not inline_qa`.
+      Wrap it so the warning fires ONLY when `--max-qa-retries` was
+      passed explicitly on the command line (not when 1 is the default):
+
+        from click.core import ParameterSource
+
+        if (
+            ctx.get_parameter_source("max_qa_retries") == ParameterSource.COMMANDLINE
+            and max_qa_retries != 1
+            and not inline_qa
+        ):
+            log.warning(
+                "run.max_qa_retries.ignored_without_inline_qa",
+                ...
+            )
+
+      Typer exposes the click context as the first parameter when
+      annotated with `ctx: typer.Context`. Add it to the function
+      signature if not already present.
+
+    - Item 2 (runner.py: always-forward max_qa_retries):
+      In `src/ouroboros/orchestrator/runner.py` at line ~1810, the
+      assignment `parallel_kwargs["max_qa_retries"] = max_qa_retries`
+      sits inside an `if inline_qa:` block. De-indent it so the kwarg
+      is forwarded UNCONDITIONALLY:
+
+        # BEFORE:
+        if inline_qa:
+            parallel_kwargs["inline_qa"] = inline_qa
+            parallel_kwargs["max_qa_retries"] = max_qa_retries
+
+        # AFTER:
+        if inline_qa:
+            parallel_kwargs["inline_qa"] = inline_qa
+        parallel_kwargs["max_qa_retries"] = max_qa_retries
+
+      The two flags are independent — max_qa_retries should always
+      propagate through.
+
+    - Item 3 (suggestions outside fence):
+      In `src/ouroboros/orchestrator/serial_executor.py` at lines
+      ~400-404, the chain-render path wraps QA suggestions inside a
+      fenced code block, preventing Markdown bullet rendering.
+      Restructure to render bullets OUTSIDE the fence:
+
+        # BEFORE (rendering bug):
+        out.append("```text")
+        for sug in suggestions:
+            out.append(f"- {sug}")
+        out.append("```")
+
+        # AFTER:
+        for sug in suggestions:
+            out.append(f"- {sug}")
+
+      Verify the surrounding fence-collision logic (dynamic backtick
+      run) added in PR #5 still applies to OTHER fence sites, not this
+      one.
+
+    - Item 4 (run_inline_qa serialization unify):
+      In `src/ouroboros/orchestrator/inline_qa.py`, `run_inline_qa`
+      currently reads `MCPToolResult.meta` directly as a dict (~line
+      165). Unify the path through `_serialize_qa_verdict`:
+
+        APPROACH 4a (preferred — round-trip via serializer):
+            Reconstruct a QAVerdict from meta keys, then serialize.
+
+            from ouroboros.mcp.tools.qa import QAVerdict
+            verdict = QAVerdict(
+                score=float(meta.get("score", 0.0)),
+                verdict=str(meta.get("verdict", "")),
+                dimensions=dict(meta.get("dimensions", {})),
+                differences=list(meta.get("differences", [])),
+                suggestions=list(meta.get("suggestions", [])),
+                reasoning=str(meta.get("reasoning", "")),
+            )
+            verdict_dict = _serialize_qa_verdict(verdict)
+
+        APPROACH 4b (fallback — meta normalizer):
+            If QAVerdict's schema cannot absorb meta keys cleanly
+            (e.g., extra="forbid" or required fields missing), add a
+            new helper:
+
+            def _normalize_qa_meta(meta: dict[str, Any]) -> dict[str, Any]:
+                """Normalize meta dict into the same shape
+                _serialize_qa_verdict produces, without instantiating
+                a QAVerdict."""
+                return {
+                    "score": float(meta.get("score", 0.0)),
+                    "verdict": str(meta.get("verdict", "")),
+                    "dimensions": dict(meta.get("dimensions", {})),
+                    "differences": list(meta.get("differences", [])),
+                    "suggestions": list(meta.get("suggestions", [])),
+                    "reasoning": str(meta.get("reasoning", "")),
+                }
+
+      The implementer chooses 4a if it works; falls back to 4b
+      otherwise. Either way, `run_inline_qa` returns a verdict_dict
+      with the same shape `_serialize_qa_verdict` produces — single
+      source of truth at the call-site interface.
+
+    REQUIREMENTS — RUN SUMMARY OBSERVABILITY:
+
+    - In `src/ouroboros/orchestrator/runner.py` (around line 2091-
+      2114, the success completion site), aggregate end-of-run stats
+      from the chain and the existing `progress_data`. Add the
+      following BEFORE the existing `completion_summary` dict
+      construction:
+
+        # AC-4: aggregate end-of-run stats for completion_summary + Run Summary panel.
+        from ouroboros.mcp.tools.execution_handlers import _mode_conflict_counter
+        from ouroboros.orchestrator.level_context import _get_min_reliability
+
+        chain_entries = chain.entries if chain else []
+        ac_count = len(chain_entries)
+        cost_usd = float(progress_data.get("estimated_cost_usd", 0.0)) if progress_data else 0.0
+        qa_calls = sum(pm.qa_attempts for pm in chain_entries)
+        qa_verdicts = {
+            "passed": sum(1 for pm in chain_entries if pm.qa_status == "passed"),
+            "exhausted": sum(1 for pm in chain_entries if pm.qa_status == "exhausted"),
+            "skipped_error": sum(1 for pm in chain_entries if pm.qa_status == "skipped_error"),
+            "skipped_delegated": sum(1 for pm in chain_entries if pm.qa_status == "skipped_delegated"),
+        }
+        invariants_above_threshold = sum(
+            1 for pm in chain_entries
+            for inv in pm.invariants_established
+            if not inv.is_contradicted and inv.reliability >= _get_min_reliability()
+        )
+        mode_conflicts = _mode_conflict_counter.pop(tracker.session_id, 0)
+
+    - Extend the `completion_summary` dict with the 5 new keys:
+
+        completion_summary = {
+            "final_message": final_message[:500],
+            "messages_processed": messages_processed,
+            "cost_usd": cost_usd,
+            "qa_calls": qa_calls,
+            "qa_verdicts": qa_verdicts,
+            "invariants_above_threshold": invariants_above_threshold,
+            "mode_conflicts": mode_conflicts,
+            **self._task_summary(),
+        }
+
+    - After the EXISTING completion panel print at line ~2108-2114,
+      add the Run Summary panel (always-show-5-row, conditional on
+      mode/inline_qa or any non-zero stat):
+
+        # AC-4: Run Summary panel — always shows all 5 rows when visible.
+        is_compounding_mode = (mode == "compounding")  # however mode is plumbed
+        panel_visible = (
+            is_compounding_mode
+            or inline_qa
+            or any([
+                cost_usd > 0,
+                qa_calls > 0,
+                mode_conflicts > 0,
+                invariants_above_threshold > 0,
+            ])
+        )
+        if panel_visible:
+            summary_lines = [
+                f"Cost:                ${cost_usd:.2f} ({ac_count} ACs)",
+                f"QA calls:            {qa_calls} across {ac_count} ACs",
+                (
+                    f"QA verdicts:         "
+                    f"{qa_verdicts['passed']} passed, "
+                    f"{qa_verdicts['exhausted']} exhausted, "
+                    f"{qa_verdicts['skipped_error']} errors"
+                ),
+                f"Invariants captured: {invariants_above_threshold} above threshold {_get_min_reliability()}",
+                f"Mode conflicts:      {mode_conflicts}",
+            ]
+            self._console.print(
+                Panel(
+                    Text("\n".join(summary_lines), style="cyan"),
+                    title="[cyan]Run Summary[/cyan]",
+                    border_style="cyan",
+                )
+            )
+
+    TESTS:
+
+    - In `tests/unit/cli/test_run_compounding.py` (item 1):
+
+        52. --max-qa-retries=1 (default) with --no-inline-qa: warning
+            does NOT fire (parameter source is DEFAULT, not COMMANDLINE).
+        53. --max-qa-retries=2 explicitly without --inline-qa: warning
+            DOES fire.
+        54. --max-qa-retries=2 with --inline-qa: no warning (gate is
+            !inline_qa).
+
+    - In `tests/unit/orchestrator/test_runner.py` (item 2):
+
+        55. parallel_kwargs["max_qa_retries"] is forwarded when
+            inline_qa=False (today it isn't).
+        56. parallel_kwargs["max_qa_retries"] is forwarded when
+            inline_qa=True (already works; regression guard).
+
+    - In `tests/unit/orchestrator/test_serial_executor.py` (item 3):
+
+        57. Chain markdown render with non-empty qa_suggestions
+            renders bullets as real Markdown ("- foo\n- bar")
+            OUTSIDE any fenced block — verify by structural assertion
+            on the rendered string.
+
+    - In `tests/unit/orchestrator/test_inline_qa.py` (item 4):
+
+        58. run_inline_qa called against a meta dict with full shape
+            returns a verdict_dict that equals _serialize_qa_verdict's
+            output for the equivalent QAVerdict (4a path).
+        59. run_inline_qa with a meta dict missing optional keys
+            still returns a verdict_dict with all canonical keys
+            (filled with safe defaults from 4a or 4b).
+
+    - In `tests/unit/orchestrator/test_runner.py` (Run Summary):
+
+        60. completion_summary contains all 5 new keys (cost_usd,
+            qa_calls, qa_verdicts, invariants_above_threshold,
+            mode_conflicts).
+        61. Run Summary panel renders when mode="compounding" even
+            with all stats at zero — always-show-5-row format with
+            explicit zero values.
+        62. Run Summary panel does NOT render when mode="parallel"
+            and inline_qa=False and all stats are zero.
+        63. mode_conflicts in completion_summary equals the value
+            popped from _mode_conflict_counter; subsequent reads of
+            the same session_id return 0 (counter was drained).
+        64. completion_summary is written to the session repo via
+            _session_repo.mark_completed (the existing call at line
+            ~2102 — verify the new fields land in the persisted record).
+
+    INVARIANTS / GOTCHAS:
+
+    - [[INVARIANT: AC-4 changes to the completion-panel rendering are
+      additive: the existing green Panel(final_message) prints as
+      before; the Run Summary panel prints BELOW it when applicable]]
+    - [[INVARIANT: Run Summary panel always shows all 5 rows when
+      visible — zero values are explicit, never elided]]
+    - [[INVARIANT: mode_conflicts is read via _mode_conflict_counter.pop()
+      — the counter is drained on read so subsequent reads return 0]]
+    - [[INVARIANT: items 1-4 are independently testable; each lands
+      with its own pytest assertion before the next is started]]
+    - GOTCHA: `_get_min_reliability` lives in level_context.py; the
+      import at the top of runner.py may need adjustment.
+    - GOTCHA: `_mode_conflict_counter` is imported from execution_handlers.py.
+      If that creates a circular import, refactor to a shared
+      `_q41_state.py` module that both can import.
+    - GOTCHA: `progress_data` may be None if the run was cancelled
+      before any progress was reported. Default to 0.0 cost in that
+      case (already covered in the snippet).
+    - GOTCHA: `chain.entries` is the canonical attribute (not
+      `chain.postmortems`); verify the actual attribute name in
+      PostmortemChain before committing.
+    - GOTCHA: rich.Panel border_style uses lowercase color names
+      ("cyan"). Don't pass "[cyan]" markup as the border_style value
+      — only the title accepts markup.
+
+ontology_schema:
+  name: "Q41HardeningCycle"
+  description: "Workflow for landing the four Q4.1 hardening ACs (parent-only QA docs, MCP execution_mode_required honoring, QA-pending sentinel resume + audit-diff, deferred CodeRabbit + Run Summary observability) into Ouroboros's serial-compounding executor without regressing any Phase-1.5 / Q2 / Q3 / Q4 invariants."
+  fields:
+    - name: "ACPostmortem.qa_status"
+      field_type: "field"
+      description: "level_context.py:607 — extended enum value 'pending' added; rest unchanged"
+    - name: "ACPostmortem.final_message"
+      field_type: "field"
+      description: "level_context.py — NEW field, str | None default None; populated from result.final_message during normal flow and on phase-1 checkpoint write"
+    - name: "SeedMetadata.execution_mode_required"
+      field_type: "field"
+      description: "core/seed.py:136 — NEW field, Literal['parallel','compounding'] | None default None"
+    - name: "_write_compounding_checkpoint"
+      field_type: "service"
+      description: "serial_executor.py:466 — UNCHANGED API; called twice per AC under inline_qa (phase-1 pending, phase-2 terminal); CheckpointStore.save() overwrites by seed_id"
+    - name: "run_inline_qa"
+      field_type: "service"
+      description: "inline_qa.py:214 — UNCHANGED API; called by both the normal QA loop and the AC-3 resume QA-replay branch"
+    - name: "_mode_conflict_counter"
+      field_type: "state"
+      description: "execution_handlers.py — NEW module-level dict[str, int]; incremented at AC-2 conflict-warning site, drained by AC-4 at end-of-run"
+    - name: "_SOFT_FLIP_WARNED_THIS_SESSION"
+      field_type: "state"
+      description: "execution_handlers.py — NEW module-level bool; guards the soft-flip deprecation warning so it fires at most once per process"
+    - name: "create_mode_conflict_event"
+      field_type: "service"
+      description: "events.py — NEW factory; emits 'mcp.execute_seed.mode_conflict' event with session_id, caller_mode, seed_mode, seed_id, timestamp payload"
+    - name: "_append_qa_audit_diff"
+      field_type: "service"
+      description: "serial_executor.py — NEW helper; appends unified-diff sections to chain-<session>-ac<N>-qa.original.diff in OUROBOROS_CHAIN_ARTIFACT_DIR; multi-replay accumulates"
+    - name: "_replace_pm_qa_state / _finalize_pm_from_qa_outcome"
+      field_type: "service"
+      description: "serial_executor.py — NEW helpers for frozen-dataclass postmortem rebuild during resume QA-replay branch"
+    - name: "Run Summary panel"
+      field_type: "ui"
+      description: "runner.py:~2114 — NEW Rich panel printed below the existing completion panel; always-show-5-row format; visible when compounding/inline_qa OR any non-zero stat"
+    - name: "completion_summary"
+      field_type: "data"
+      description: "runner.py:2091 — extended with cost_usd, qa_calls, qa_verdicts, invariants_above_threshold, mode_conflicts; persisted via session_repo.mark_completed"
+    - name: "--inline-qa, --max-qa-retries"
+      field_type: "flag"
+      description: "cli/commands/run.py — UNCHANGED flags; AC-4 item 1 fixes the warning gate to only fire on explicit override; AC-4 item 2 fixes the unconditional forward through runner"
+
+evaluation_principles:
+  - name: "backward_compatibility"
+    description: "Parallel mode behavior remains byte-identical. Non-compounding non-inline-QA runs see the existing single completion panel. Old serialized chains hydrate cleanly under the new ACPostmortem schema. Old seed YAMLs (without execution_mode_required) hydrate as None and fall through to the global default."
+  - name: "crash_resilience"
+    description: "QA-pending sentinel + phase-1/phase-2 checkpoint mean a Ctrl+C during the QA call no longer forces an agent re-run on resume. The agent's already-committed work is preserved; only QA replays. Idempotent: multiple consecutive crashes still converge to a terminal state."
+  - name: "audit_trail_preservation"
+    description: "Every overwritten QA verdict is captured in the audit-diff sidecar. Multi-replay history accumulates as cumulative '### Replay N' sections. The live event stream uses supersede semantics (last verdict wins); the sidecar is the out-of-band audit record."
+  - name: "soft_pass_safety"
+    description: "Inherited from Q4 cycle-1: QA exhaustion never blocks the run. AC-3's resume-without-inline-qa edge case also soft-passes (qa_status=None, AC marked terminal without verdict)."
+  - name: "user_experience"
+    description: "End-of-run Run Summary panel surfaces cost, QA stats, invariants, and mode conflicts in one place. Always-show-5-row format makes the output grep/parse-friendly. Soft-flip deprecation warning + mode-conflict warning + replay-skipped warning are user-facing, not buried in DEBUG logs."
+  - name: "graceful_degradation"
+    description: "Audit-diff sidecar write failures degrade to a logged warning. Phase-1 checkpoint store unavailability degrades to status-quo (agent re-runs on resume). Mode_conflict event emit failures don't block the handler. AC-3 helpers (_replace_pm_qa_state, _finalize_pm_from_qa_outcome, _append_qa_audit_diff) are pure / idempotent — safe to call multiple times."
+  - name: "test_coverage"
+    description: "AC-1 adds 0 new tests (renames + adds docstring to existing). AC-2 adds ~11 unit tests. AC-3 adds ~17 unit + integration tests including 2 e2e crash-resume scenarios. AC-4 adds ~13 unit tests. Full suite stays green; expected ~5740 tests passing post-cycle (~5699 + ~41 new)."
+  - name: "no_premature_optimization"
+    description: "Module-level state for soft-flip and mode-conflict counters uses simple Python dicts/bools — no thread synchronization. Documented as benign-race acceptable. The audit-diff file uses simple file-append, no locking. These choices match the existing codebase's pragmatism."
+  - name: "design_traceability"
+    description: "Every architectural decision in this cycle traces back to a locked decision in docs/brainstorm/phase-2-q4.1-hardening-design.md. The design doc itself encodes P0/P1/interview findings. AC-1's docstring cites the design doc; AC-3's audit-diff design is sourced from the interview-derived deltas section."
+  - name: "invariant_emission"
+    description: "Each AC's final message emits at least one [[INVARIANT: ...]] tag so Q3's verifier can score the work on real output. Existing invariants from prior cycles are NOT regressed."
+
+exit_conditions:
+  - name: "all_four_acs_landed"
+    description: "AC-1, AC-2, AC-3, AC-4 each produce one git commit with the conventional-commit prefix `feat(compounding): Q4.1 — ...` and `[[INVARIANT: ...]]` tags in the final message"
+    evaluation_criteria: "git log shows 4 Q4.1 commits in order; each AC's tests pass; full test suite stays green between commits"
+  - name: "no_regressions"
+    description: "All Phase-1.5, Q2, Q3, Q4 invariants hold post-cycle"
+    evaluation_criteria: "Existing 5699-test suite passes after each commit; no test renamed away from its current name except the AC-1 rename; chain artifact still renders diff_summary; resume still works for non-Q4.1 chains"
+  - name: "design_doc_referenced"
+    description: "AC-1's docstring at serial_executor.py:~1516 cites docs/brainstorm/phase-2-q4.1-hardening-design.md as the design source"
+    evaluation_criteria: "rg finds the path reference in the codebase post-AC-1"
+  - name: "audit_diff_format_verified"
+    description: "AC-3's audit-diff sidecar produces unified-diff format that round-trips through `patch` (or equivalent) — the diff is structurally valid, not just visually plausible"
+    evaluation_criteria: "test 49 passes (basic round-trip via difflib + patch semantics)"
+  - name: "run_summary_panel_dogfood"
+    description: "AC-4's Run Summary panel renders during the dogfood run itself with non-zero cost and qa_calls (since the run is --inline-qa)"
+    evaluation_criteria: "Manual inspection of dogfood-run console output shows a cyan Run Summary panel with all 5 rows"
+
+metadata:
+  seed_id: "phase-2-q4.1-hardening"
+  parent_seed: null
+  ambiguity_score: 0.10
+  expected_decomposition_depth: 0
+  source_brainstorm: "docs/brainstorm/phase-2-q4.1-hardening-design.md"
+  execution_mode_required: "compounding"

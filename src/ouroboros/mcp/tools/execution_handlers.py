@@ -62,6 +62,7 @@ from ouroboros.orchestrator.adapter import (
     DELEGATED_PARENT_TRANSCRIPT_PATH_ARG,
     RuntimeHandle,
 )
+from ouroboros.orchestrator.events import create_mode_conflict_event
 from ouroboros.orchestrator.runner import OrchestratorRunner
 from ouroboros.orchestrator.session import SessionRepository, SessionStatus
 from ouroboros.persistence.checkpoint import CheckpointStore
@@ -69,6 +70,30 @@ from ouroboros.persistence.event_store import EventStore
 from ouroboros.providers.base import LLMAdapter
 
 log = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Module-level state for Q4.1 / AC-2 mode resolution
+# ---------------------------------------------------------------------------
+# These are intentionally simple module-level singletons (no thread sync) per
+# the design doc — the worst-case race is a duplicate one-line warning, not a
+# correctness issue.  See `docs/brainstorm/phase-2-q4.1-hardening-design.md`,
+# "Risk register" — entry on `_SOFT_FLIP_WARNED_THIS_SESSION` racy under
+# concurrent MCP calls.
+#
+# Q4.1 / AC-4 sub-AC 5: the canonical home moved to
+# :mod:`ouroboros.orchestrator._q41_state` so :mod:`ouroboros.orchestrator.runner`
+# can read ``_mode_conflict_counter`` at end-of-run without re-importing this
+# module (which would re-introduce the runner ↔ handler import cycle).  The
+# write sites below mutate ``_q41_state`` directly; the alias on this module is
+# kept by-reference (for the dict) and via a property-style getattr forward
+# (for the bool) so existing tests and other callers that introspect names on
+# this module continue to observe the canonical state.
+from ouroboros.orchestrator import _q41_state
+
+# Mutable dict aliased by reference — both modules see the same instance, so
+# ``.clear()`` / ``[k] = v`` from either side is visible from the other.
+_mode_conflict_counter: dict[str, int] = _q41_state._mode_conflict_counter
 
 
 # ---------------------------------------------------------------------------
@@ -190,16 +215,21 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     name="mode",
                     type=ToolInputType.STRING,
                     description=(
-                        "Execution mode: 'parallel' (default) runs independent "
-                        "ACs concurrently within each dependency level; "
-                        "'compounding' runs ACs strictly one at a time, "
-                        "carrying a rolling postmortem (files changed, "
-                        "invariants, gotchas) from each AC into the next. "
-                        "Compounding mode also pins CLAUDE.md into the "
-                        "system prompt."
+                        "Execution mode. 'compounding' (Q4.1 default) runs "
+                        "ACs strictly one at a time, carrying a rolling "
+                        "postmortem (files changed, invariants, gotchas) "
+                        "from each AC into the next, and pins CLAUDE.md into "
+                        "the system prompt. 'parallel' runs independent ACs "
+                        "concurrently within each dependency level. When "
+                        "omitted, 'compounding' is selected unless the seed "
+                        "sets metadata.execution_mode_required (which the "
+                        "handler honors). When the caller passes mode AND "
+                        "the seed declares a different one, the caller wins "
+                        "but the disagreement is logged + emitted as a "
+                        "mcp.execute_seed.mode_conflict event."
                     ),
                     required=False,
-                    default="parallel",
+                    default="compounding",
                     enum=("parallel", "compounding"),
                 ),
             ),
@@ -283,14 +313,6 @@ class ExecuteSeedHandler(BridgeAwareMixin):
         session_id = session_id or session_id_override
         model_tier = arguments.get("model_tier", "medium")
         max_iterations = arguments.get("max_iterations", 10)
-        execution_mode = arguments.get("mode", "parallel")
-        if execution_mode not in {"parallel", "compounding"}:
-            return Result.err(
-                MCPToolError(
-                    f"Invalid mode {execution_mode!r}: expected 'parallel' or 'compounding'.",
-                    tool_name="ouroboros_execute_seed",
-                )
-            )
         if not is_resume and session_id is None:
             session_id = f"orch_{uuid4().hex[:12]}"
 
@@ -312,36 +334,38 @@ class ExecuteSeedHandler(BridgeAwareMixin):
             cwd=str(resolved_cwd),
         )
 
-        # --- Subagent dispatch: gate on runtime + opencode_mode ---
-        payload = build_execute_subagent(
-            seed_content=seed_content,
-            session_id=session_id,
-            seed_path=arguments.get("seed_path"),
-            cwd=str(resolved_cwd),
-            max_iterations=max_iterations,
-            skip_qa=arguments.get("skip_qa", False),
-            model_tier=model_tier,
-        )
-        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
-            await emit_subagent_dispatched_event(
-                self.event_store,
-                session_id=session_id,
-                payload=payload,
-            )
-            # Preserve public response shape (#442): consumers expect
-            # session_id / status keys even in plugin-dispatch mode.
-            return build_subagent_result(
-                payload,
-                response_shape={
-                    "session_id": session_id,
-                    "status": "delegated_to_subagent",
-                    "dispatch_mode": "plugin",
-                    "runtime_backend": self.agent_runtime_backend,
-                    "model_tier": model_tier,
-                },
-            )
-
-        # Fall-through: real in-process execution (subprocess / non-opencode runtimes).
+        # ---------------------------------------------------------------
+        # Q4.1 / AC-2 — seed parse + caller-wins-and-warn mode resolution
+        # ---------------------------------------------------------------
+        # Seed parsing and mode resolution run *before* the plugin-dispatch
+        # check below so both branches (in-process AND delegated) honor the
+        # mode contract: the caller-vs-seed conflict warning,
+        # ``mcp.execute_seed.mode_conflict`` event, and session-scoped
+        # counter fire uniformly.  Without this ordering the
+        # ``should_dispatch_via_plugin`` early-return would silently bypass
+        # AC-2 on delegated runs.
+        #
+        # Mode-resolution priority:
+        #   1. ``arguments["mode"]``                       (caller — wins)
+        #   2. ``seed.metadata.execution_mode_required``   (seed preference)
+        #   3. ``"compounding"``                           (Q4.1 default)
+        #
+        # When the caller specifies a mode AND the seed declares a different
+        # one, the caller wins but the disagreement is surfaced via warning
+        # + event + counter (drained by AC-4's Run Summary).  When neither
+        # side specifies a mode, ``"compounding"`` applies and a one-time
+        # per-session deprecation warning fires — external MCP callers have
+        # a release cycle to set ``mode`` or
+        # ``metadata.execution_mode_required`` explicitly.
+        #
+        # Invalid-mode validation runs after resolution so the rejection
+        # message reflects the actually-resolved value, not the raw
+        # caller argument (which may be ``None``).
+        #
+        # Soft-flip flag and conflict counter live on
+        # :mod:`ouroboros.orchestrator._q41_state` (AC-4 sub-AC 5) so the
+        # runner can read the counter at end-of-run without re-importing
+        # this module.  Mutate via the canonical module reference.
 
         # Parse seed_content YAML into Seed object
         try:
@@ -364,6 +388,118 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                 )
             )
 
+        caller_mode = arguments.get("mode")  # None when caller omitted
+        seed_mode = seed.metadata.execution_mode_required  # None when seed silent
+        # Local stash — emitted once an event store is alive (in-process
+        # path: after ``event_store.initialize()`` below; plugin path: via
+        # ``self.event_store`` immediately before the dispatch event).
+        pending_mode_conflict_event = None
+
+        if caller_mode is not None:
+            execution_mode = caller_mode
+            if seed_mode is not None and caller_mode != seed_mode:
+                log.warning(
+                    "mcp.execute_seed.mode_conflict",
+                    caller_mode=caller_mode,
+                    seed_mode=seed_mode,
+                    seed_id=seed.metadata.seed_id,
+                    session_id=session_id,
+                    message=(
+                        f"Caller passed mode={caller_mode!r} but seed "
+                        f"{seed.metadata.seed_id} declares "
+                        f"execution_mode_required={seed_mode!r} — "
+                        "caller wins; conflict recorded."
+                    ),
+                )
+                # Build the structured event now so the conflict snapshot
+                # captures the resolution-time values; emit it once the
+                # event store is alive.  Best-effort: emit failure degrades
+                # to the warning + counter only and never blocks the call.
+                pending_mode_conflict_event = create_mode_conflict_event(
+                    session_id=session_id or "",
+                    caller_mode=caller_mode,
+                    seed_mode=seed_mode,
+                    seed_id=seed.metadata.seed_id,
+                )
+                # Session-scoped counter for AC-4's Run Summary panel.
+                if session_id:
+                    _q41_state._mode_conflict_counter[session_id] = (
+                        _q41_state._mode_conflict_counter.get(session_id, 0) + 1
+                    )
+        elif seed_mode is not None:
+            execution_mode = seed_mode
+        else:
+            execution_mode = "compounding"  # Q4.1 soft-flipped default
+            if not _q41_state._SOFT_FLIP_WARNED_THIS_SESSION:
+                log.warning(
+                    "mcp.execute_seed.default_flipped",
+                    session_id=session_id,
+                    seed_id=seed.metadata.seed_id,
+                    message=(
+                        "No execution mode specified — defaulting to "
+                        "'compounding' (was 'parallel' before Q4.1). "
+                        "Pass mode='parallel' or set "
+                        "metadata.execution_mode_required='parallel' to "
+                        "silence this warning."
+                    ),
+                )
+                _q41_state._SOFT_FLIP_WARNED_THIS_SESSION = True
+
+        if execution_mode not in {"parallel", "compounding"}:
+            return Result.err(
+                MCPToolError(
+                    f"Invalid mode {execution_mode!r}: expected 'parallel' or 'compounding'.",
+                    tool_name="ouroboros_execute_seed",
+                )
+            )
+
+        # --- Subagent dispatch: gate on runtime + opencode_mode ---
+        payload = build_execute_subagent(
+            seed_content=seed_content,
+            session_id=session_id,
+            seed_path=arguments.get("seed_path"),
+            cwd=str(resolved_cwd),
+            max_iterations=max_iterations,
+            skip_qa=arguments.get("skip_qa", False),
+            model_tier=model_tier,
+        )
+        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
+            # Q4.1 / AC-2 — flush the deferred mode-conflict event on the
+            # plugin-dispatch path too, so the audit trail is identical to
+            # the in-process branch.  Best-effort: a write failure must not
+            # block the dispatch (warning + counter are already recorded).
+            if (
+                pending_mode_conflict_event is not None
+                and self.event_store is not None
+            ):
+                try:
+                    await self.event_store.append(pending_mode_conflict_event)
+                except Exception:
+                    log.exception(
+                        "mcp.execute_seed.mode_conflict_event_emit_failed",
+                        session_id=session_id,
+                    )
+            await emit_subagent_dispatched_event(
+                self.event_store,
+                session_id=session_id,
+                payload=payload,
+            )
+            # Preserve public response shape (#442): consumers expect
+            # session_id / status keys even in plugin-dispatch mode.
+            return build_subagent_result(
+                payload,
+                response_shape={
+                    "session_id": session_id,
+                    "status": "delegated_to_subagent",
+                    "dispatch_mode": "plugin",
+                    "runtime_backend": self.agent_runtime_backend,
+                    "model_tier": model_tier,
+                    "mode": execution_mode,
+                },
+            )
+
+        # Fall-through: real in-process execution (subprocess / non-opencode runtimes).
+
         verification_working_dir = self._resolve_verification_working_dir(
             seed,
             resolved_cwd,
@@ -378,6 +514,19 @@ class ExecuteSeedHandler(BridgeAwareMixin):
             event_store = self.event_store or EventStore()
             owns_event_store = self.event_store is None
             await event_store.initialize()
+
+            # Q4.1 / AC-2 — flush the deferred mode-conflict event now that
+            # the store is alive.  Best-effort: a write failure must not
+            # block the run (the warning + counter are already recorded).
+            if pending_mode_conflict_event is not None:
+                try:
+                    await event_store.append(pending_mode_conflict_event)
+                except Exception:
+                    log.exception(
+                        "mcp.execute_seed.mode_conflict_event_emit_failed",
+                        session_id=session_id,
+                    )
+
             # Use stderr: in MCP stdio mode, stdout is the JSON-RPC channel.
             console = Console(stderr=True)
             session_repo = SessionRepository(event_store)

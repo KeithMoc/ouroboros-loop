@@ -80,6 +80,88 @@ class TestSeedMetadata:
         with pytest.raises(PydanticValidationError):
             metadata.ambiguity_score = 0.20  # type: ignore[misc]
 
+    # --- Q4.1 / AC-2 Sub-AC 1: execution_mode_required field --------------
+    # Tests 24-27 — see docs/brainstorm/phase-2-q4.1-hardening-design.md
+    # for the design rationale (caller-wins-and-warn + soft-flip default).
+
+    def test_metadata_execution_mode_required_defaults_to_none(self) -> None:
+        """SeedMetadata.execution_mode_required defaults to None.
+
+        Test 24: a freshly-constructed SeedMetadata expresses no mode
+        preference; the MCP handler is expected to fall through to the
+        caller / global default.
+        """
+        metadata = SeedMetadata(ambiguity_score=0.15)
+
+        assert metadata.execution_mode_required is None
+
+    def test_metadata_execution_mode_required_round_trip_serialization(self) -> None:
+        """SeedMetadata round-trips execution_mode_required through model_dump.
+
+        Test 25: when the field is set, model_dump + model_validate must
+        preserve the value byte-identically. Both literal values
+        ('parallel' and 'compounding') are exercised.
+        """
+        for mode in ("parallel", "compounding"):
+            metadata = SeedMetadata(
+                ambiguity_score=0.15,
+                execution_mode_required=mode,  # type: ignore[arg-type]
+            )
+
+            dumped = metadata.model_dump(mode="json")
+            assert dumped["execution_mode_required"] == mode
+
+            reconstructed = SeedMetadata.model_validate(dumped)
+            assert reconstructed.execution_mode_required == mode
+
+    def test_metadata_execution_mode_required_backward_compat_old_yaml(self) -> None:
+        """SeedMetadata hydrates cleanly from old payloads lacking the field.
+
+        Test 26: old seed YAML files (pre-Q4.1) do not carry the
+        execution_mode_required key. They must hydrate without error and
+        with execution_mode_required=None — the MCP handler then falls
+        through to the global default. This is the backward-compat
+        invariant called out in
+        docs/brainstorm/phase-2-q4.1-hardening-design.md.
+        """
+        old_payload = {
+            "seed_id": "seed_legacy123",
+            "version": "1.0.0",
+            "ambiguity_score": 0.15,
+            "interview_id": "interview_legacy",
+            # No execution_mode_required key — pre-Q4.1 schema.
+        }
+
+        metadata = SeedMetadata.model_validate(old_payload)
+
+        assert metadata.seed_id == "seed_legacy123"
+        assert metadata.execution_mode_required is None
+
+    def test_metadata_execution_mode_required_rejects_invalid_value(self) -> None:
+        """SeedMetadata raises ValidationError for non-Literal mode values.
+
+        Test 27: any value outside {'parallel', 'compounding', None}
+        must fail at construction time so misconfigured seeds surface
+        early instead of silently falling through to the default.
+        """
+        with pytest.raises(PydanticValidationError):
+            SeedMetadata(
+                ambiguity_score=0.15,
+                execution_mode_required="serial",  # type: ignore[arg-type]
+            )
+
+        with pytest.raises(PydanticValidationError):
+            SeedMetadata(
+                ambiguity_score=0.15,
+                execution_mode_required="",  # type: ignore[arg-type]
+            )
+
+        with pytest.raises(PydanticValidationError):
+            SeedMetadata(
+                ambiguity_score=0.15,
+                execution_mode_required=123,  # type: ignore[arg-type]
+            )
+
 
 class TestOntologyField:
     """Test OntologyField model."""
