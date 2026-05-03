@@ -255,7 +255,7 @@ If you're picking this up cold from a new session:
 2. **Verify main is at `57a6449`** (upstream-sync merge): `git log --oneline -1`. The Q4.1 squash-merge `9a8d9f9` is now the parent on the local-side, and `483e9be` (upstream's v0.31.1 release-merge) is the parent on the upstream-side.
 3. **Decide whether to push `57a6449` to `origin/main`** (or open a review PR — see open gap #6).
 4. **Q4.2 is the next cycle** (judge-accuracy substrate + end-of-run sweep mode). Start with P0 recon against the master Q-list at `docs/brainstorm/serial-compounding-open-questions.md`, then brainstorming, then P1 edge-case mining, then ooo-style interview — same three-pass procedure as Q4.1 (took ~41 min and produced a spec ~30% richer than brainstorm-only).
-5. **Check `.claude/projects/-home-keith--WORKSPACES--ouroboros-loop/memory/MEMORY.md`** for project memory: dogfood-bootstrap pattern, gh-fork-resolution gotcha, prompt-caching block.
+5. **Check Claude Code's per-project memory** (`~/.claude/projects/<this-project-slug>/memory/MEMORY.md` on your local box) for project memory: dogfood-bootstrap pattern, gh-fork-resolution gotcha, prompt-caching block.
 
 ---
 

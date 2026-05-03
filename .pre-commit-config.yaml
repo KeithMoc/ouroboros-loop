@@ -25,3 +25,13 @@ repos:
         additional_dependencies:
           - pydantic>=2.0.0
           - types-PyYAML
+
+  - repo: local
+    hooks:
+      - id: privacy-leak-guard
+        name: Block personal/local info from leaking into commits
+        entry: scripts/check-privacy-leaks.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

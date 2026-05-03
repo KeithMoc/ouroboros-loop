@@ -108,6 +108,16 @@ _bmad/
 .claude/.upstream-sync-cache.json
 .claude/scheduled_tasks.lock
 
+# Local-only doc convention — anything intended to stay on the maintainer's
+# machine (private notes, strategy drafts, personal handoffs) goes in one of
+# these paths. The privacy-leak-guard pre-commit hook (scripts/check-privacy-leaks.sh)
+# catches accidental leaks of /home/<user>/ paths, personal emails, etc., but the
+# first line of defense is keeping local content here so it never reaches staging.
+docs/local/
+notes/local/
+**/*.local.md
+**/*.private.md
+
 
 # Local archive for removed/held docs and assets
 archive/
@@ -144,4 +154,3 @@ docs/cli-inventory.yaml
 # (see src/ouroboros/orchestrator/serial_executor.py write_chain_artifact)
 # These are per-session inspection files, not permanent project documentation.
 docs/brainstorm/chain-*.md
-

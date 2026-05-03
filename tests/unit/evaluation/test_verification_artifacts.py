@@ -502,7 +502,7 @@ class TestCommittedHistoryCapture:
             "98c4a15c3c93336cf69248455fb5fa13d34b3e2\n"
             "test(serial): Sub-AC 3 — truncation event\n"
             "\n"
-            "Keithm\n"
+            "Test Author\n"
             "Sat Apr 25 06:01:00 2026 +0000\n"
             "\n"
             " src/ouroboros/orchestrator/serial_executor.py | 4 +++-\n"
@@ -640,7 +640,7 @@ class TestCommittedHistoryCapture:
             "deadbeefdeadbeefdeadbeef\n"
             "feat: shallow-only HEAD\n"
             "\n"
-            "Keithm\n"
+            "Test Author\n"
             "\n"
             " src/foo.py | 1 +\n"
         )

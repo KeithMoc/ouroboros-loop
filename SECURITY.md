@@ -17,7 +17,17 @@ responsibly. **Do not open a public GitHub issue for security vulnerabilities.**
 
 ### How to Report
 
-Send an email to **jqyu.lee@gmail.com** with the following information:
+**For vulnerabilities in upstream `ouroboros-ai`** (the published Python package, MCP
+server, agents, skills shipped via the marketplace) — email
+**jqyu.lee@gmail.com** (upstream maintainer).
+
+**For vulnerabilities in fork-only code** of this repository — code under `.claude/`
+that is not part of the published plugin (e.g., maintainer-only skills, hooks,
+session-start scripts) — open a private report via
+[GitHub Security Advisories on this repository](https://github.com/KeithMoc/ouroboros-loop/security/advisories/new).
+Do not open a public issue for security reports.
+
+In either case, please include:
 
 - A description of the vulnerability and its potential impact
 - Steps to reproduce the issue, including any relevant configuration
