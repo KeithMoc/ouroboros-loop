@@ -104,6 +104,10 @@ _bmad/
 .omc/
 .smoke-home/
 
+# Local Claude Code dev artifacts (fork maintainer only — not shipped in plugin)
+.claude/.upstream-sync-cache.json
+.claude/scheduled_tasks.lock
+
 
 # Local archive for removed/held docs and assets
 archive/
