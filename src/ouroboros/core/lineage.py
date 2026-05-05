@@ -108,6 +108,23 @@ class ACResult(BaseModel, frozen=True):
         return None
 
 
+class TaskResult(BaseModel, frozen=True):
+    """Worker execution outcome for a task derived from an acceptance criterion.
+
+    This is intentionally separate from :class:`ACResult`: task completion
+    describes whether execution work finished, while AC results describe formal
+    evaluator/verifier verdicts about the produced artifact.
+    """
+
+    task_index: int
+    task_content: str
+    status: str
+    completed: bool
+    source_ac_index: int | None = None
+    evidence: str = ""
+    execution_method: str = "unknown"
+
+
 class FeedbackMetadata(BaseModel, frozen=True):
     """Structured evaluation feedback that downstream loops can react to."""
 
@@ -149,7 +166,17 @@ class EvaluationSummary(BaseModel, frozen=True):
         description="Suspicion that the artifact is optimized for evaluator, rubric, or test approval rather than solving the real task (0.0-1.0). Distinct from drift_score.",
     )
     failure_reason: str | None = None
-    ac_results: tuple[ACResult, ...] = ()
+    ac_results: tuple[ACResult, ...] = Field(
+        default_factory=tuple,
+        description="Formal evaluator/verifier verdicts for acceptance criteria.",
+    )
+    task_results: tuple[TaskResult, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Worker execution outcomes for tasks/subtasks. Distinct from ac_results: "
+            "task completion is not acceptance approval."
+        ),
+    )
     feedback_metadata: tuple[FeedbackMetadata, ...] = Field(
         default_factory=tuple,
         description=(
@@ -181,11 +208,13 @@ class EvaluationSummary(BaseModel, frozen=True):
         """Eagerly reconcile approval fields with AC results at construction time."""
         if self.ac_results:
             ac_passed = all(ac.passed for ac in self.ac_results)
-            expected_status = "approved" if ac_passed else "rejected"
+            execution_completed = self.execution_completion_status == "completed"
+            final_approved = ac_passed and execution_completed
+            expected_status = "approved" if final_approved else "rejected"
             if self.approval_status != expected_status:
                 object.__setattr__(self, "approval_status", expected_status)
-            if self.final_approved != ac_passed:
-                object.__setattr__(self, "final_approved", ac_passed)
+            if self.final_approved != final_approved:
+                object.__setattr__(self, "final_approved", final_approved)
         return self
 
     @property
@@ -199,7 +228,7 @@ class EvaluationSummary(BaseModel, frozen=True):
             return False
         if self.ac_results:
             return all(ac.passed for ac in self.ac_results)
-        if self.approval_status == "rejected":
+        if self.approval_status != "approved":
             return False
         return self.final_approved
 
@@ -375,16 +404,23 @@ class ControlDirectiveEmission(BaseModel, frozen=True):
     Captures the audit-level "who/what/why/when" of a control-plane
     decision so it appears in the lineage timeline alongside state events
     (per RFC #476 M2 / sub-RFC #511). The full event row remains in the
-    EventStore; this is the projected view used by callers.
+    EventStore; this projected view preserves the stable ControlContract
+    identity fields callers need for replay, idempotency inspection, and
+    future UI rendering without pretending to be the durable source of truth.
     """
 
     directive: str
     reason: str
     emitted_by: str
     timestamp: datetime
+    schema_version: int | None = None
+    target_type: str | None = None
+    target_id: str | None = None
     generation_number: int | None = None
     phase: str | None = None
     is_terminal: bool = False
+    parent_directive_id: str | None = None
+    idempotency_key: str | None = None
 
 
 class OntologyLineage(BaseModel, frozen=True):

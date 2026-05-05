@@ -1,11 +1,11 @@
 ---
 name: ralph
-description: "Persistent self-referential loop until verification passes"
+description: "Client-driven Ralph loop around background evolve_step jobs"
 ---
 
 # /ouroboros:ralph
 
-Persistent self-referential loop until verification passes. "The boulder never stops."
+Client-driven Ralph loop around background `evolve_step` jobs. "The boulder never stops."
 
 ## Usage
 
@@ -16,7 +16,20 @@ ooo ralph "<your request>"
 
 **Trigger keywords:** "ralph", "don't stop", "must complete", "until it works", "keep going"
 
+> **Current implementation note (#528):** `ooo ralph` is currently a
+> skill-driven loop. The MCP server exposes `ouroboros_start_evolve_step`
+> and the job polling tools, but it does **not** yet expose a first-class
+> `ouroboros_ralph` tool that owns the whole multi-generation loop. That
+> means this skill must keep calling one generation at a time until a
+> dedicated MCP-owned Ralph loop lands.
+
 ## How It Works
+
+Ralph mode is currently coordinated by this skill. It starts one background
+`evolve_step` job per iteration, polls that job, reads the QA result, and then
+decides whether to start another iteration. The loop state lives in the client
+conversation plus EventStore/job history; it is not yet a single durable MCP
+job.
 
 Ralph mode includes parallel execution + automatic verification:
 
@@ -43,7 +56,8 @@ When the user invokes this skill:
 2. **Initialize loop**:
    - Generate a session_id (UUID)
    - Track iteration, verification_history in conversation context
-   - No file I/O needed — evolve_step stores all execution data in EventStore
+   - No file I/O needed — evolve_step stores execution data in EventStore
+   - Do not claim a dedicated `ouroboros_ralph` MCP job exists yet; use `ouroboros_start_evolve_step` plus job polling
 
 4. **Enter the loop** (non-blocking background execution):
 
@@ -56,17 +70,18 @@ When the user invokes this skill:
 
        # Poll for progress (non-blocking, shows intermediate state)
        # Use timeout_seconds=120 (2-min long-poll) to reduce context consumption
-       # Only report when AC completed count changes (level-based polling)
+       # Only report when Task completed count changes (level-based polling)
        prev_completed = 0
        while not terminal:
            wait_result = await job_wait(job_id, cursor, timeout_seconds=120)
            cursor = wait_result.meta["cursor"]
            status = wait_result.meta["status"]
-           # Parse AC Progress from response, report only on level completion
-           current_completed = <parse AC completed from response>
+           # Metadata keys remain legacy-compatible (`ac_completed` / `sub_ac_completed`).
+           # Interpret and relay those counters as Task/Subtask progress.
+           current_completed = wait_result.meta["ac_completed"]
            if current_completed > prev_completed:
                # Report progress concisely (one line per poll)
-               print: [Level complete] AC: {current_completed}/{total} | Phase: {phase}
+               print: [Level complete] Task: {current_completed}/{total} | Phase: {phase}
                prev_completed = current_completed
            terminal = status in ("completed", "failed", "cancelled")
 
@@ -130,7 +145,7 @@ When the user invokes this skill:
 
 ## The Boulder Never Stops
 
-This is the key phrase. Ralph does not give up:
+This is the key phrase. Ralph does not give up while the client continues to drive the loop:
 - Each failure is data for the next attempt
 - Verification drives the loop
 - Only complete success or max iterations stops it
@@ -143,9 +158,9 @@ User: ooo ralph fix all failing tests
 [Ralph Iteration 1/10]
 Started background execution (job_abc123)
 Polling progress...
-  Phase: Executing | AC Progress: 1/3
-  Phase: Executing | AC Progress: 2/3
-  Phase: Executing | AC Progress: 3/3
+  Phase: Executing | Task Progress: 1/3
+  Phase: Executing | Task Progress: 2/3
+  Phase: Executing | Task Progress: 3/3
 Execution complete. Fetching result...
 
 QA Verdict: REVISE (score: 0.65)
