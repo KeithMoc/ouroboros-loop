@@ -38,6 +38,8 @@ _JOB_EXECUTION_EVENT_LIMIT = 250
 _JOB_SUBTASK_EVENT_PAGE_SIZE = 500
 _JOB_PROGRESS_EVENT_TYPES = {
     "workflow.progress.updated",
+    "execution.node.created",
+    "execution.node.updated",
     "execution.subtask.updated",
 }
 _JOB_VIEW_ALIASES = {
@@ -65,7 +67,16 @@ async def _query_all_execution_subtask_events(
 ) -> list[Any]:
     """Fetch subtask updates from one stable execution replay snapshot."""
     events, _cursor = await event_store.get_events_after("execution", execution_id, 0)
-    return [event for event in events if event.type == "execution.subtask.updated"]
+    return [
+        event
+        for event in events
+        if event.type
+        in {
+            "execution.node.created",
+            "execution.node.updated",
+            "execution.subtask.updated",
+        }
+    ]
 
 
 async def _query_latest_workflow_event(event_store: EventStore, execution_id: str) -> Any | None:
@@ -455,6 +466,12 @@ async def _render_job_snapshot_inner(
                 lines.append(
                     f"**Current Step**: Gen {latest.data.get('generation_number')} failed at {latest.data.get('phase')}"
                 )
+            elif latest.type == "lineage.generation.watchdog_decision":
+                lines.append(
+                    f"**Current Step**: Gen {latest.data.get('generation_number')} watchdog {latest.data.get('action', 'decision')}"
+                )
+                if latest.data.get("reason"):
+                    lines.append(f"**Reason**: {latest.data.get('reason')}")
             elif latest.type in {"lineage.converged", "lineage.stagnated", "lineage.exhausted"}:
                 lines.append(f"**Current Step**: {latest.type.split('.', 1)[1]}")
                 if latest.data.get("reason"):

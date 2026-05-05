@@ -45,6 +45,7 @@ from ouroboros.providers.codex_cli_stream import (
     iter_stream_lines,
     terminate_process,
 )
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 log = structlog.get_logger()
 
@@ -135,9 +136,10 @@ class CodexCliLLMAdapter:
             raise ValueError(msg)
         return candidate
 
-    def _build_prompt(self, messages: list[Message]) -> str:
+    def _build_prompt(self, messages: list[Message], *, max_turns: int | None = None) -> str:
         """Build a plain-text prompt from conversation messages."""
         parts: list[str] = []
+        effective_max_turns = max_turns if max_turns is not None else self._max_turns
 
         system_messages = [
             message.content for message in messages if message.role == MessageRole.SYSTEM
@@ -157,7 +159,7 @@ class CodexCliLLMAdapter:
             parts.append("## Tool Constraints")
             parts.append("Do NOT use any tools or MCP calls. Respond with plain text only.")
 
-        if self._max_turns > 0:
+        if effective_max_turns > 0:
             parts.append("## Execution Budget")
             if self._allowed_tools == []:
                 parts.append(
@@ -166,7 +168,7 @@ class CodexCliLLMAdapter:
                 )
             else:
                 parts.append(
-                    f"Keep the work within at most {self._max_turns} tool-assisted turns if possible."
+                    f"Keep the work within at most {effective_max_turns} tool-assisted turns if possible."
                 )
 
         for message in messages:
@@ -350,6 +352,7 @@ class CodexCliLLMAdapter:
         output_last_message_path: str,
         output_schema_path: str | None,
         model: str | None,
+        profile: str | None = None,
     ) -> list[str]:
         """Build the `codex exec` command for a one-shot completion.
 
@@ -374,7 +377,9 @@ class CodexCliLLMAdapter:
         if output_schema_path:
             command.extend(["--output-schema", output_schema_path])
 
-        if model:
+        if profile:
+            command.extend(["--profile", profile])
+        elif model:
             command.extend(["--model", model])
 
         return command
@@ -483,6 +488,39 @@ class CodexCliLLMAdapter:
                     return content
 
         return stderr.strip()
+
+    def _extract_stdout_errors(self, stdout_lines: list[str]) -> list[str]:
+        """Pull error event messages from a Codex JSONL stdout stream.
+
+        Codex CLI 0.128+ emits in-flight failures (provider 502s, model
+        registry mismatches, auth issues, retry exhaustion) as JSONL events
+        on stdout with ``type`` of ``"error"`` or ``"turn.failed"``. The
+        process eventually exits with rc != 0 and only the static startup
+        banner ("Reading prompt from stdin...") on stderr — so any error
+        report that forwards just stderr loses every actionable detail.
+
+        This helper reads ``stdout_lines`` in arrival order and returns the
+        textual ``message`` from each terminal/error event, preserving order
+        so callers can use ``[-1]`` for the most recent (final) error.
+        """
+        errors: list[str] = []
+        for line in stdout_lines:
+            event = self._parse_json_event(line)
+            if not event:
+                continue
+            event_type = event.get("type")
+            if event_type not in {"error", "turn.failed"}:
+                continue
+
+            payload = event.get("error") if event_type == "turn.failed" else event
+            if isinstance(payload, dict):
+                msg = payload.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    errors.append(msg.strip())
+                    continue
+            if isinstance(payload, str) and payload.strip():
+                errors.append(payload.strip())
+        return errors
 
     def _format_tool_info(self, tool_name: str, tool_input: dict[str, Any]) -> str:
         """Format tool name and input details for debug callbacks."""
@@ -646,8 +684,15 @@ class CodexCliLLMAdapter:
         config: CompletionConfig,
     ) -> Result[CompletionResponse, ProviderError]:
         """Execute a single Codex CLI completion request."""
-        prompt = self._build_prompt(messages)
-        normalized_model = self._normalize_model(config.model)
+        profile_result = resolve_completion_profile_result(config, backend="codex")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        resolved = profile_result.value
+        effective_config = resolved.config
+        prompt = self._build_prompt(messages, max_turns=effective_config.max_turns)
+        normalized_model = (
+            None if resolved.backend_profile else self._normalize_model(effective_config.model)
+        )
         output_fd, output_path_str = tempfile.mkstemp(prefix=self._tempfile_prefix, suffix=".txt")
         os.close(output_fd)
         output_path = Path(output_path_str)
@@ -667,6 +712,7 @@ class CodexCliLLMAdapter:
             output_last_message_path=str(output_path),
             output_schema_path=str(schema_path) if schema_path else None,
             model=normalized_model,
+            profile=resolved.backend_profile,
         )
 
         prompt_bytes = prompt.encode("utf-8")
@@ -728,15 +774,18 @@ class CodexCliLLMAdapter:
                 )
 
             if process.returncode != 0:
+                stdout_errors = self._extract_stdout_errors(stdout_lines)
                 return Result.err(
                     ProviderError(
-                        message=content
+                        message=(stdout_errors[-1] if stdout_errors else None)
+                        or content
                         or f"{self._display_name} exited with code {process.returncode}",
                         provider=self._provider_name,
                         details={
                             "returncode": process.returncode,
                             "session_id": session_id,
                             "stderr": "\n".join(stderr_lines).strip(),
+                            "stdout_errors": stdout_errors,
                         },
                     )
                 )
@@ -889,15 +938,18 @@ class CodexCliLLMAdapter:
             content = last_content or self._fallback_content(stdout_lines, "\n".join(stderr_lines))
 
         if process.returncode != 0:
+            stdout_errors = self._extract_stdout_errors(stdout_lines)
             return Result.err(
                 ProviderError(
-                    message=content
+                    message=(stdout_errors[-1] if stdout_errors else None)
+                    or content
                     or f"{self._display_name} exited with code {process.returncode}",
                     provider=self._provider_name,
                     details={
                         "returncode": process.returncode,
                         "session_id": session_id,
                         "stderr": "\n".join(stderr_lines).strip(),
+                        "stdout_errors": stdout_errors,
                     },
                 )
             )

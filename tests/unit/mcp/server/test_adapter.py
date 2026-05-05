@@ -1,5 +1,6 @@
 """Tests for MCP server adapter."""
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -7,6 +8,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from ouroboros.core.types import Result
+from ouroboros.events.base import BaseEvent
+from ouroboros.events.io_recorder import get_current_io_journal_recorder
 from ouroboros.mcp.errors import MCPResourceNotFoundError, MCPServerError
 from ouroboros.mcp.server.adapter import (
     VALID_TRANSPORTS,
@@ -28,6 +31,13 @@ from ouroboros.mcp.types import (
     MCPToolResult,
     ToolInputType,
 )
+from ouroboros.orchestrator.agent_runtime_context import AgentRuntimeContext
+from ouroboros.orchestrator.control_bus import ControlBus, ControlBusDrainError
+
+
+class _FakeEventStore:
+    async def append(self, event: object) -> None:
+        pass
 
 
 class MockToolHandler:
@@ -207,6 +217,124 @@ class TestMCPServerAdapterTools:
         assert result.value.text_content == "Success"
         handler.handle_mock.assert_called_once_with({"input": "test"})
 
+    async def test_call_tool_scopes_io_journal_recorder_from_runtime_context(self) -> None:
+        """MCP tool calls provide per-call journal identity to shared adapters."""
+
+        class _RecorderProbeHandler(MockToolHandler):
+            def __init__(self) -> None:
+                super().__init__("probe_tool")
+                self.recorder = None
+
+            async def handle(
+                self, arguments: dict[str, Any]
+            ) -> Result[MCPToolResult, MCPServerError]:
+                self.recorder = get_current_io_journal_recorder()
+                return Result.ok(
+                    MCPToolResult(
+                        content=(MCPContentItem(type=ContentType.TEXT, text="ok"),),
+                    )
+                )
+
+        adapter = MCPServerAdapter()
+        adapter.set_runtime_context(
+            AgentRuntimeContext(
+                event_store=_FakeEventStore(),
+                runtime_backend="codex",
+                llm_backend="litellm",
+            )
+        )
+        handler = _RecorderProbeHandler()
+        adapter.register_tool(handler)
+
+        result = await adapter.call_tool(
+            "probe_tool",
+            {
+                "execution_id": "exec_123",
+                "session_id": "sess_123",
+                "phase": "reflect",
+                "generation_number": 2,
+            },
+        )
+
+        assert result.is_ok
+        assert handler.recorder is not None
+        assert handler.recorder.target_type == "execution"
+        assert handler.recorder.target_id == "exec_123"
+        assert handler.recorder.session_id == "sess_123"
+        assert handler.recorder.execution_id == "exec_123"
+        assert handler.recorder.phase == "reflect"
+        assert handler.recorder.generation_number == 2
+        assert get_current_io_journal_recorder() is None
+
+    def test_io_recorder_for_tool_call_uses_lineage_identity(self) -> None:
+        adapter = MCPServerAdapter()
+        adapter.set_runtime_context(
+            AgentRuntimeContext(
+                event_store=_FakeEventStore(),
+                runtime_backend="codex",
+                llm_backend="litellm",
+            )
+        )
+
+        recorder = adapter._io_recorder_for_tool_call(
+            "ouroboros_evolve_step",
+            {
+                "lineage_id": "lin_123",
+                "session_id": "sess_123",
+                "generation": 3,
+                "current_phase": "reflect",
+            },
+        )
+
+        assert recorder is not None
+        assert recorder.target_type == "lineage"
+        assert recorder.target_id == "lin_123"
+        assert recorder.lineage_id == "lin_123"
+        assert recorder.session_id == "sess_123"
+        assert recorder.generation_number == 3
+        assert recorder.phase == "reflect"
+
+    def test_io_recorder_for_tool_call_uses_session_identity(self) -> None:
+        adapter = MCPServerAdapter()
+        adapter.set_runtime_context(
+            AgentRuntimeContext(
+                event_store=_FakeEventStore(),
+                runtime_backend="codex",
+                llm_backend="litellm",
+            )
+        )
+
+        recorder = adapter._io_recorder_for_tool_call(
+            "ouroboros_qa",
+            {"qa_session_id": "qa_123"},
+        )
+
+        assert recorder is not None
+        assert recorder.target_type == "session"
+        assert recorder.target_id == "qa_123"
+        assert recorder.session_id == "qa_123"
+        assert recorder.execution_id is None
+        assert recorder.lineage_id is None
+
+    def test_io_recorder_for_tool_call_uses_mcp_tool_fallback_identity(self) -> None:
+        adapter = MCPServerAdapter()
+        adapter.set_runtime_context(
+            AgentRuntimeContext(
+                event_store=_FakeEventStore(),
+                runtime_backend="codex",
+                llm_backend="litellm",
+            )
+        )
+
+        recorder = adapter._io_recorder_for_tool_call("plain_tool", {})
+
+        assert recorder is not None
+        assert recorder.target_type == "mcp_tool"
+        assert recorder.target_id.startswith("plain_tool:")
+        assert recorder.session_id is None
+        assert recorder.execution_id is None
+        assert recorder.lineage_id is None
+
     async def test_call_tool_not_found(self) -> None:
         """call_tool returns error for unknown tool."""
         adapter = MCPServerAdapter()
@@ -262,6 +390,17 @@ class TestMCPServerAdapterResources:
 
         assert result.is_ok
         assert result.value.text == "Resource content"
+
+    async def test_read_resource_routes_registered_base_uri_prefix(self) -> None:
+        """read_resource routes child URIs to handlers registered at the base URI."""
+        adapter = MCPServerAdapter()
+        handler = MockResourceHandler("test://resource")
+        adapter.register_resource(handler)
+
+        result = await adapter.read_resource("test://resource/child")
+
+        assert result.is_ok
+        handler.handle_mock.assert_awaited_once_with("test://resource/child")
 
     async def test_read_resource_not_found(self) -> None:
         """read_resource returns error for unknown resource."""
@@ -516,6 +655,51 @@ class TestServeTransport:
         # Test: Path traversal should be rejected by input validation
         with pytest.raises(RuntimeError, match="Path traversal detected"):
             await captured_wrapper(input="../../../etc/passwd")
+
+    @pytest.mark.asyncio
+    async def test_fastmcp_registers_base_resource_uri_template(self) -> None:
+        """FastMCP path exposes child URIs for base resource handlers."""
+        from unittest.mock import MagicMock, patch
+
+        adapter = MCPServerAdapter()
+        handler = MockResourceHandler("test://resource")
+        adapter.register_resource(handler)
+
+        mock_fastmcp_cls = MagicMock()
+        mock_instance = MagicMock()
+        captured_resources: dict[str, Any] = {}
+
+        def capture_resource_decorator(uri: str):
+            def decorator(func):
+                captured_resources[uri] = func
+                return func
+
+            return decorator
+
+        mock_instance.tool = MagicMock(return_value=lambda f: f)
+        mock_instance.resource = capture_resource_decorator
+        mock_instance.run_stdio_async = AsyncMock()
+        mock_fastmcp_cls.return_value = mock_instance
+
+        with (
+            patch(
+                "ouroboros.mcp.server.adapter.FastMCP",
+                mock_fastmcp_cls,
+                create=True,
+            ),
+            patch.dict(
+                "sys.modules",
+                {"mcp.server.fastmcp": MagicMock(FastMCP=mock_fastmcp_cls)},
+            ),
+        ):
+            await adapter.serve(transport="stdio")
+
+        assert "test://resource" in captured_resources
+        assert "test://resource/{resource_id}" in captured_resources
+
+        text = await captured_resources["test://resource/{resource_id}"]("child")
+        assert text == "Resource content"
+        handler.handle_mock.assert_awaited_with("test://resource/child")
 
     @pytest.mark.asyncio
     async def test_fastmcp_rejects_auth_config_at_startup(self):
@@ -1031,4 +1215,97 @@ class TestCreateOuroborosServerBrownfieldStore:
             )
 
         assert captured_handler_kwargs["_store"] is mock_brownfield_store
-        assert server._owned_resources == [mock_event_store, mock_brownfield_store]
+        assert isinstance(server._owned_resources[0], ControlBus)
+        assert server._owned_resources[1:] == [mock_event_store, mock_brownfield_store]
+
+
+def test_create_ouroboros_server_retains_runtime_context() -> None:
+    """The composition root must keep AgentRuntimeContext reachable after return."""
+    from ouroboros.mcp.server.adapter import create_ouroboros_server
+
+    server = create_ouroboros_server(runtime_backend="codex", llm_backend="claude_code")
+
+    assert server.runtime_context is not None
+    assert server.runtime_context.runtime_backend == "codex"
+    assert server.runtime_context.llm_backend == "claude_code"
+    assert server.runtime_context.control is not None
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_drains_runtime_control_bus() -> None:
+    """Server-owned ControlBus must not leave subscriber tasks behind."""
+    from ouroboros.mcp.server.adapter import create_ouroboros_server
+
+    server = create_ouroboros_server(runtime_backend="codex", llm_backend="claude_code")
+    assert server.runtime_context is not None
+    bus = server.runtime_context.control
+    assert bus is not None
+    bus._close_timeout_s = 0.01
+
+    started = asyncio.Event()
+
+    async def blocked(_event: BaseEvent) -> None:
+        started.set()
+        await asyncio.sleep(60)
+
+    bus.subscribe(lambda _event: True, blocked)
+    tasks = bus.publish(
+        BaseEvent(
+            type="control.directive.emitted",
+            aggregate_type="lineage",
+            aggregate_id="lin_shutdown_probe",
+            data={"directive": "cancel"},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    await server.shutdown()
+
+    assert tasks[0].cancelled()
+    assert bus._tasks == set()
+    assert server._owned_resources == []
+
+
+@pytest.mark.asyncio
+async def test_server_shutdown_stops_before_dependents_when_control_bus_refuses_drain() -> None:
+    """Do not close dependent resources while control subscribers are still live."""
+    server = MCPServerAdapter()
+    bus = ControlBus(_close_timeout_s=0.01, _cancel_timeout_s=0.01)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _DependentResource:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    resource = _DependentResource()
+
+    async def stubborn(_event: BaseEvent) -> None:
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await release.wait()
+
+    server.register_owned_resource(bus)
+    server.register_owned_resource(resource)
+    bus.subscribe(lambda _event: True, stubborn)
+    tasks = bus.publish(
+        BaseEvent(
+            type="control.directive.emitted",
+            aggregate_type="lineage",
+            aggregate_id="lin_shutdown_probe",
+            data={"directive": "cancel"},
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+
+    with pytest.raises(ControlBusDrainError):
+        await asyncio.wait_for(server.shutdown(), timeout=0.5)
+
+    assert resource.closed is False
+
+    release.set()
+    await asyncio.wait_for(tasks[0], timeout=0.5)

@@ -12,13 +12,14 @@ Reflect handles all subsequent generations autonomously.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
 import logging
 
 from pydantic import BaseModel, Field
 
-from ouroboros.config import get_reflect_model
+from ouroboros.config import get_llm_backend, get_reflect_model
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.lineage import EvaluationSummary, MutationAction, OntologyDelta, OntologyLineage
 from ouroboros.core.seed import Seed
@@ -72,10 +73,103 @@ class ReflectEngine:
 
     When evaluation is fully approved (score >= 0.8, no drift), outputs
     minimal changes to allow convergence.
+
+    Adapter freshness:
+        ``llm_adapter`` is captured at MCP server startup. If the user
+        changes ``llm.backend`` in ``~/.ouroboros/config.yaml`` after the
+        server has started, the captured adapter is stale and every Reflect
+        call still hits the previous backend's adapter (issue #562). The
+        ``adapter_factory`` field lets callers supply a zero-arg factory
+        the engine invokes per call so Reflect always honors the live
+        config; if no factory is supplied the engine falls back to the
+        captured adapter (preserving today's behavior for tests and direct
+        consumers).
     """
 
     llm_adapter: LLMAdapter
-    model: str = field(default_factory=get_reflect_model)
+    model: str | None = None
+    adapter_factory: Callable[[], LLMAdapter | None] | None = field(default=None)
+    adapter_backend: str | None = None
+    _captured_backend: str | None = field(default=None, init=False, repr=False)
+    _model_is_explicit: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Track explicit model pins while allowing backend-aware implicit defaults."""
+        self._model_is_explicit = self.model is not None
+        try:
+            self._captured_backend = self.adapter_backend or get_llm_backend()
+        except Exception:  # noqa: BLE001 — never fail engine init on config read
+            self._captured_backend = None
+        if self.model is None:
+            self._refresh_model(self._captured_backend)
+
+    def _refresh_model(self, backend: str | None) -> None:
+        if not self._model_is_explicit:
+            self.model = get_reflect_model(backend)
+
+    def _completion_model(self) -> str:
+        if self.model is None:
+            self._refresh_model(self._selected_backend())
+        assert self.model is not None
+        return self.model
+
+    def _resolve_adapter(self) -> LLMAdapter:
+        """Return the adapter the next ``complete()`` call should use."""
+        current_backend = self._selected_backend()
+        backend_drifted = (
+            self._captured_backend is not None
+            and current_backend
+            and current_backend != self._captured_backend
+        )
+
+        if self.adapter_factory is not None:
+            try:
+                fresh = self.adapter_factory()
+                if fresh is not None:
+                    # Treat the factory result as the latest known-good adapter so
+                    # a later transient factory failure does not fall back to a
+                    # stale startup adapter after backend/model state has moved.
+                    self.llm_adapter = fresh
+                    if current_backend:
+                        self._captured_backend = current_backend
+                        self._refresh_model(current_backend)
+                    return fresh
+            except Exception:  # noqa: BLE001 — fall through to captured adapter
+                logger.exception("ReflectEngine adapter_factory raised; using captured adapter")
+                return self.llm_adapter
+
+        if backend_drifted:
+            try:
+                from ouroboros.providers.factory import create_llm_adapter
+
+                rebuilt = create_llm_adapter(
+                    backend=current_backend,
+                    **_adapter_rebuild_kwargs(self.llm_adapter),
+                )
+                self.llm_adapter = rebuilt
+                self._captured_backend = current_backend
+                self._refresh_model(current_backend)
+                logger.info(
+                    "reflect.adapter_rebuilt_for_backend_drift",
+                    extra={"new_backend": current_backend},
+                )
+                return rebuilt
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "ReflectEngine failed to rebuild adapter for drifted backend; "
+                    "falling back to captured adapter"
+                )
+                return self.llm_adapter
+
+        return self.llm_adapter
+
+    def _selected_backend(self) -> str | None:
+        if self.adapter_backend is not None:
+            return self.adapter_backend
+        try:
+            return get_llm_backend()
+        except Exception:  # noqa: BLE001
+            return None
 
     async def reflect(
         self,
@@ -110,13 +204,16 @@ class ReflectEngine:
             Message(role=MessageRole.USER, content=prompt),
         ]
 
+        adapter = self._resolve_adapter()
         config = CompletionConfig(
-            model=self.model,
+            model=self._completion_model(),
+            role="reflect",
+            model_is_explicit=self._model_is_explicit,
             temperature=0.5,
             max_tokens=3000,
         )
 
-        result = await self.llm_adapter.complete(messages, config)
+        result = await adapter.complete(messages, config)
 
         if result.is_err:
             logger.error("ReflectEngine LLM call failed: %s", result.error)
@@ -336,3 +433,35 @@ Guidelines:
                 },
             )
             return None
+
+
+def _adapter_rebuild_kwargs(adapter: LLMAdapter) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "cwd": _adapter_cwd(adapter),
+        "max_turns": _adapter_max_turns(adapter),
+    }
+    for key, attr in (
+        ("permission_mode", "_permission_mode"),
+        ("allowed_tools", "_allowed_tools"),
+        ("cli_path", "_cli_path"),
+        ("timeout", "_timeout"),
+        ("max_retries", "_max_retries"),
+        ("on_message", "_on_message"),
+        ("api_key", "_api_key"),
+        ("api_base", "_api_base"),
+    ):
+        if hasattr(adapter, attr):
+            value = getattr(adapter, attr)
+            if value is not None:
+                kwargs[key] = value
+    return kwargs
+
+
+def _adapter_cwd(adapter: LLMAdapter) -> str | None:
+    value = getattr(adapter, "_cwd", None)
+    return str(value) if value is not None else None
+
+
+def _adapter_max_turns(adapter: LLMAdapter) -> int:
+    value = getattr(adapter, "_max_turns", 1)
+    return value if isinstance(value, int) and value > 0 else 1

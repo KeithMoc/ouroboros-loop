@@ -35,6 +35,7 @@ Functions:
 """
 
 import ast
+import math
 import os
 from pathlib import Path
 import shutil
@@ -47,6 +48,7 @@ import yaml
 from ouroboros.config.models import (  # noqa: E402
     CredentialsConfig,
     OuroborosConfig,
+    RuntimeControlsConfig,
     get_config_dir,
     get_default_config,
     get_default_credentials,
@@ -67,6 +69,16 @@ _DEFAULT_CONSENSUS_MODELS = (
 _DEFAULT_CONSENSUS_ADVOCATE_MODEL = "openrouter/anthropic/claude-opus-4-6"
 _DEFAULT_CONSENSUS_DEVIL_MODEL = "openrouter/openai/gpt-4o"
 _DEFAULT_CONSENSUS_JUDGE_MODEL = "openrouter/google/gemini-2.5-pro"
+_DEFAULT_USAGE_LIMIT_PAUSE_HOURS = 5.0
+_SECONDS_PER_HOUR = 3600
+_USAGE_LIMIT_PAUSE_CONFIG_KEY = "orchestrator.usage_limit_pause_hours"
+_RUNTIME_CONTROL_ENV_KEYS = {
+    "OUROBOROS_MCP_TOOL_TIMEOUT_SECONDS": "mcp_tool_timeout_seconds",
+    "OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS": "generation_idle_timeout_seconds",
+    "OUROBOROS_GENERATION_NO_PROGRESS_TIMEOUT_SECONDS": ("generation_no_progress_timeout_seconds"),
+    "OUROBOROS_GENERATION_SAFETY_TIMEOUT_SECONDS": "generation_safety_timeout_seconds",
+    "OUROBOROS_WATCHDOG_POLL_SECONDS": "watchdog_poll_seconds",
+}
 
 
 def _parse_env_value(raw_value: str) -> str:
@@ -400,6 +412,97 @@ def credentials_file_secure(credentials_path: Path | None = None) -> bool:
     return (file_mode & 0o777) == 0o600
 
 
+def _runtime_controls_error(error: ConfigError) -> bool:
+    """Return True when a config validation error concerns runtime_controls."""
+    if error.config_key and error.config_key.startswith("runtime_controls"):
+        return True
+    config_keys = error.details.get("config_keys") if isinstance(error.details, dict) else None
+    return isinstance(config_keys, list) and any(
+        str(config_key).startswith("runtime_controls") for config_key in config_keys
+    )
+
+
+def _parse_runtime_control_number(
+    raw_value: str,
+    *,
+    config_key: str,
+    allow_float: bool = False,
+    allow_zero: bool = True,
+) -> int | float:
+    """Parse a runtime-control value from an environment variable."""
+    candidate = raw_value.strip()
+    try:
+        parsed = float(candidate) if allow_float else int(candidate)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{config_key} must be a {'positive number' if allow_float else 'non-negative integer'}",
+            config_key=config_key,
+            details={"value": raw_value},
+        ) from exc
+
+    if allow_float:
+        if parsed < 0 or (not allow_zero and parsed == 0):
+            raise ConfigError(
+                f"{config_key} must be {'greater than 0' if not allow_zero else 'greater than or equal to 0'}",
+                config_key=config_key,
+                details={"value": raw_value},
+            )
+        return parsed
+
+    if parsed < 0:
+        raise ConfigError(
+            f"{config_key} must be greater than or equal to 0",
+            config_key=config_key,
+            details={"value": raw_value},
+        )
+    return parsed
+
+
+def get_runtime_controls_config() -> RuntimeControlsConfig:
+    """Get progress-aware runtime controls from config and environment.
+
+    Priority:
+        1. Dedicated environment variable overrides
+        2. Legacy OUROBOROS_GENERATION_TIMEOUT as the no-progress timeout
+        3. config.yaml runtime_controls section
+        4. built-in defaults
+
+    The legacy generation timeout maps to semantic no-material-progress
+    detection, not to the MCP adapter wall-clock timeout.
+    """
+    try:
+        controls = load_config().runtime_controls
+    except ConfigError as exc:
+        if _runtime_controls_error(exc):
+            raise
+        controls = RuntimeControlsConfig()
+
+    updates: dict[str, float] = {}
+    for env_key, field_name in _RUNTIME_CONTROL_ENV_KEYS.items():
+        env_value = os.environ.get(env_key, "").strip()
+        if not env_value:
+            continue
+        updates[field_name] = _parse_runtime_control_number(
+            env_value,
+            config_key=env_key,
+            allow_float=True,
+            allow_zero=field_name != "watchdog_poll_seconds",
+        )
+
+    legacy_generation_timeout = os.environ.get("OUROBOROS_GENERATION_TIMEOUT", "").strip()
+    if legacy_generation_timeout and "generation_no_progress_timeout_seconds" not in updates:
+        updates["generation_no_progress_timeout_seconds"] = _parse_runtime_control_number(
+            legacy_generation_timeout,
+            config_key="OUROBOROS_GENERATION_TIMEOUT",
+            allow_float=True,
+        )
+
+    if not updates:
+        return controls
+
+    return RuntimeControlsConfig.model_validate({**controls.model_dump(), **updates})
+
+
 def get_cli_path() -> str | None:
     """Get Claude CLI path from environment variable or config file.
 
@@ -495,7 +598,7 @@ def _parse_max_parallel_workers(value: Any, *, config_key: str) -> int:
 
     try:
         parsed = int(value)
-    except (TypeError, ValueError) as exc:
+    except (OverflowError, TypeError, ValueError) as exc:
         raise ConfigError(
             f"{config_key} must be a positive integer",
             config_key=config_key,
@@ -509,6 +612,13 @@ def _parse_max_parallel_workers(value: Any, *, config_key: str) -> int:
             details={"value": value},
         )
 
+    if not math.isfinite(parsed):
+        raise ConfigError(
+            f"{config_key} must be finite",
+            config_key=config_key,
+            details={"value": value},
+        )
+
     if parsed <= 0:
         raise ConfigError(
             f"{config_key} must be greater than 0",
@@ -517,6 +627,110 @@ def _parse_max_parallel_workers(value: Any, *, config_key: str) -> int:
         )
 
     return parsed
+
+
+def _parse_positive_float(value: Any, *, config_key: str) -> float:
+    """Parse a positive float setting without silently accepting booleans."""
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"{config_key} must be a positive number",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"{config_key} must be a positive number",
+            config_key=config_key,
+            details={"value": value},
+        ) from exc
+
+    if not math.isfinite(parsed):
+        raise ConfigError(
+            f"{config_key} must be finite",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    if parsed <= 0:
+        raise ConfigError(
+            f"{config_key} must be greater than 0",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    return parsed
+
+
+def get_usage_limit_pause_seconds() -> int:
+    """Get the default pause window for provider usage/quota limits.
+
+    Priority:
+        1. OUROBOROS_USAGE_LIMIT_PAUSE_HOURS environment variable
+        2. config.yaml orchestrator.usage_limit_pause_hours
+        3. built-in default (5 hours)
+    """
+    env_value = os.environ.get("OUROBOROS_USAGE_LIMIT_PAUSE_HOURS", "").strip()
+    if env_value:
+        hours = _parse_positive_float(
+            env_value,
+            config_key="OUROBOROS_USAGE_LIMIT_PAUSE_HOURS",
+        )
+        return max(1, int(hours * _SECONDS_PER_HOUR))
+
+    config_path = get_config_dir() / "config.yaml"
+    if not config_path.exists():
+        # No config file means no pause-window override; use the built-in default.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+
+    try:
+        with config_path.open() as f:
+            config_dict = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(
+            f"Failed to parse configuration file: {e}",
+            config_file=str(config_path),
+            details={"yaml_error": str(e)},
+        ) from e
+    except OSError as e:
+        raise ConfigError(
+            f"Failed to read configuration file: {e}",
+            config_file=str(config_path),
+            details={"os_error": str(e), "error_type": type(e).__name__},
+        ) from e
+
+    if config_dict is None:
+        # Empty config means no pause-window override; use the built-in default.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+    if not isinstance(config_dict, dict):
+        raise ConfigError(
+            "Configuration file must contain a mapping",
+            config_file=str(config_path),
+            details={"value_type": type(config_dict).__name__},
+        )
+
+    orchestrator_config = config_dict.get("orchestrator")
+    if orchestrator_config is None:
+        # Missing orchestrator section means no pause-window override.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+    if not isinstance(orchestrator_config, dict):
+        raise ConfigError(
+            "orchestrator must be a mapping",
+            config_key="orchestrator",
+            config_file=str(config_path),
+            details={"value": orchestrator_config},
+        )
+    if "usage_limit_pause_hours" not in orchestrator_config:
+        # Missing pause-window key means no override; invalid values still raise below.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+
+    hours = _parse_positive_float(
+        orchestrator_config["usage_limit_pause_hours"],
+        config_key=_USAGE_LIMIT_PAUSE_CONFIG_KEY,
+    )
+    return max(1, int(hours * _SECONDS_PER_HOUR))
 
 
 def get_max_parallel_workers() -> int:

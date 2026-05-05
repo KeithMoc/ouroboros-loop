@@ -479,6 +479,7 @@ class TestCreateOuroborosServer:
     EXPECTED_OUROBOROS_SERVER_TOOLS = {
         "ouroboros_ac_dashboard",
         "ouroboros_ac_tree_hud",
+        "ouroboros_auto",
         "ouroboros_brownfield",
         "ouroboros_cancel_execution",
         "ouroboros_cancel_job",
@@ -510,6 +511,22 @@ class TestCreateOuroborosServer:
         assert server.info.version == "1.0.0"
         tool_names = {tool.name for tool in server.info.tools}
         assert tool_names == self.EXPECTED_OUROBOROS_SERVER_TOOLS
+
+    def test_create_server_forwards_bridge_context_to_auto_handler(self) -> None:
+        """Auto resume rebuilds should retain bridge access from server wiring."""
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        class FakeBridge:
+            manager = object()
+            tool_prefix = "bridge__"
+
+        bridge = FakeBridge()
+        server = create_ouroboros_server(mcp_bridge=bridge)
+        auto = server._tool_handlers["ouroboros_auto"]
+
+        assert isinstance(auto, AutoHandler)
+        assert auto.mcp_manager is bridge.manager
+        assert auto.mcp_tool_prefix == "bridge__"
 
     def test_creates_server_with_custom_config(self) -> None:
         """Factory creates server with custom configuration."""
@@ -568,6 +585,51 @@ class TestCreateOuroborosServer:
         mock_create_llm_adapter.assert_called_once()
         assert mock_create_llm_adapter.call_args.kwargs["backend"] == "codex"
         assert mock_create_llm_adapter.call_args.kwargs["max_turns"] == 1
+
+    def test_evolution_adapter_factory_resolves_live_backend_with_cwd(self) -> None:
+        """Per-call evolution adapter factory must not freeze startup llm_backend."""
+        with (
+            patch("ouroboros.providers.create_llm_adapter") as mock_create_llm_adapter,
+            patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime,
+            patch("ouroboros.evolution.wonder.WonderEngine") as mock_wonder_engine,
+            patch("ouroboros.evolution.reflect.ReflectEngine") as mock_reflect_engine,
+        ):
+            mock_create_llm_adapter.return_value = MagicMock()
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="codex", llm_backend="codex")
+
+            initial_kwargs = mock_create_llm_adapter.call_args.kwargs
+            factory = mock_wonder_engine.call_args.kwargs["adapter_factory"]
+            assert mock_wonder_engine.call_args.kwargs["adapter_backend"] == "codex"
+            assert mock_reflect_engine.call_args.kwargs["adapter_factory"] is factory
+            assert mock_reflect_engine.call_args.kwargs["adapter_backend"] == "codex"
+
+            factory()
+
+        assert initial_kwargs["backend"] == "codex"
+        assert mock_create_llm_adapter.call_args.kwargs["backend"] == "codex"
+        assert mock_create_llm_adapter.call_args.kwargs["cwd"] == initial_kwargs["cwd"]
+        assert mock_create_llm_adapter.call_args.kwargs["max_turns"] == 1
+
+    def test_evolution_adapter_factory_uses_live_backend_without_explicit_override(self) -> None:
+        """Per-call evolution adapter factory resolves live config absent override."""
+        with (
+            patch("ouroboros.providers.create_llm_adapter") as mock_create_llm_adapter,
+            patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime,
+            patch("ouroboros.evolution.wonder.WonderEngine") as mock_wonder_engine,
+            patch("ouroboros.evolution.reflect.ReflectEngine"),
+        ):
+            mock_create_llm_adapter.return_value = MagicMock()
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="codex")
+
+            factory = mock_wonder_engine.call_args.kwargs["adapter_factory"]
+            assert mock_wonder_engine.call_args.kwargs["adapter_backend"] is None
+            factory()
+
+        assert mock_create_llm_adapter.call_args.kwargs["backend"] is None
 
     def test_opencode_backend_is_accepted_at_server_creation(self) -> None:
         """OpenCode backend is forwarded through the shared adapter factory."""
