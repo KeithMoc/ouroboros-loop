@@ -26,15 +26,35 @@ Run the upstream-sync skill to audit and merge if the user agrees.
 
 If the user says "yes / let's do it / sync it / proceed", you start at **Phase 0**. If they say "not now", acknowledge and stop — do NOT keep nagging in the same session.
 
+## Autopilot mode
+
+If the user says "autopilot", "run it end-to-end", "do the whole thing", or similar, the flow becomes non-interactive — but the **safety classifications still stand**. Autopilot does NOT mean:
+
+- Bypass the MECHANICAL/COMPLEX gate.
+- Power through a complex merge inside the session-prompt window.
+- Skip the tracking issue.
+
+Autopilot DOES mean:
+
+- Pick the obvious defaults at Phase 0 (latest `upstream/main`, named `chore/sync-upstream-<latest-tag>` for mechanical or `feat/upstream-sync-<latest-tag>` for complex, "full path").
+- Drive every phase without pausing for confirmation.
+- Capture lessons learned at the end and feed them back into this skill.
+
+The classification gate is non-negotiable. If autopilot lands on COMPLEX, the autopilot succeeds by **filing the tracking artifact and stopping**, not by forcing the merge.
+
 ## Phase 0 — Scope confirmation
 
-Before any git work, confirm with the user:
+Before any git work, confirm with the user (skip if autopilot — use defaults below):
 
 1. **Which upstream ref?** Default `upstream/main`. Confirm if the user wants a tag (e.g. `upstream/v0.32.0`) or a different branch.
 2. **Target branch?** Default: integrate via a topic branch named `chore/sync-upstream-<version-or-date>`, then PR into `main`. Never merge directly to `main` without a PR.
 3. **Time budget.** Ask whether they want the **fast path only** (skip if anything is non-mechanical) or the **full path** (write the issue and stop, or proceed if mechanical).
 
-Only proceed once these three are answered.
+Only proceed once these three are answered (or autopilot defaults apply).
+
+### Sniff test before audit
+
+Before running Phase 1, check `git rev-list --count origin/main..upstream/main`. **Heuristic: N > 50 commits = expect COMPLEX**. The probability that 50+ upstream commits leave our hot paths untouched is essentially zero on this fork. You can still run the full audit, but anchor your expectation at COMPLEX from the start.
 
 ## Phase 1 — Audit
 
@@ -79,6 +99,19 @@ This phase is conversational — propose a take, let the user steer.
 
 Classify the merge as **MECHANICAL** or **COMPLEX** using these criteria:
 
+**Always run the trial merge on a throwaway probe branch**, not on `main` and not on the future feat/ branch:
+
+```bash
+git checkout -b probe/trial-merge-<version> main
+git merge --no-commit --no-ff upstream/<ref>
+# inspect conflicts
+git merge --abort
+git checkout main
+git branch -D probe/trial-merge-<version>
+```
+
+This keeps the audit non-destructive and leaves your real branches untouched. (Learned the hard way: aborting a merge on `main` or a feat/ branch makes the next state confusing.)
+
 ### MECHANICAL — proceed to fast path
 
 All of:
@@ -101,7 +134,18 @@ Any one of:
 - Test suite fails after trial merge for non-trivial reasons.
 - The audit surfaced "we should think about this" anywhere.
 
-When uncertain, classify **COMPLEX**. The cost of a wrong "mechanical" call is much higher than the cost of writing an issue.
+#### Hot-path watchlist (shortcut to COMPLEX)
+
+Any conflict in these files is COMPLEX by default — they carry our compounding work and any disturbance there needs design review, not hunk-fixing:
+
+- `src/ouroboros/orchestrator/parallel_executor.py` (Q4 inline-QA `context_override`, Q4.1 `Complexity` adaptive routing)
+- `src/ouroboros/orchestrator/runner.py` (Q4.1 Run Summary panel, recoverable-failure flow)
+- `src/ouroboros/orchestrator/serial_executor.py` (Phase-1.5 dogfood postmortem chain)
+- `src/ouroboros/orchestrator/diff_capture.py` / `inline_qa.py` / `level_context.py` (Phase-2 Q2/Q4 features — entirely fork-local)
+- `src/ouroboros/mcp/tools/{evolution,execution}_handlers.py` (worker-cap + mode-resolution ordering — Q4.1 AC-2)
+- `src/ouroboros/config/{loader,models,__init__}.py` when upstream renames helpers (`get_skip_qa_default`, `get_parallel_default`, `get_max_decomposition_depth_default`) — every consumer needs migration
+
+When uncertain, classify **COMPLEX**. The cost of a wrong "mechanical" call is much higher than the cost of writing a tracking doc.
 
 Always abort the trial merge before moving on:
 
@@ -169,7 +213,9 @@ git rev-list --left-right --count upstream/main...origin/main
 
 The merge is a feature now. Don't merge it tonight.
 
-### Step 1 — Open a tracking issue
+### Step 1 — Open a tracking artifact
+
+**Try GitHub issue first:**
 
 ```bash
 gh issue create --repo KeithMoc/ouroboros-loop \
@@ -198,6 +244,15 @@ EOF
 )"
 ```
 
+**If `gh issue create` fails with `the '<repo>' repository has disabled issues`** (this fork has issues disabled by design — strategic notes go local), fall back to a local tracking doc under the gitignored `docs/local/` tree:
+
+```bash
+mkdir -p docs/local/upstream-sync-<version>
+# Write the same body content to docs/local/upstream-sync-<version>/TRACKING.md
+```
+
+The doc is gitignored under the `docs/local/` rule (commit `3be8ee5e`) so it stays on the maintainer's machine. Still update `docs/local/HANDOFF.md` (also gitignored) with a one-paragraph status entry pointing to the TRACKING doc, so the next session inherits the parked-work state via the `dx:handoff` convention.
+
 ### Step 2 — Treat as a feature branch
 
 - Branch: `feat/upstream-sync-<version>` (the `feat/` prefix is intentional — it's feature-grade work).
@@ -219,7 +274,13 @@ Whether mechanical or complex, after the merge lands on `origin/main`:
 1. Run the full project test suite locally.
 2. Check `git rev-list --left-right --count upstream/main...origin/main`. Left should be 0 (or just the commits upstream landed in the last hour).
 3. If GitHub UI still says "N behind" after a successful merge-commit-based PR, the fix is the same as last time: ensure local `main` has the real merge, then `git push origin main --force-with-lease`. This only happens if the PR was accidentally squashed.
-4. Update `docs/handoff/` with a one-paragraph note: version synced, mechanical vs complex, what to watch for next.
+4. Update `docs/local/HANDOFF.md` with a one-paragraph note: version synced, mechanical vs complex, what to watch for next. (The public `HANDOFF.md` stays byte-identical to upstream per the privacy convention — fork-strategic notes go local.)
+
+If the merge was parked as COMPLEX, Phase 5 still runs but only the verification of *parked* state:
+- `feat/upstream-sync-<version>` branch exists locally
+- `docs/local/upstream-sync-<version>/TRACKING.md` exists with conflict inventory
+- `docs/local/HANDOFF.md` updated with parked-status entry
+- `git rev-list --count upstream/main...origin/main` still shows the original delta (the merge has not landed yet)
 
 ## Anti-patterns — do not do these
 
@@ -249,3 +310,10 @@ git push -u origin HEAD
 # Verify post-merge
 git fetch upstream && git rev-list --left-right --count upstream/main...origin/main
 ```
+
+## Lessons learned (rolling appendix)
+
+Each completed run of this skill should add a one-bullet entry below if the run surfaced a generalizable lesson. Don't add per-merge debugging — only patterns the *next* sync should expect.
+
+- **2026-05-04 (v0.31.1 → v0.32.0, parked COMPLEX, 142 commits):** Trial merge on a `probe/` branch (not on `main`, not on `feat/`) keeps abort state out of the real branches. Issues are disabled on the fork — `gh issue create` fails with `the '<repo>' repository has disabled issues`, so tracking falls back to `docs/local/<topic>/TRACKING.md`. The `auto` workflow stack upstream is moving fast and replaced our `parent_ac_index/sub_ac_index/context_override` with a unified `ExecutionNodeIdentity`; expect more such object-of-related-things refactors in future syncs and treat them as design tasks, not hunk fixes.
+- **2026-05-01 (v0.30.0 → v0.31.1, mechanical-with-care, 35 commits):** Trial-merge "no semantic conflict" was misleading — upstream reordered worker-cap resolution before seed parsing, which contradicted our Q4.1 AC-2 ordering. Always check ordering of operations, not just file-level conflicts.
