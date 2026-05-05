@@ -615,6 +615,7 @@ class TestJsonSchemaHandling:
 
         options_call_kwargs = mock_options_cls.call_args.kwargs
         assert "allowed_tools" not in options_call_kwargs
+        assert "tools" not in options_call_kwargs
         assert options_call_kwargs["cwd"] == "/tmp/project"
         assert "Write" in options_call_kwargs["disallowed_tools"]
 
@@ -647,11 +648,106 @@ class TestJsonSchemaHandling:
 
         options_call_kwargs = mock_options_cls.call_args.kwargs
         assert options_call_kwargs["allowed_tools"] == []
+        assert options_call_kwargs["tools"] == []
         assert "Read" in options_call_kwargs["disallowed_tools"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_allowed_tools_sets_visible_sdk_tools(self) -> None:
+        """Explicit tool envelopes restrict both permissions and exposed SDK tools."""
+        allowed_tools = ["Read", "Grep", "mcp__ouroboros__qa"]
+        adapter = ClaudeCodeAdapter(allowed_tools=allowed_tools)
+        config = CompletionConfig(model="claude-sonnet-4-6")
+
+        mock_options_cls = MagicMock()
+
+        async def fake_query(*args, **kwargs):
+            msg = MagicMock()
+            type(msg).__name__ = "ResultMessage"
+            msg.structured_output = None
+            msg.result = "test response"
+            msg.is_error = False
+            yield msg
+
+        sdk_module = _make_sdk_mock(mock_options_cls, MagicMock(side_effect=fake_query))
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "claude_agent_sdk": sdk_module,
+                "claude_agent_sdk._errors": sdk_module._errors,
+            },
+        ):
+            await adapter._execute_single_request("test prompt", config)
+
+        options_call_kwargs = mock_options_cls.call_args.kwargs
+        assert options_call_kwargs["allowed_tools"] == allowed_tools
+        assert options_call_kwargs["tools"] == allowed_tools
+        assert "Read" not in options_call_kwargs["disallowed_tools"]
+        assert "Grep" not in options_call_kwargs["disallowed_tools"]
+        assert "ToolSearch" not in options_call_kwargs["tools"]
+        assert "AskUserQuestion" not in options_call_kwargs["tools"]
+        assert "Write" in options_call_kwargs["disallowed_tools"]
 
 
 class TestErrorDiagnostics:
     """Tests for error diagnostic paths in _execute_single_request."""
+
+    @pytest.mark.asyncio
+    async def test_empty_stderr_cli_process_exit_is_retried(self) -> None:
+        """Transient Claude CLI exits without stderr are retried by the shared adapter."""
+        adapter = ClaudeCodeAdapter()
+        config = CompletionConfig(model="claude-sonnet-4-6")
+        transient_error = ProviderError(
+            message="Claude Agent SDK request failed: Command failed with exit code 1",
+            details={
+                "error_type": "ProcessError",
+                "stderr": "",
+                "configured_cli_path": "/Applications/cmux.app/Contents/Resources/bin/claude",
+            },
+        )
+
+        adapter._execute_single_request = AsyncMock(
+            side_effect=[
+                Result.err(transient_error),
+                _ok_completion_result("seed requirements"),
+            ]
+        )
+
+        with patch("ouroboros.providers.claude_code_adapter.asyncio.sleep", new=AsyncMock()):
+            result = await adapter._complete_with_transient_retry(
+                "test prompt",
+                config,
+                system_prompt=None,
+            )
+
+        assert result.is_ok
+        assert result.value.content == "seed requirements"
+        assert adapter._execute_single_request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stderr_cli_process_exit_is_not_retried(self) -> None:
+        """Actionable CLI failures with stderr should surface immediately."""
+        adapter = ClaudeCodeAdapter()
+        config = CompletionConfig(model="claude-sonnet-4-6")
+        auth_error = ProviderError(
+            message="Claude Agent SDK request failed: Command failed with exit code 1",
+            details={
+                "error_type": "ProcessError",
+                "stderr": "error: authentication required",
+            },
+        )
+
+        adapter._execute_single_request = AsyncMock(return_value=Result.err(auth_error))
+
+        result = await adapter._complete_with_transient_retry(
+            "test prompt",
+            config,
+            system_prompt=None,
+        )
+
+        assert result.is_err
+        assert result.error is auth_error
+        adapter._execute_single_request.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_sdk_exception_produces_provider_error_with_details(self) -> None:
@@ -682,6 +778,8 @@ class TestErrorDiagnostics:
         assert isinstance(error, ProviderError)
         assert "SDK connection lost" in error.message
         assert error.details["error_type"] == "RuntimeError"
+        assert "traceback" in error.details
+        assert "RuntimeError: SDK connection lost" in error.details["traceback"]
 
     @pytest.mark.asyncio
     async def test_sdk_exception_includes_stderr_in_details(self) -> None:
@@ -818,6 +916,135 @@ class TestErrorDiagnostics:
         assert "retry" in result.error.message.lower()
 
     @pytest.mark.asyncio
+    async def test_error_max_turns_uses_streamed_partial_content(self) -> None:
+        """error_max_turns with assistant text returns the partial result."""
+        adapter = ClaudeCodeAdapter(max_turns=5)
+        config = CompletionConfig(model="claude-sonnet-4-6")
+
+        mock_options_cls = MagicMock()
+
+        class TextBlock:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        async def partial_then_max_turns_query(*args, **kwargs):
+            assistant_msg = MagicMock()
+            type(assistant_msg).__name__ = "AssistantMessage"
+            assistant_msg.content = [TextBlock("What should the app do first?")]
+            yield assistant_msg
+
+            result_msg = MagicMock()
+            type(result_msg).__name__ = "ResultMessage"
+            result_msg.structured_output = None
+            result_msg.result = ""
+            result_msg.is_error = True
+            result_msg.subtype = "error_max_turns"
+            result_msg.errors = ["Reached maximum number of turns (5)"]
+            result_msg.stop_reason = "max_turns"
+            yield result_msg
+
+        sdk_module = _make_sdk_mock(
+            mock_options_cls, MagicMock(side_effect=partial_then_max_turns_query)
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "claude_agent_sdk": sdk_module,
+                "claude_agent_sdk._errors": sdk_module._errors,
+            },
+        ):
+            result = await adapter._execute_single_request("test prompt", config)
+
+        assert result.is_ok
+        assert result.value.content == "What should the app do first?"
+        assert result.value.finish_reason == "length"
+        assert result.value.raw_response["subtype"] == "error_max_turns"
+        assert result.value.raw_response["stop_reason"] == "max_turns"
+        assert result.value.raw_response["errors"] == ["Reached maximum number of turns (5)"]
+        assert result.value.raw_response["partial_result"] is True
+
+    @pytest.mark.asyncio
+    async def test_error_max_turns_without_partial_content_remains_error(self) -> None:
+        """error_max_turns still fails when there is no usable content."""
+        adapter = ClaudeCodeAdapter(max_turns=5)
+        config = CompletionConfig(model="claude-sonnet-4-6")
+
+        mock_options_cls = MagicMock()
+
+        async def max_turns_only_query(*args, **kwargs):
+            result_msg = MagicMock()
+            type(result_msg).__name__ = "ResultMessage"
+            result_msg.structured_output = None
+            result_msg.result = ""
+            result_msg.is_error = True
+            result_msg.subtype = "error_max_turns"
+            result_msg.errors = ["Reached maximum number of turns (5)"]
+            result_msg.stop_reason = "tool_use"
+            yield result_msg
+
+        sdk_module = _make_sdk_mock(mock_options_cls, MagicMock(side_effect=max_turns_only_query))
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "claude_agent_sdk": sdk_module,
+                "claude_agent_sdk._errors": sdk_module._errors,
+            },
+        ):
+            result = await adapter._execute_single_request("test prompt", config)
+
+        assert result.is_err
+        assert result.error.details["subtype"] == "error_max_turns"
+        assert result.error.details["stop_reason"] == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_error_max_turns_rejects_tool_use_partial(self) -> None:
+        """Tool-use-stopped partials are not guessed into final answers."""
+        adapter = ClaudeCodeAdapter(max_turns=5)
+        config = CompletionConfig(model="claude-sonnet-4-6")
+
+        mock_options_cls = MagicMock()
+
+        class TextBlock:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        async def preamble_then_max_turns_query(*args, **kwargs):
+            assistant_msg = MagicMock()
+            type(assistant_msg).__name__ = "AssistantMessage"
+            assistant_msg.content = [TextBlock("What should the app do first?")]
+            yield assistant_msg
+
+            result_msg = MagicMock()
+            type(result_msg).__name__ = "ResultMessage"
+            result_msg.structured_output = None
+            result_msg.result = ""
+            result_msg.is_error = True
+            result_msg.subtype = "error_max_turns"
+            result_msg.errors = ["Reached maximum number of turns (5)"]
+            result_msg.stop_reason = "tool_use"
+            yield result_msg
+
+        sdk_module = _make_sdk_mock(
+            mock_options_cls, MagicMock(side_effect=preamble_then_max_turns_query)
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "claude_agent_sdk": sdk_module,
+                "claude_agent_sdk._errors": sdk_module._errors,
+            },
+        ):
+            result = await adapter._execute_single_request("test prompt", config)
+
+        assert result.is_err
+        assert "usable final response" in result.error.message
+        assert result.error.details["partial_rejected"] is True
+        assert result.error.details["partial_content"] == "What should the app do first?"
+
+    @pytest.mark.asyncio
     async def test_sdk_error_message_includes_stderr(self) -> None:
         """SDK is_error result includes stderr in ProviderError details."""
         adapter = ClaudeCodeAdapter()
@@ -871,6 +1098,7 @@ class TestProviderErrorFormatDetails:
                 "session_id": "sess_abc",
                 "claudecode_present": True,
                 "claude_code_entrypoint": "sdk-py",
+                "configured_cli_path": "/Applications/cmux.app/Contents/Resources/bin/claude",
                 "stderr": "error: auth failed",
             },
         )
@@ -878,6 +1106,9 @@ class TestProviderErrorFormatDetails:
         assert "SDK failed" in rendered
         assert "error_type: RuntimeError" in rendered
         assert "session_id: sess_abc" in rendered
+        assert (
+            "configured_cli_path: /Applications/cmux.app/Contents/Resources/bin/claude" in rendered
+        )
         assert "stderr tail:\nerror: auth failed" in rendered
 
     def test_format_details_without_details(self) -> None:

@@ -62,6 +62,7 @@ from ouroboros.orchestrator.events import (
 )
 from ouroboros.orchestrator.execution_runtime_scope import (
     ACRuntimeIdentity,
+    ExecutionNodeIdentity,
     build_ac_runtime_identity,
     build_ac_runtime_scope,
     build_level_coordinator_runtime_scope,
@@ -116,6 +117,16 @@ MIN_SUB_ACS = 2
 MAX_SUB_ACS = 5
 DECOMPOSITION_TIMEOUT_SECONDS = 60.0
 _IMPLEMENTATION_SESSION_KIND = "implementation_session"
+
+
+def _subtask_event_label(content: str, *, max_length: int = 50) -> str:
+    """Return compact display text without losing full event content."""
+    normalized = " ".join(content.split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[:max_length]
+
+
 _REUSABLE_RUNTIME_EVENT_TYPES = frozenset(
     {
         "execution.session.recovered",
@@ -134,9 +145,29 @@ _AC_RUNTIME_OWNERSHIP_METADATA_KEYS = frozenset(
         "ac_id",
         "ac_index",
         "attempt_number",
+        "depth",
+        "display_path",
+        "execution_id",
+        "identity_model",
+        "legacy_node_id",
+        "legacy_node_aliases",
+        "legacy_parent_node_id",
+        "legacy_parent_node_aliases",
+        "legacy_session_scope_id",
+        "legacy_session_scope_ids",
+        "legacy_session_state_path",
+        "legacy_session_state_paths",
+        "node_kind",
+        "node_id",
+        "ordinal",
         "parent_ac_index",
+        "parent_node_id",
+        "path",
         "retry_attempt",
+        "root_ac_index",
+        "root_ac_number",
         "scope",
+        "schema_version",
         "session_attempt_id",
         "session_role",
         "session_scope_id",
@@ -148,8 +179,16 @@ _AC_RUNTIME_SCOPE_METADATA_KEYS = frozenset(
     {
         "ac_id",
         "ac_index",
+        "execution_id",
+        "identity_model",
+        "node_kind",
+        "node_id",
         "parent_ac_index",
+        "parent_node_id",
+        "path",
+        "root_ac_index",
         "scope",
+        "schema_version",
         "session_role",
         "session_scope_id",
         "session_state_path",
@@ -551,15 +590,69 @@ class ParallelACExecutor:
         is_sub_ac: bool,
         parent_ac_index: int | None,
         sub_ac_index: int | None,
-        retry_attempt: int,  # noqa: ARG004
+        node_identity: ExecutionNodeIdentity | None,
+        retry_attempt: int,
     ) -> dict[str, Any]:
         """Build metadata that binds a runtime handle to a single AC execution scope."""
-        return ACRuntimeIdentity(
-            runtime_scope=runtime_scope,
-            ac_index=None if is_sub_ac else ac_index,
-            parent_ac_index=parent_ac_index if is_sub_ac else None,
-            sub_ac_index=sub_ac_index if is_sub_ac else None,
-        ).to_metadata()
+        identity = build_ac_runtime_identity(
+            ac_index,
+            execution_context_id=node_identity.execution_context_id
+            if node_identity is not None
+            else None,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        if identity.runtime_scope != runtime_scope:
+            identity = replace(identity, runtime_scope=runtime_scope)
+        return identity.to_metadata()
+
+    @staticmethod
+    def _metadata_value_matches_expected_scope(
+        key: str,
+        observed_value: Any,
+        expected_metadata: dict[str, Any],
+    ) -> bool:
+        """Return True when observed metadata matches canonical or legacy scope."""
+        if observed_value == expected_metadata.get(key):
+            return True
+
+        if key in {"ac_id", "session_scope_id"}:
+            legacy_scope_ids = expected_metadata.get("legacy_session_scope_ids")
+            if isinstance(legacy_scope_ids, (list, tuple)) and observed_value in legacy_scope_ids:
+                return True
+            return observed_value == expected_metadata.get("legacy_session_scope_id")
+
+        if key == "session_state_path":
+            legacy_state_paths = expected_metadata.get("legacy_session_state_paths")
+            if (
+                isinstance(legacy_state_paths, (list, tuple))
+                and observed_value in legacy_state_paths
+            ):
+                return True
+            return observed_value == expected_metadata.get("legacy_session_state_path")
+
+        if key == "node_id":
+            legacy_node_aliases = expected_metadata.get("legacy_node_aliases")
+            if (
+                isinstance(legacy_node_aliases, (list, tuple))
+                and observed_value in legacy_node_aliases
+            ):
+                return True
+            return observed_value == expected_metadata.get("legacy_node_id")
+
+        if key == "parent_node_id":
+            legacy_parent_node_aliases = expected_metadata.get("legacy_parent_node_aliases")
+            if (
+                isinstance(legacy_parent_node_aliases, (list, tuple))
+                and observed_value in legacy_parent_node_aliases
+            ):
+                return True
+            return observed_value == expected_metadata.get("legacy_parent_node_id")
+
+        return False
 
     @staticmethod
     def _runtime_handle_claims_foreign_ac_scope(
@@ -574,8 +667,11 @@ class ParallelACExecutor:
 
         metadata = runtime_handle.metadata
         for key in _AC_RUNTIME_SCOPE_METADATA_KEYS:
-            expected_value = expected_metadata.get(key)
-            if key in metadata and metadata.get(key) != expected_value:
+            if key in metadata and not ParallelACExecutor._metadata_value_matches_expected_scope(
+                key,
+                metadata.get(key),
+                expected_metadata,
+            ):
                 return True
 
         if is_sub_ac:
@@ -603,7 +699,11 @@ class ParallelACExecutor:
             if key not in metadata:
                 continue
             matched_scope_key = True
-            if metadata.get(key) != expected_metadata.get(key):
+            if not cls._metadata_value_matches_expected_scope(
+                key,
+                metadata.get(key),
+                expected_metadata,
+            ):
                 return False
 
         if not matched_scope_key:
@@ -662,6 +762,7 @@ class ParallelACExecutor:
         is_sub_ac: bool,
         parent_ac_index: int | None,
         sub_ac_index: int | None,
+        node_identity: ExecutionNodeIdentity | None,
         retry_attempt: int,
         source: str,
         require_resume_scope_match: bool,
@@ -676,6 +777,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
 
@@ -736,6 +838,7 @@ class ParallelACExecutor:
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         retry_attempt: int = 0,
         tool_catalog: tuple[MCPToolDefinition, ...] | None = None,
     ) -> RuntimeHandle | None:
@@ -750,6 +853,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
         cached_seeded_handle = self._ac_runtime_handles.get(runtime_identity.cache_key)
@@ -760,6 +864,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
             source="cache",
             require_resume_scope_match=True,
@@ -835,6 +940,7 @@ class ParallelACExecutor:
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         retry_attempt: int = 0,
     ) -> RuntimeHandle | None:
         """Load the latest reusable AC-scoped runtime handle from execution events."""
@@ -844,6 +950,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
         cached_runtime_handle = self._ac_runtime_handles.get(runtime_identity.cache_key)
@@ -854,6 +961,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
             source="cache",
             require_resume_scope_match=True,
@@ -863,73 +971,80 @@ class ParallelACExecutor:
         if cached_handle is not None:
             return cached_handle
 
-        try:
-            events = await self._event_store.replay(
-                runtime_identity.runtime_scope.aggregate_type,
-                runtime_identity.session_scope_id,
-            )
-        except Exception:
-            log.exception(
-                "parallel_executor.ac.runtime_handle_load_failed",
-                ac_index=ac_index,
-                is_sub_ac=is_sub_ac,
-                parent_ac_index=parent_ac_index,
-                sub_ac_index=sub_ac_index,
-                retry_attempt=retry_attempt,
-                session_scope_id=runtime_identity.session_scope_id,
-            )
-            return None
-
-        for event in reversed(events):
-            event_data = event.data if isinstance(event.data, dict) else {}
-            if not self._event_matches_ac_runtime_identity(event_data, runtime_identity):
-                continue
-
-            if event.type in _NON_REUSABLE_RUNTIME_EVENT_TYPES:
-                self._forget_ac_runtime_handle(
-                    ac_index,
-                    execution_context_id=execution_context_id,
+        candidate_scope_ids = (
+            runtime_identity.session_scope_id,
+            *runtime_identity.legacy_session_scope_ids,
+        )
+        for candidate_scope_id in dict.fromkeys(candidate_scope_ids):
+            try:
+                events = await self._event_store.replay(
+                    runtime_identity.runtime_scope.aggregate_type,
+                    candidate_scope_id,
+                )
+            except Exception:
+                log.exception(
+                    "parallel_executor.ac.runtime_handle_load_failed",
+                    ac_index=ac_index,
                     is_sub_ac=is_sub_ac,
                     parent_ac_index=parent_ac_index,
                     sub_ac_index=sub_ac_index,
                     retry_attempt=retry_attempt,
-                )
-                return None
-            if event.type not in _REUSABLE_RUNTIME_EVENT_TYPES:
-                continue
-
-            runtime_payload = event_data.get("runtime")
-            try:
-                runtime_handle = RuntimeHandle.from_dict(runtime_payload)
-            except ValueError as exc:
-                log.warning(
-                    "parallel_executor.persisted_runtime_handle_invalid",
-                    aggregate_id=event.aggregate_id,
-                    event_type=event.type,
-                    error=str(exc),
-                    runtime_keys=sorted(runtime_payload)
-                    if isinstance(runtime_payload, dict)
-                    else None,
+                    session_scope_id=candidate_scope_id,
                 )
                 continue
-            if runtime_handle is None:
-                continue
-            runtime_handle = self._normalize_ac_runtime_handle(
-                runtime_handle,
-                runtime_scope=runtime_identity.runtime_scope,
-                ac_index=ac_index,
-                is_sub_ac=is_sub_ac,
-                parent_ac_index=parent_ac_index,
-                sub_ac_index=sub_ac_index,
-                retry_attempt=retry_attempt,
-                source="persisted_event",
-                require_resume_scope_match=True,
-            )
-            if runtime_handle is None:
-                continue
 
-            self._ac_runtime_handles[runtime_identity.cache_key] = runtime_handle
-            return runtime_handle
+            for event in reversed(events):
+                event_data = event.data if isinstance(event.data, dict) else {}
+                if not self._event_matches_ac_runtime_identity(event_data, runtime_identity):
+                    continue
+
+                if event.type in _NON_REUSABLE_RUNTIME_EVENT_TYPES:
+                    self._forget_ac_runtime_handle(
+                        ac_index,
+                        execution_context_id=execution_context_id,
+                        is_sub_ac=is_sub_ac,
+                        parent_ac_index=parent_ac_index,
+                        sub_ac_index=sub_ac_index,
+                        node_identity=node_identity,
+                        retry_attempt=retry_attempt,
+                    )
+                    return None
+                if event.type not in _REUSABLE_RUNTIME_EVENT_TYPES:
+                    continue
+
+                runtime_payload = event_data.get("runtime")
+                try:
+                    runtime_handle = RuntimeHandle.from_dict(runtime_payload)
+                except ValueError as exc:
+                    log.warning(
+                        "parallel_executor.persisted_runtime_handle_invalid",
+                        aggregate_id=event.aggregate_id,
+                        event_type=event.type,
+                        error=str(exc),
+                        runtime_keys=sorted(runtime_payload)
+                        if isinstance(runtime_payload, dict)
+                        else None,
+                    )
+                    continue
+                if runtime_handle is None:
+                    continue
+                runtime_handle = self._normalize_ac_runtime_handle(
+                    runtime_handle,
+                    runtime_scope=runtime_identity.runtime_scope,
+                    ac_index=ac_index,
+                    is_sub_ac=is_sub_ac,
+                    parent_ac_index=parent_ac_index,
+                    sub_ac_index=sub_ac_index,
+                    node_identity=node_identity,
+                    retry_attempt=retry_attempt,
+                    source="persisted_event",
+                    require_resume_scope_match=True,
+                )
+                if runtime_handle is None:
+                    continue
+
+                self._ac_runtime_handles[runtime_identity.cache_key] = runtime_handle
+                return runtime_handle
 
         return None
 
@@ -942,6 +1057,7 @@ class ParallelACExecutor:
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         retry_attempt: int = 0,
     ) -> RuntimeHandle | None:
         """Cache the latest reusable AC-scoped runtime handle."""
@@ -954,6 +1070,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
         normalized_handle = self._normalize_ac_runtime_handle(
@@ -963,6 +1080,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
             source="runtime",
             require_resume_scope_match=False,
@@ -978,6 +1096,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
             source="cache",
             require_resume_scope_match=False,
@@ -998,6 +1117,7 @@ class ParallelACExecutor:
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         retry_attempt: int = 0,
     ) -> None:
         """Drop live cached handle state once an AC scope is no longer resumable."""
@@ -1007,6 +1127,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
         self._ac_runtime_handles.pop(runtime_identity.cache_key, None)
@@ -1047,6 +1168,7 @@ class ParallelACExecutor:
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         retry_attempt: int = 0,
     ) -> ACRuntimeIdentity:
         """Return the normalized AC runtime identity for one implementation attempt."""
@@ -1056,6 +1178,7 @@ class ParallelACExecutor:
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
 
@@ -1083,7 +1206,11 @@ class ParallelACExecutor:
                 continue
 
             matched_identity_key = True
-            if observed_value != expected_metadata.get(key):
+            if not ParallelACExecutor._metadata_value_matches_expected_scope(
+                key,
+                observed_value,
+                expected_metadata,
+            ):
                 return False
 
         return matched_identity_key
@@ -1312,6 +1439,7 @@ class ParallelACExecutor:
         runtime_identity: ACRuntimeIdentity,
         ac_content: str,
         runtime_handle: RuntimeHandle | None,
+        execution_id: str | None = None,
         session_id: str | None = None,
         result_summary: str | None = None,
         success: bool | None = None,
@@ -1322,18 +1450,21 @@ class ParallelACExecutor:
 
         effective_session_id = session_id or self._runtime_resume_session_id(runtime_handle)
         server_session_id = runtime_handle.server_session_id if runtime_handle is not None else None
+        identity_metadata = runtime_identity.to_metadata()
 
         event = BaseEvent(
             type=event_type,
             aggregate_type=runtime_identity.runtime_scope.aggregate_type,
             aggregate_id=runtime_identity.session_scope_id,
             data={
+                **identity_metadata,
                 "ac_id": runtime_identity.ac_id,
                 "acceptance_criterion": ac_content,
                 "scope": runtime_identity.scope,
                 "session_role": runtime_identity.session_role,
                 "retry_attempt": runtime_identity.retry_attempt,
                 "attempt_number": runtime_identity.attempt_number,
+                "execution_id": execution_id,
                 "session_scope_id": runtime_identity.session_scope_id,
                 "session_attempt_id": runtime_identity.session_attempt_id,
                 "session_state_path": runtime_identity.session_state_path,
@@ -2142,6 +2273,7 @@ class ParallelACExecutor:
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
         context_override: str | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
     ) -> ACExecutionResult:
         """Execute a single AC via the sole recursive AC execution entry point.
 
@@ -2166,11 +2298,19 @@ class ParallelACExecutor:
             ACExecutionResult for this AC.
         """
         start_time = datetime.now(UTC)
+        execution_context_id = execution_id or session_id
+        if node_identity is None:
+            node_identity = ExecutionNodeIdentity.root(
+                execution_context_id=execution_context_id,
+                ac_index=ac_index,
+            )
 
         log.info(
             "parallel_executor.ac.started",
             parent_session_id=session_id,
             ac_index=ac_index,
+            node_id=node_identity.node_id,
+            display_path=node_identity.display_path,
             depth=depth,
         )
 
@@ -2179,7 +2319,12 @@ class ParallelACExecutor:
 
         # Try decomposition if enabled and not too deep
         if self._enable_decomposition and depth < self._max_decomposition_depth:
-            self._console.print(f"  [dim]AC {ac_index + 1}: Analyzing complexity...[/dim]")
+            display_label = (
+                f"AC {node_identity.display_path}"
+                if node_identity.depth == 0
+                else f"Sub-AC {node_identity.display_path}"
+            )
+            self._console.print(f"  [dim]{display_label}: Analyzing complexity...[/dim]")
             self._flush_console()
             sub_acs, atomic_complexity = await self._try_decompose_ac(
                 ac_content=ac_content,
@@ -2187,23 +2332,26 @@ class ParallelACExecutor:
                 seed_goal=seed_goal,
                 tools=tools,
                 system_prompt=system_prompt,
+                node_identity=node_identity,
             )
 
             if sub_acs and len(sub_acs) >= MIN_SUB_ACS:
                 # Decomposition successful - execute Sub-ACs in parallel
                 self._console.print(
-                    f"  [cyan]AC {ac_index + 1} → Decomposed into {len(sub_acs)} Sub-ACs (parallel)[/cyan]"
+                    f"  [cyan]{display_label} → Decomposed into {len(sub_acs)} Sub-ACs (parallel)[/cyan]"
                 )
                 self._flush_console()
 
                 # Emit decomposition event for TUI
                 for i, sub_ac in enumerate(sub_acs):
+                    child_node_identity = node_identity.child(i)
                     await self._emit_subtask_event(
                         execution_id=execution_id,
                         ac_index=ac_index,
                         sub_task_index=i + 1,
-                        sub_task_desc=sub_ac[:50],
+                        sub_task_content=sub_ac,
                         status="pending",
+                        node_identity=child_node_identity,
                     )
 
                 # Execute Sub-ACs sequentially (memory optimization) while
@@ -2217,19 +2365,19 @@ class ParallelACExecutor:
 
                 for idx, sub_ac in enumerate(sub_acs):
                     try:
-                        # Only depth-0 → depth-1 transitions flag children as sub-ACs
-                        # with parent_ac_index/sub_ac_index. Deeper descendants
-                        # (depth>=2) retain their own ac_index and are treated as
-                        # independent nodes for runtime identity tracking; downstream
-                        # tooling that needs full ancestry should traverse via
-                        # decomposition events rather than parent_ac_index metadata.
-                        child_is_sub_ac = depth == 0 and not is_sub_ac
+                        child_node_identity = node_identity.child(idx)
+                        child_is_sub_ac = child_node_identity.depth > 0
+                        legacy_parent_ac_index = (
+                            node_identity.root_ac_index if child_node_identity.depth == 1 else None
+                        )
+                        legacy_sub_ac_index = idx if child_node_identity.depth == 1 else None
                         await self._emit_subtask_event(
                             execution_id=execution_id,
                             ac_index=ac_index,
                             sub_task_index=idx + 1,
-                            sub_task_desc=sub_ac[:50],
+                            sub_task_content=sub_ac,
                             status="executing",
+                            node_identity=child_node_identity,
                         )
 
                         sub_results[idx] = await self._execute_single_ac(
@@ -2246,9 +2394,10 @@ class ParallelACExecutor:
                             retry_attempt=retry_attempt,
                             execution_counters=execution_counters,
                             is_sub_ac=child_is_sub_ac,
-                            parent_ac_index=ac_index if child_is_sub_ac else None,
-                            sub_ac_index=idx if child_is_sub_ac else None,
+                            parent_ac_index=legacy_parent_ac_index,
+                            sub_ac_index=legacy_sub_ac_index,
                             context_override=context_override,
+                            node_identity=child_node_identity,
                         )
                     except BaseException as e:
                         if isinstance(e, anyio.get_cancelled_exc_class()):
@@ -2283,12 +2432,14 @@ class ParallelACExecutor:
                 # Update TUI with final statuses
                 for i, result in enumerate(final_sub_results):
                     status = "completed" if result.success else "failed"
+                    child_node_identity = node_identity.child(i)
                     await self._emit_subtask_event(
                         execution_id=execution_id,
                         ac_index=ac_index,
                         sub_task_index=i + 1,
-                        sub_task_desc=sub_acs[i][:50],
+                        sub_task_content=sub_acs[i],
                         status=status,
+                        node_identity=child_node_identity,
                     )
 
                 duration = (datetime.now(UTC) - start_time).total_seconds()
@@ -2334,8 +2485,6 @@ class ParallelACExecutor:
         # decomposition/dispatch branch above.
         atomic_retry_attempt = retry_attempt
         max_attempts = retry_attempt + MAX_STALL_RETRIES + 1
-        execution_context_id = execution_id or session_id
-
         while True:
             atomic_result = await self._execute_atomic_ac(
                 ac_index=ac_index,
@@ -2357,6 +2506,7 @@ class ParallelACExecutor:
                 sub_ac_index=sub_ac_index,
                 complexity=atomic_complexity,
                 context_override=context_override,
+                node_identity=node_identity,
             )
             if atomic_result.error != _STALL_SENTINEL:
                 if decomposition_depth_warning:
@@ -2369,20 +2519,22 @@ class ParallelACExecutor:
                 is_sub_ac=is_sub_ac,
                 parent_ac_index=parent_ac_index,
                 sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
                 retry_attempt=atomic_retry_attempt,
             )
             should_retry = atomic_retry_attempt - retry_attempt < MAX_STALL_RETRIES
-            await self._safe_emit_event(
-                create_ac_stall_detected_event(
-                    session_id=session_id,
-                    ac_index=ac_index,
-                    ac_id=runtime_identity.ac_id,
-                    silent_seconds=STALL_TIMEOUT_SECONDS,
-                    attempt=runtime_identity.attempt_number,
-                    max_attempts=max_attempts,
-                    action="restart" if should_retry else "abandon",
-                )
+            stall_event = create_ac_stall_detected_event(
+                session_id=session_id,
+                ac_index=ac_index,
+                ac_id=runtime_identity.ac_id,
+                silent_seconds=STALL_TIMEOUT_SECONDS,
+                attempt=runtime_identity.attempt_number,
+                max_attempts=max_attempts,
+                action="restart" if should_retry else "abandon",
             )
+            if node_identity is not None:
+                stall_event.data.update(node_identity.to_event_metadata())
+            await self._safe_emit_event(stall_event)
 
             if not should_retry:
                 log.error(
@@ -2409,6 +2561,7 @@ class ParallelACExecutor:
         seed_goal: str,
         tools: list[str],
         system_prompt: str,
+        node_identity: ExecutionNodeIdentity | None = None,
     ) -> tuple[list[str] | None, Complexity]:
         """Ask Claude to decompose AC into Sub-ACs if complex.
 
@@ -2420,12 +2573,17 @@ class ParallelACExecutor:
             "normal", or "complex") — it defaults to "normal" when unknown and
             feeds adaptive executor model routing downstream.
         """
+        ac_label = (
+            f"AC #{node_identity.display_path}"
+            if node_identity is not None
+            else f"AC #{ac_index + 1}"
+        )
         decompose_prompt = f"""Analyze this acceptance criterion and determine if it should be decomposed.
 
 ## Goal Context
 {seed_goal}
 
-## Acceptance Criterion (AC #{ac_index + 1})
+## Acceptance Criterion ({ac_label})
 {ac_content}
 
 ## Instructions
@@ -2926,6 +3084,7 @@ Respond with ONLY the JSON object, nothing else.
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         level_contexts: list[LevelContext] | None = None,
         sibling_acs: list[str] | None = None,
         retry_attempt: int = 0,
@@ -2954,7 +3113,14 @@ Respond with ONLY the JSON object, nothing else.
         )
 
         # Build prompt
-        if is_sub_ac:
+        if node_identity is not None:
+            label = (
+                f"AC {node_identity.display_path}"
+                if node_identity.depth == 0
+                else f"Sub-AC {node_identity.display_path}"
+            )
+            indent = "    " if node_identity.depth > 0 else "  "
+        elif is_sub_ac:
             label = f"Sub-AC {sub_ac_index + 1} of AC {parent_ac_index + 1}"
             indent = "    "
         else:
@@ -3034,6 +3200,7 @@ When complete, explicitly state: [TASK_COMPLETE]
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
         if persisted_runtime_handle is not None:
@@ -3044,6 +3211,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                 is_sub_ac=is_sub_ac,
                 parent_ac_index=parent_ac_index,
                 sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
                 retry_attempt=retry_attempt,
             )
         runtime_handle = self._build_ac_runtime_handle(
@@ -3052,6 +3220,7 @@ When complete, explicitly state: [TASK_COMPLETE]
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
             tool_catalog=tool_catalog,
         )
@@ -3061,6 +3230,7 @@ When complete, explicitly state: [TASK_COMPLETE]
             is_sub_ac=is_sub_ac,
             parent_ac_index=parent_ac_index,
             sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
             retry_attempt=retry_attempt,
         )
         lifecycle_event_type = (
@@ -3099,6 +3269,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                             is_sub_ac=is_sub_ac,
                             parent_ac_index=parent_ac_index,
                             sub_ac_index=sub_ac_index,
+                            node_identity=node_identity,
                             retry_attempt=retry_attempt,
                         )
 
@@ -3126,6 +3297,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                                     runtime_identity=runtime_identity,
                                     ac_content=ac_content,
                                     runtime_handle=runtime_handle,
+                                    execution_id=execution_context_id,
                                     session_id=ac_session_id,
                                 )
                                 emitted_recovery_turn_ids.add(replacement_turn_id)
@@ -3142,15 +3314,16 @@ When complete, explicitly state: [TASK_COMPLETE]
                     now = time.monotonic()
                     if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                         ac_id = runtime_identity.ac_id
-                        await self._safe_emit_event(
-                            create_heartbeat_event(
-                                session_id=session_id,
-                                ac_index=ac_index,
-                                ac_id=ac_id,
-                                elapsed_seconds=now - exec_start,
-                                message_count=message_count,
-                            )
+                        heartbeat_event = create_heartbeat_event(
+                            session_id=session_id,
+                            ac_index=ac_index,
+                            ac_id=ac_id,
+                            elapsed_seconds=now - exec_start,
+                            message_count=message_count,
                         )
+                        if node_identity is not None:
+                            heartbeat_event.data.update(node_identity.to_event_metadata())
+                        await self._safe_emit_event(heartbeat_event)
                         last_heartbeat = now
 
                     projected = project_runtime_message(message)
@@ -3162,6 +3335,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                             runtime_identity=runtime_identity,
                             ac_content=ac_content,
                             runtime_handle=runtime_handle,
+                            execution_id=execution_context_id,
                             session_id=persisted_session_id,
                         )
                         lifecycle_emitted = True
@@ -3172,6 +3346,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                             is_sub_ac=is_sub_ac,
                             parent_ac_index=parent_ac_index,
                             sub_ac_index=sub_ac_index,
+                            node_identity=node_identity,
                             retry_attempt=retry_attempt,
                         )
 
@@ -3217,11 +3392,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                             aggregate_type=runtime_identity.runtime_scope.aggregate_type,
                             aggregate_id=runtime_identity.session_scope_id,
                             data={
-                                "ac_id": runtime_identity.ac_id,
-                                "retry_attempt": runtime_identity.retry_attempt,
-                                "attempt_number": runtime_identity.attempt_number,
-                                "session_scope_id": runtime_identity.session_scope_id,
-                                "session_attempt_id": runtime_identity.session_attempt_id,
+                                **runtime_identity.to_metadata(),
                                 "tool_name": projected.tool_name,
                                 "tool_detail": tool_detail,
                                 "tool_input": tool_input,
@@ -3238,11 +3409,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                             aggregate_type=runtime_identity.runtime_scope.aggregate_type,
                             aggregate_id=runtime_identity.session_scope_id,
                             data={
-                                "ac_id": runtime_identity.ac_id,
-                                "retry_attempt": runtime_identity.retry_attempt,
-                                "attempt_number": runtime_identity.attempt_number,
-                                "session_scope_id": runtime_identity.session_scope_id,
-                                "session_attempt_id": runtime_identity.session_attempt_id,
+                                **runtime_identity.to_metadata(),
                                 "tool_name": projected.tool_name,
                                 "tool_result_text": projected.content,
                                 **self._runtime_event_metadata(message),
@@ -3258,11 +3425,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                             aggregate_type=runtime_identity.runtime_scope.aggregate_type,
                             aggregate_id=runtime_identity.session_scope_id,
                             data={
-                                "ac_id": runtime_identity.ac_id,
-                                "retry_attempt": runtime_identity.retry_attempt,
-                                "attempt_number": runtime_identity.attempt_number,
-                                "session_scope_id": runtime_identity.session_scope_id,
-                                "session_attempt_id": runtime_identity.session_attempt_id,
+                                **runtime_identity.to_metadata(),
                                 "thinking_text": projected.thinking,
                                 **self._runtime_event_metadata(message),
                             },
@@ -3303,6 +3466,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                 is_sub_ac=is_sub_ac,
                 parent_ac_index=parent_ac_index,
                 sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
                 retry_attempt=retry_attempt,
             )
 
@@ -3315,6 +3479,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                 runtime_identity=runtime_identity,
                 ac_content=ac_content,
                 runtime_handle=runtime_handle,
+                execution_id=execution_context_id,
                 session_id=ac_session_id,
                 result_summary=final_message or None,
                 success=success,
@@ -3354,6 +3519,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                 is_sub_ac=is_sub_ac,
                 parent_ac_index=parent_ac_index,
                 sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
                 retry_attempt=retry_attempt,
             )
             await self._emit_ac_runtime_event(
@@ -3361,6 +3527,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                 runtime_identity=runtime_identity,
                 ac_content=ac_content,
                 runtime_handle=runtime_handle,
+                execution_id=execution_context_id,
                 session_id=ac_session_id,
                 success=False,
                 error=str(e),
@@ -3398,6 +3565,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                     is_sub_ac=is_sub_ac,
                     parent_ac_index=parent_ac_index,
                     sub_ac_index=sub_ac_index,
+                    node_identity=node_identity,
                     retry_attempt=retry_attempt,
                 )
 
@@ -3406,8 +3574,9 @@ When complete, explicitly state: [TASK_COMPLETE]
         execution_id: str,
         ac_index: int,
         sub_task_index: int,
-        sub_task_desc: str,
+        sub_task_content: str,
         status: str,
+        node_identity: ExecutionNodeIdentity | None = None,
     ) -> None:
         """Emit sub-task event for TUI tree updates.
 
@@ -3417,15 +3586,40 @@ When complete, explicitly state: [TASK_COMPLETE]
         from ouroboros.events.base import BaseEvent
 
         ac_index_1 = ac_index + 1  # 0-based → 1-based for TUI node keys
+        label = _subtask_event_label(sub_task_content)
+        node_metadata = node_identity.to_event_metadata() if node_identity is not None else {}
+        node_event_type = (
+            "execution.node.created" if status == "pending" else "execution.node.updated"
+        )
+        if node_identity is not None:
+            node_event = BaseEvent(
+                type=node_event_type,
+                aggregate_type="execution",
+                aggregate_id=execution_id,
+                data={
+                    **node_metadata,
+                    "node_kind": "sub_ac",
+                    "content": sub_task_content,
+                    "label": label,
+                    "status": status,
+                    "legacy_ac_index": ac_index_1,
+                    "legacy_sub_task_index": sub_task_index,
+                    "legacy_sub_task_id": f"ac_{ac_index_1}_sub_{sub_task_index}",
+                },
+            )
+            await self._event_store.append(node_event)
+
         event = BaseEvent(
             type="execution.subtask.updated",
             aggregate_type="execution",
             aggregate_id=execution_id,
             data={
+                **node_metadata,
                 "ac_index": ac_index_1,
                 "sub_task_index": sub_task_index,
                 "sub_task_id": f"ac_{ac_index_1}_sub_{sub_task_index}",
-                "content": sub_task_desc,
+                "content": sub_task_content,
+                "label": label,
                 "status": status,
             },
         )
@@ -3587,13 +3781,20 @@ When complete, explicitly state: [TASK_COMPLETE]
         for i, ac_content in enumerate(seed.acceptance_criteria):
             status = ac_statuses.get(i, "pending")
             retry_attempt = (ac_retry_attempts or {}).get(i, 0)
+            node_identity = ExecutionNodeIdentity.root(
+                execution_context_id=execution_id or session_id,
+                ac_index=i,
+            )
             runtime_scope = build_ac_runtime_scope(
                 i,
                 execution_context_id=execution_id or session_id,
                 retry_attempt=retry_attempt,
+                node_id=node_identity.node_id,
+                node_path=node_identity.path,
             )
             acceptance_criteria.append(
                 {
+                    **node_identity.to_event_metadata(),
                     "index": i + 1,
                     "ac_id": runtime_scope.aggregate_id,
                     "content": ac_content,

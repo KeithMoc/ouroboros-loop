@@ -58,6 +58,147 @@ class _EventSubscriptionContext:
     generation: int = 0
 
 
+def _coerce_non_empty_string(value: object) -> str | None:
+    """Return a stripped non-empty string when present."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _coerce_int(value: object, default: int) -> int:
+    """Return an integer when possible, otherwise a default."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return default
+
+
+def _find_node_id_for_ac_index(nodes: dict[str, Any], ac_index: int) -> str | None:
+    """Resolve the top-level tree node associated with a 1-based AC index."""
+    if ac_index <= 0:
+        return None
+
+    conventional_id = f"ac_{ac_index}"
+    if conventional_id in nodes:
+        return conventional_id
+
+    for node_id, raw_node in nodes.items():
+        if not isinstance(raw_node, dict):
+            continue
+        if _coerce_int(raw_node.get("index"), 0) != ac_index:
+            continue
+        if _coerce_int(raw_node.get("depth"), 0) > 1:
+            continue
+        return node_id
+
+    return None
+
+
+def _legacy_ac_node_aliases(ac: dict[str, Any], canonical_id: str) -> list[str]:
+    """Return legacy top-level AC node IDs that may alias ``canonical_id``."""
+    aliases: list[str] = []
+    for value in (
+        ac.get("ac_id"),
+        f"ac_{ac.get('index', 0)}",
+        f"ac_{ac.get('root_ac_index') + 1}"
+        if isinstance(ac.get("root_ac_index"), int) and ac.get("root_ac_index") >= 0
+        else None,
+    ):
+        alias = _coerce_non_empty_string(value)
+        if alias is not None and alias != canonical_id and alias not in aliases:
+            aliases.append(alias)
+    return aliases
+
+
+def _merge_legacy_ac_node_alias(
+    nodes: dict[str, Any],
+    *,
+    canonical_id: str,
+    aliases: list[str],
+) -> None:
+    """Move mixed-history root AC state from legacy aliases to ``canonical_id``."""
+    canonical_node = nodes.get(canonical_id)
+    if not isinstance(canonical_node, dict):
+        canonical_node = {"id": canonical_id, "children_ids": []}
+        nodes[canonical_id] = canonical_node
+
+    canonical_children = list(canonical_node.get("children_ids", []))
+    for alias in aliases:
+        legacy_node = nodes.pop(alias, None)
+        if not isinstance(legacy_node, dict):
+            continue
+        for child_id in legacy_node.get("children_ids", []):
+            if child_id not in canonical_children:
+                canonical_children.append(child_id)
+            child = nodes.get(child_id)
+            if isinstance(child, dict) and child.get("parent_id") == alias:
+                child["parent_id"] = canonical_id
+        for key, value in legacy_node.items():
+            if key in {"id", "children_ids"}:
+                continue
+            canonical_node.setdefault(key, value)
+
+    canonical_node["id"] = canonical_id
+    canonical_node["children_ids"] = canonical_children
+
+
+def _subtask_message_may_fallback_to_ac_index(message: SubtaskUpdated) -> bool:
+    """Return whether AC-index fallback is safe for a subtask update."""
+    return message.node_depth is None or message.node_depth <= 1
+
+
+def _resolve_subtask_parent_id(
+    nodes: dict[str, Any],
+    message: SubtaskUpdated,
+) -> str | None:
+    """Resolve a Sub-AC parent from canonical, legacy, then index metadata."""
+    candidates: list[str] = []
+    for value in (
+        message.parent_node_id,
+        message.legacy_parent_node_id,
+    ):
+        candidate = _coerce_non_empty_string(value)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    for value in message.legacy_parent_node_aliases:
+        candidate = _coerce_non_empty_string(value)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        if candidate in nodes:
+            return candidate
+
+    if not _subtask_message_may_fallback_to_ac_index(message):
+        return None
+
+    ac_indexes: list[int] = []
+    for value in (message.ac_index, message.root_ac_number):
+        ac_index = _coerce_int(value, 0)
+        if ac_index > 0 and ac_index not in ac_indexes:
+            ac_indexes.append(ac_index)
+
+    if message.root_ac_index is not None and message.root_ac_index >= 0:
+        root_ac_number = message.root_ac_index + 1
+        if root_ac_number not in ac_indexes:
+            ac_indexes.append(root_ac_number)
+
+    for ac_index in ac_indexes:
+        parent_id = _find_node_id_for_ac_index(nodes, ac_index)
+        if parent_id is not None:
+            return parent_id
+
+    return None
+
+
 class OuroborosTUI(App[None]):
     """Main Textual application for Ouroboros TUI."""
 
@@ -302,16 +443,20 @@ class OuroborosTUI(App[None]):
             self._state.status = "running"
         elif event_type == "orchestrator.session.completed":
             self._state.status = "completed"
+            self._state.is_paused = False
         elif event_type == "orchestrator.session.failed":
             self._state.status = "failed"
+            self._state.is_paused = False
         elif event_type == "orchestrator.session.cancelled":
             self._state.status = "cancelled"
+            self._state.is_paused = False
         elif event_type == "execution.terminal":
             # Mirror event from the execution stream — ensures TUI sees
             # terminal transitions even when only polling "execution".
             terminal_status = data.get("status", "completed")
-            if terminal_status in {"completed", "failed", "cancelled"}:
+            if terminal_status in {"completed", "failed", "cancelled", "paused"}:
                 self._state.status = terminal_status
+                self._state.is_paused = terminal_status == "paused"
         elif event_type == "orchestrator.session.paused":
             self._state.status = "paused"
             self._state.is_paused = True
@@ -438,8 +583,14 @@ class OuroborosTUI(App[None]):
     def on_subtask_updated(self, message: SubtaskUpdated) -> None:
         """Handle sub-task updates and add to AC tree (SSOT)."""
         nodes = self._state.ac_tree.get("nodes", {})
-        parent_ac_id = f"ac_{message.ac_index}"
-        sub_task_id = message.sub_task_id
+        resolved_parent_id = _resolve_subtask_parent_id(nodes, message)
+        parent_ac_id = (
+            resolved_parent_id
+            or message.parent_node_id
+            or message.legacy_parent_node_id
+            or (f"ac_{message.ac_index}" if message.ac_index > 0 else "")
+        )
+        sub_task_id = message.node_id or message.sub_task_id
         existing_node = nodes.get(sub_task_id, {})
 
         # Add or update subtask node
@@ -447,10 +598,18 @@ class OuroborosTUI(App[None]):
             "id": sub_task_id,
             "content": message.content or existing_node.get("content", ""),
             "status": message.status,
-            "depth": existing_node.get("depth", 2),
+            "depth": message.node_depth
+            if message.node_depth is not None
+            else existing_node.get("depth", 2),
             "parent_id": parent_ac_id,
             "is_atomic": True,
             "children_ids": existing_node.get("children_ids", []),
+            "node_id": message.node_id,
+            "path": message.path,
+            "display_path": message.display_path,
+            "ordinal": message.ordinal,
+            "root_ac_index": message.root_ac_index,
+            "identity_model": message.identity_model,
         }
         if message.current_tool_activity:
             subtask_node["current_tool_activity"] = dict(message.current_tool_activity)
@@ -465,7 +624,19 @@ class OuroborosTUI(App[None]):
         nodes[sub_task_id] = subtask_node
 
         # Update parent's children_ids (add if not present)
-        if parent_ac_id in nodes:
+        previous_parent_id = existing_node.get("parent_id")
+        if (
+            isinstance(previous_parent_id, str)
+            and previous_parent_id != parent_ac_id
+            and previous_parent_id in nodes
+        ):
+            nodes[previous_parent_id]["children_ids"] = [
+                child_id
+                for child_id in nodes[previous_parent_id].get("children_ids", [])
+                if child_id != sub_task_id
+            ]
+        if resolved_parent_id is not None and resolved_parent_id in nodes:
+            parent_ac_id = resolved_parent_id
             parent = nodes[parent_ac_id]
             children = parent.get("children_ids", [])
             if sub_task_id not in children:
@@ -566,7 +737,7 @@ class OuroborosTUI(App[None]):
         # Create child nodes for each AC
         for ac in acceptance_criteria:
             ac_index = ac.get("index", 0)
-            ac_id = f"ac_{ac_index}"
+            ac_id = ac.get("node_id") or ac.get("ac_id") or f"ac_{ac_index}"
             child_ids.append(ac_id)
 
             # Map status from workflow to tree status
@@ -585,6 +756,12 @@ class OuroborosTUI(App[None]):
                 "depth": 1,
                 "is_atomic": True,  # Flat list = all atomic
                 "children_ids": [],
+                "node_id": ac.get("node_id"),
+                "path": ac.get("path", []),
+                "display_path": ac.get("display_path"),
+                "ordinal": ac.get("ordinal"),
+                "root_ac_index": ac.get("root_ac_index"),
+                "identity_model": ac.get("identity_model"),
             }
 
         # Create root node
@@ -631,7 +808,14 @@ class OuroborosTUI(App[None]):
         # Smart merge: update status/content but preserve children
         for ac in acceptance_criteria:
             ac_index = ac.get("index", 0)
-            ac_id = f"ac_{ac_index}"
+            ac_id = ac.get("node_id") or ac.get("ac_id") or f"ac_{ac_index}"
+            legacy_aliases = _legacy_ac_node_aliases(ac, ac_id)
+            if legacy_aliases:
+                _merge_legacy_ac_node_alias(
+                    existing_nodes,
+                    canonical_id=ac_id,
+                    aliases=legacy_aliases,
+                )
 
             status = ac.get("status", "pending")
             if status == "in_progress":
@@ -643,6 +827,12 @@ class OuroborosTUI(App[None]):
                 # Update existing node - preserve children_ids and is_atomic
                 existing_nodes[ac_id]["status"] = status
                 existing_nodes[ac_id]["content"] = ac.get("content", "")
+                existing_nodes[ac_id]["node_id"] = ac.get("node_id")
+                existing_nodes[ac_id]["path"] = ac.get("path", [])
+                existing_nodes[ac_id]["display_path"] = ac.get("display_path")
+                existing_nodes[ac_id]["ordinal"] = ac.get("ordinal")
+                existing_nodes[ac_id]["root_ac_index"] = ac.get("root_ac_index")
+                existing_nodes[ac_id]["identity_model"] = ac.get("identity_model")
             else:
                 # New AC node - add it
                 existing_nodes[ac_id] = {
@@ -652,11 +842,20 @@ class OuroborosTUI(App[None]):
                     "depth": 1,
                     "is_atomic": True,
                     "children_ids": [],
+                    "node_id": ac.get("node_id"),
+                    "path": ac.get("path", []),
+                    "display_path": ac.get("display_path"),
+                    "ordinal": ac.get("ordinal"),
+                    "root_ac_index": ac.get("root_ac_index"),
+                    "identity_model": ac.get("identity_model"),
                 }
 
         # Ensure root exists and keep its children_ids in sync
         root_id = self._state.ac_tree.get("root_id", "root")
-        expected_child_ids = [f"ac_{ac.get('index', 0)}" for ac in acceptance_criteria]
+        expected_child_ids = [
+            ac.get("node_id") or ac.get("ac_id") or f"ac_{ac.get('index', 0)}"
+            for ac in acceptance_criteria
+        ]
 
         if root_id not in existing_nodes:
             existing_nodes[root_id] = {
@@ -671,8 +870,15 @@ class OuroborosTUI(App[None]):
             existing_nodes[root_id]["status"] = (
                 "executing" if current_ac_index is not None else "pending"
             )
-            # Sync children_ids: add any new ACs not already present
-            current_children = existing_nodes[root_id].get("children_ids", [])
+            # Sync children_ids to the current canonical root AC identities.
+            # This removes mixed-history legacy ``ac_<n>`` roots once a
+            # node-aware progress snapshot introduces the canonical ``node_*``
+            # ID, preventing duplicate root entries after resume replay.
+            current_children = [
+                child_id
+                for child_id in existing_nodes[root_id].get("children_ids", [])
+                if child_id in expected_child_ids
+            ]
             for child_id in expected_child_ids:
                 if child_id not in current_children:
                     current_children.append(child_id)

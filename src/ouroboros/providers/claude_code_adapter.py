@@ -33,6 +33,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import traceback
 
 import structlog
 
@@ -46,6 +47,7 @@ from ouroboros.providers.base import (
     MessageRole,
     UsageInfo,
 )
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 log = structlog.get_logger(__name__)
 
@@ -212,6 +214,28 @@ class ClaudeCodeAdapter:
         error_lower = error_msg.lower()
         return any(pattern in error_lower for pattern in _RETRYABLE_ERROR_PATTERNS)
 
+    def _is_retryable_provider_error(self, error: ProviderError) -> bool:
+        """Check if a provider error is transient enough to retry.
+
+        Claude Code's SDK sometimes reports CLI bootstrap failures as a generic
+        subprocess exit with no stderr, especially when launched through custom
+        wrapper paths such as the macOS ``cmux.app`` Claude binary.  Retrying the
+        shared adapter keeps seed generation from failing permanently on the
+        first extraction attempt while still avoiding retries for actionable
+        stderr-bearing failures such as auth or configuration errors.
+        """
+        if self._is_retryable_error(error.message):
+            return True
+
+        error_type = str(error.details.get("error_type", ""))
+        stderr = str(error.details.get("stderr", "") or "").strip()
+        if stderr:
+            return False
+
+        message = error.message.lower()
+        is_cli_process_exit = error_type in {"ProcessError", "CalledProcessError"}
+        return is_cli_process_exit and "command failed with exit code" in message
+
     async def complete(
         self,
         messages: list[Message],
@@ -240,6 +264,11 @@ class ClaudeCodeAdapter:
                     details={"import_error": str(e)},
                 )
             )
+
+        profile_result = resolve_completion_profile_result(config, backend="claude_code")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
 
         # Extract system messages and pass as system_prompt (not embedded in user prompt)
         system_msgs = [m for m in messages if m.role == MessageRole.SYSTEM]
@@ -295,7 +324,7 @@ class ClaudeCodeAdapter:
             prompt_preview=prompt[:100],
             message_count=len(messages),
             has_system_prompt=system_prompt is not None,
-            max_turns=self._max_turns,
+            max_turns=config.max_turns if config.max_turns is not None else self._max_turns,
             model=config.model,
             cwd=str(self._cwd) if self._cwd else None,
             cli_path=str(self._cli_path) if self._cli_path else None,
@@ -424,11 +453,12 @@ class ClaudeCodeAdapter:
 
                 # Check if error is retryable
                 error_msg = result.error.message
-                if self._is_retryable_error(error_msg) and attempt < _MAX_RETRIES - 1:
+                if self._is_retryable_provider_error(result.error) and attempt < _MAX_RETRIES - 1:
                     backoff = _INITIAL_BACKOFF_SECONDS * (2**attempt)
                     log.warning(
                         "claude_code_adapter.retryable_error",
                         error=error_msg,
+                        error_type=result.error.details.get("error_type"),
                         attempt=attempt + 1,
                         max_retries=_MAX_RETRIES,
                         backoff_seconds=backoff,
@@ -583,7 +613,7 @@ class ClaudeCodeAdapter:
 
         options_kwargs: dict = {
             "disallowed_tools": disallowed,
-            "max_turns": self._max_turns,
+            "max_turns": config.max_turns if config.max_turns is not None else self._max_turns,
             # Allow MCP and other ~/.claude/ settings to be inherited
             "permission_mode": self._permission_mode,
             "cwd": self._cwd,
@@ -592,7 +622,12 @@ class ClaudeCodeAdapter:
             "env": env_overrides,
         }
         if self._allowed_tools is not None:
-            options_kwargs["allowed_tools"] = self._allowed_tools
+            # The SDK distinguishes the visible tool catalog (tools) from
+            # permission filtering (allowed_tools). Passing both keeps explicit
+            # envelopes, such as the interview read-only tool set, from exposing
+            # default built-ins like AskUserQuestion/ToolSearch.
+            options_kwargs["allowed_tools"] = list(self._allowed_tools)
+            options_kwargs["tools"] = list(self._allowed_tools)
 
         # Pass model from CompletionConfig if specified
         # "default" is not a valid SDK model — treat it as None (use SDK default)
@@ -623,7 +658,7 @@ class ClaudeCodeAdapter:
 
         log.debug(
             "claude_code_adapter.sdk_request_configured",
-            max_turns=self._max_turns,
+            max_turns=options_kwargs["max_turns"],
             model=options_kwargs.get("model"),
             cwd=str(self._cwd) if self._cwd else None,
             cli_path=str(self._cli_path) if self._cli_path else None,
@@ -639,6 +674,8 @@ class ClaudeCodeAdapter:
         content = ""
         session_id = None
         error_result: ProviderError | None = None
+        finish_reason = "stop"
+        raw_response: dict[str, object] = {"session_id": None}
 
         # Wrap query() to skip unknown message types (e.g., rate_limit_event)
         # that the SDK doesn't recognize yet. Without this, a single
@@ -699,18 +736,56 @@ class ClaudeCodeAdapter:
                     elif not content:
                         content = getattr(sdk_message, "result", "") or ""
 
-                    # Check for errors - don't break, just record
+                    # Check for errors - don't break, just record.
                     is_error = getattr(sdk_message, "is_error", False)
                     if is_error:
+                        subtype = getattr(sdk_message, "subtype", None)
+                        stop_reason = getattr(sdk_message, "stop_reason", None)
+                        errors = getattr(sdk_message, "errors", None)
+                        if subtype == "error_max_turns" and self._is_usable_max_turns_partial(
+                            content,
+                            stop_reason=stop_reason,
+                        ):
+                            # Claude Code can emit a useful AssistantMessage and then
+                            # finish with ResultMessage(error_max_turns) after trying
+                            # to continue with tools. Surface the already-streamed
+                            # text as a truncated partial result instead of crashing
+                            # the interview loop or pretending completion was clean.
+                            finish_reason = "length"
+                            raw_response.update(
+                                {
+                                    "subtype": subtype,
+                                    "stop_reason": stop_reason,
+                                    "errors": errors,
+                                    "partial_result": True,
+                                }
+                            )
+                            log.warning(
+                                "claude_code_adapter.max_turns_partial_result",
+                                session_id=session_id,
+                                content_length=len(content),
+                                max_turns=self._max_turns,
+                                stop_reason=stop_reason,
+                            )
+                            continue
+
                         error_msg = (
                             getattr(sdk_message, "result", "")
                             or "Unknown error from Claude Agent SDK"
                         )
+                        partial_content = content.strip() if subtype == "error_max_turns" else ""
+                        if subtype == "error_max_turns" and partial_content:
+                            error_msg = (
+                                "Claude Agent SDK reached max turns before producing "
+                                "a usable final response"
+                            )
                         log.warning(
                             "claude_code_adapter.sdk_error",
                             error=error_msg,
                             session_id=session_id,
                             stderr_lines=len(stderr_lines),
+                            subtype=subtype,
+                            partial_rejected=bool(partial_content),
                         )
                         error_result = ProviderError(
                             message=error_msg,
@@ -719,12 +794,22 @@ class ClaudeCodeAdapter:
                                 "stderr": "\n".join(stderr_lines[-20:]) if stderr_lines else "",
                                 "claudecode_present": claudecode_present,
                                 "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                                "subtype": subtype,
+                                "stop_reason": stop_reason,
+                                "errors": errors,
+                                "partial_content": partial_content or None,
+                                "partial_rejected": bool(partial_content),
+                                "configured_cli_path": (
+                                    str(self._cli_path) if self._cli_path else None
+                                ),
+                                "cwd": self._cwd,
                             },
                         )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             stderr_tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            traceback_text = traceback.format_exc()
             error_message = f"Claude Agent SDK request failed: {exc}"
             if stderr_tail and "Check stderr output for details" in str(exc):
                 error_message = f"{error_message}\nstderr tail:\n{stderr_tail}"
@@ -744,8 +829,12 @@ class ClaudeCodeAdapter:
                         "error_type": type(exc).__name__,
                         "session_id": session_id,
                         "stderr": stderr_tail,
+                        "traceback": traceback_text,
                         "claudecode_present": claudecode_present,
                         "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                        "configured_cli_path": str(self._cli_path) if self._cli_path else None,
+                        "cwd": self._cwd,
+                        "env_override_keys": sorted(env_overrides.keys()),
                     },
                 )
             )
@@ -774,6 +863,10 @@ class ClaudeCodeAdapter:
                             "session_id": session_id,
                             "content_length": 0,
                             "stderr": stderr_tail,
+                            "configured_cli_path": (
+                                str(self._cli_path) if self._cli_path else None
+                            ),
+                            "cwd": self._cwd,
                         },
                     )
                 )
@@ -792,6 +885,10 @@ class ClaudeCodeAdapter:
                             "session_id": session_id,
                             "content_length": 0,
                             "stderr": stderr_tail,
+                            "configured_cli_path": (
+                                str(self._cli_path) if self._cli_path else None
+                            ),
+                            "cwd": self._cwd,
                         },
                     )
                 )
@@ -800,9 +897,11 @@ class ClaudeCodeAdapter:
             "claude_code_adapter.request_completed",
             content_length=len(content),
             session_id=session_id,
+            finish_reason=finish_reason,
         )
 
         # Build response
+        raw_response["session_id"] = session_id
         response = CompletionResponse(
             content=content,
             model=config.model,
@@ -811,11 +910,26 @@ class ClaudeCodeAdapter:
                 completion_tokens=0,
                 total_tokens=0,
             ),
-            finish_reason="stop",
-            raw_response={"session_id": session_id},
+            finish_reason=finish_reason,
+            raw_response=raw_response,
         )
 
         return Result.ok(response)
+
+    @staticmethod
+    def _is_usable_max_turns_partial(content: str, *, stop_reason: object) -> bool:
+        """Return whether max-turn partial text is safe to surface as a completion.
+
+        Claude Code may stream natural-language preambles before attempting a tool
+        call and then finish with ``error_max_turns``. Those preambles are not a
+        final answer, and this provider layer cannot reliably distinguish them by
+        inspecting text shape. Keep tool-use-stopped max-turns on the error path
+        and only surface non-tool-use partials as length-limited completions.
+        """
+        text = content.strip()
+        if not text:
+            return False
+        return stop_reason != "tool_use"
 
     def _format_tool_info(self, tool_name: str, tool_input: dict) -> str:
         """Format tool name and input for display.

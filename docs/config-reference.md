@@ -34,8 +34,9 @@ Complete reference for `~/.ouroboros/config.yaml` and all related environment va
 For Codex-backed Ouroboros workflows:
 
 - Put persistent Ouroboros role overrides in `~/.ouroboros/config.yaml`.
-- Use `~/.codex/config.toml` only for the Codex MCP/env hookup written by `ouroboros setup --runtime codex`.
+- Use `~/.codex/config.toml` only for the Codex MCP registration and Codex profile anchors written by `ouroboros setup --runtime codex`.
 - The Codex-aware loader does **not** hardcode a mini model when these keys are left at their shipped defaults. It resolves Codex-backed lookups to Codex's `default` sentinel unless you set an explicit model string.
+- Use `llm_profiles` and `llm_role_profiles` when you want portable task profiles that can map to Codex CLI profiles or to ordinary model settings for other providers.
 
 ### Codex Role Override Map
 
@@ -47,7 +48,110 @@ For Codex-backed Ouroboros workflows:
 | Consensus simple voting | `consensus.models` |
 | Consensus deliberative roles | `consensus.advocate_model`, `consensus.devil_model`, `consensus.judge_model` |
 
-> **Recommended documented baseline:** use GPT-5.4 with medium reasoning effort in Codex CLI, then pin specific Ouroboros roles in `config.yaml` when you want deterministic per-role model selection.
+> **Recommended documented baseline:** use GPT-5.4 with medium reasoning effort in Codex CLI for standard work. `ouroboros setup --runtime codex` also creates cheaper fast defaults on GPT-5.4 Mini and deeper GPT-5.5 defaults for users whose ChatGPT plan exposes those models.
+
+### Portable Task Profiles
+
+`llm_profiles` are top-level, provider-neutral task profiles. `llm_role_profiles` maps logical Ouroboros roles to those profiles. For Codex, a provider mapping can use `profile`, which is passed as `codex exec --profile <name>`. Role mappings route model/native-profile selection and CLI turn budgets while preserving each call site's tuned sampling and token settings; explicit per-request `profile` selection opts into the profile's full tuning envelope.
+
+```yaml
+llm_profiles:
+  fast:
+    max_turns: 1
+    temperature: 0.2
+    providers:
+      codex:
+        profile: ouroboros-fast
+      litellm:
+        model: openrouter/openai/gpt-5.3-codex-spark
+
+  standard:
+    max_turns: 3
+    temperature: 0.3
+    providers:
+      codex:
+        profile: ouroboros-standard
+
+  deep:
+    max_turns: 5
+    temperature: 0.4
+    providers:
+      codex:
+        profile: ouroboros-deep
+      claude_code:
+        model: claude-opus-4-6
+      gemini:
+        model: gemini-2.5-pro
+      opencode:
+        model: openai/gpt-5.4
+      litellm:
+        model: openrouter/anthropic/claude-opus-4-6
+
+  frontier:
+    max_turns: 8
+    temperature: 0.4
+    providers:
+      codex:
+        profile: ouroboros-frontier
+
+llm_role_profiles:
+  ambiguity: deep
+  assertion_extraction: fast
+  brownfield: fast
+  context_compression: deep
+  mechanical_detection: fast
+  question_classification: deep
+  qa: frontier
+  atomicity: standard
+  brownfield_explore: frontier
+  clarification: frontier
+  decomposition: standard
+  dependency_analysis: standard
+  pm_interview: deep
+  seed_generation: deep
+  consensus_advocate: deep
+  consensus_perspective: deep
+  consensus_vote: deep
+  double_diamond: deep
+  ontology_analysis: deep
+  pm_document: deep
+  reflect: deep
+  semantic_evaluation: deep
+  wonder: frontier
+  consensus_judge: frontier
+  agent_runtime: standard
+  agent_runtime_implementation: standard
+  agent_runtime_interview: deep
+  agent_runtime_coordinator: standard
+  agent_runtime_evaluation: deep
+```
+
+Resolution order is: explicit request-level model pins, role mapping, profile provider mapping for the active backend, existing `*_model` field, then backend default behavior.
+
+For Codex, setup creates flat profile anchors in `~/.codex/config.toml`:
+
+```toml
+[profiles.ouroboros-fast]
+model_reasoning_effort = "low"
+
+[profiles.ouroboros-standard]
+model_reasoning_effort = "medium"
+
+[profiles.ouroboros-deep]
+model_reasoning_effort = "high"
+
+[profiles.ouroboros-frontier]
+model_reasoning_effort = "xhigh"
+```
+
+These are intentionally sparse, flat Codex profiles. Codex currently exposes a single `--profile <name>` selector; setup does not depend on unsupported profile-to-profile inheritance. Setup leaves `model` unset so the generated anchors inherit the user's local Codex default model instead of assuming account access to a specific frontier model. Add a `model = "..."` line to an anchor only when you want to pin a model that your account exposes.
+
+If `~/.codex/config.toml` already contains a URL-based Ouroboros MCP server, setup preserves it instead of replacing it with a stdio command block:
+
+```toml
+[mcp_servers.ouroboros]
+url = "http://127.0.0.1:12000/mcp"
+```
 
 ---
 
@@ -63,8 +167,11 @@ For Codex-backed Ouroboros workflows:
 | `resilience` | `ResilienceConfig` | Phase 3 — Stagnation detection and lateral thinking |
 | `evaluation` | `EvaluationConfig` | Phase 4 — 3-stage evaluation pipeline settings |
 | `consensus` | `ConsensusConfig` | Phase 5 — Multi-model consensus settings |
+| `llm_profiles` | `dict[str, LLMTaskProfileConfig]` | Provider-neutral LLM task profiles |
+| `llm_role_profiles` | `dict[str, str]` | Logical role to LLM task profile mapping |
 | `persistence` | `PersistenceConfig` | SQLite event store settings |
 | `drift` | `DriftConfig` | Drift monitoring thresholds |
+| `runtime_controls` | `RuntimeControlsConfig` | Long-running workflow liveness and progress controls |
 | `logging` | `LoggingConfig` | Log level, path, and verbosity |
 
 ---
@@ -122,6 +229,29 @@ llm:
 | `dependency_analysis_model` | `string` | `"claude-opus-4-6"` | Model used for AC dependency analysis. Overridable via `OUROBOROS_DEPENDENCY_ANALYSIS_MODEL`. |
 | `ontology_analysis_model` | `string` | `"claude-opus-4-6"` | Model used for ontological analysis. Overridable via `OUROBOROS_ONTOLOGY_ANALYSIS_MODEL`. |
 | `context_compression_model` | `string` | `"gpt-4"` | Model used for workflow context compression. Overridable via `OUROBOROS_CONTEXT_COMPRESSION_MODEL`. |
+
+---
+
+## `llm_profiles` and `llm_role_profiles`
+
+`llm_profiles` define reusable task profiles outside any single provider. `llm_role_profiles` chooses which profile a logical Ouroboros task role should use.
+
+Common role keys include `clarification`, `seed_generation`, `assertion_extraction`, `qa`, `semantic_evaluation`, `wonder`, `reflect`, `consensus_vote`, `consensus_advocate`, `consensus_judge`, `dependency_analysis`, `context_compression`, `ontology_analysis`, `atomicity`, `decomposition`, `double_diamond`, and `mechanical_detection`.
+
+Profile fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model` | `string \| null` | Portable model override used when no provider-specific model is set. |
+| `temperature` | `float \| null` | Portable temperature override. |
+| `max_tokens` | `int \| null` | Portable token limit override. |
+| `top_p` | `float \| null` | Portable nucleus sampling override. |
+| `max_turns` | `int \| null` | Portable CLI-agent turn budget where supported. |
+| `providers` | `dict` | Backend-specific overrides keyed by `codex`, `claude_code`, `gemini`, `opencode`, `litellm`, or provider aliases such as `openrouter`. |
+
+Provider-specific fields use the same keys plus `profile`. `profile` is currently backend-native metadata; Codex maps it to `codex exec --profile <name>`, while non-Codex adapters ignore it unless they add native profile support later. Role-based resolution uses these profile fields for model/native-profile routing and `max_turns` only; it intentionally preserves request-level `temperature`, `max_tokens`, and `top_p` so existing task-specific tuning does not change just because a role was annotated. Explicit `CompletionConfig.profile` requests use the profile's full sampling/token envelope. `ouroboros setup --runtime codex` installs missing default profiles and role mappings but preserves existing profile definitions, existing Codex provider model pins, and skips role mappings where explicit legacy model overrides are already configured.
+
+Codex agent-runtime tasks also use these mappings. Runtime handles with `session_role: implementation`, `coordinator`, `interview`, or `evaluation` resolve through `agent_runtime_<session_role>`; tasks without a role fall back to `agent_runtime`. Explicit runtime models still win and are passed with `--model` instead of `--profile`.
 
 ---
 
@@ -364,6 +494,46 @@ drift:
 
 ---
 
+## `runtime_controls`
+
+Controls long-running MCP/evolution liveness. These defaults are intended for normal local use: complex productive generations can run for hours, silent hangs are bounded, and repeated activity without material progress is eventually stopped.
+
+```yaml
+runtime_controls:
+  mcp_tool_timeout_seconds: 0                 # 0 = no adapter wall-clock cap
+  generation_idle_timeout_seconds: 7200       # No EventStore activity for 2 hours
+  generation_no_progress_timeout_seconds: 14400  # Activity but no material progress for 4 hours
+  generation_safety_timeout_seconds: 0        # Optional final hard cap; 0 = disabled
+  watchdog_poll_seconds: 15.0
+```
+
+Material progress is stricter than liveness. Heartbeats, messages, and tool calls keep the generation from being considered idle; phase changes, workflow status changes, stage/subtask completion, and terminal execution events reset the no-progress timer.
+
+Recommended tuning examples:
+
+```yaml
+# Long-running local work
+runtime_controls:
+  generation_idle_timeout_seconds: 7200
+  generation_no_progress_timeout_seconds: 43200
+
+# Strict CI / bounded automation
+runtime_controls:
+  generation_idle_timeout_seconds: 900
+  generation_no_progress_timeout_seconds: 3600
+  generation_safety_timeout_seconds: 14400
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `mcp_tool_timeout_seconds` | `float >= 0` | `0` | Adapter-level MCP timeout for progress-aware tools such as `ouroboros_evolve_step`. Keep `0` for normal use so the watchdog, not wall-clock time, decides liveness. |
+| `generation_idle_timeout_seconds` | `float >= 0` | `7200` | Timeout when no lineage/execution activity is observed. `0` disables idle detection. |
+| `generation_no_progress_timeout_seconds` | `float >= 0` | `14400` | Timeout when activity continues but material progress does not. `0` disables no-progress detection. |
+| `generation_safety_timeout_seconds` | `float >= 0` | `0` | Optional final hard cap for a generation. `0` disables the hard cap. |
+| `watchdog_poll_seconds` | `float > 0` | `15.0` | EventStore polling interval for generation watchdog decisions. |
+
+---
+
 ## `logging`
 
 Controls log output.
@@ -460,14 +630,17 @@ All environment variables have higher priority than the corresponding `config.ya
 
 ### MCP Evolution
 
-These variables are read by the MCP server adapter (`ouroboros-mcp`) and the evolutionary loop. They have **no** corresponding `config.yaml` key — env var is the only override mechanism.
-
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OUROBOROS_EXECUTION_MODEL` | `null` (runtime default) | Model used for agent execution inside the MCP evolve loop. Only applicable when the Claude runtime is active. |
 | `OUROBOROS_VALIDATION_MODEL` | `null` (runtime default) | Model used for import/validation fix passes during MCP evolution. Only applicable when the Claude runtime is active. |
 | `OUROBOROS_EVOLVE_STAGE1` | `"false"` | Set to `"true"` to enable Stage 1 mechanical checks (lint/build/test) during MCP evolution. |
-| `OUROBOROS_GENERATION_TIMEOUT` | **dual-usage** — see note | Per-generation timeout in seconds. **Note:** This variable controls two independent mechanisms with different hardcoded defaults: (1) `EvolutionConfig.generation_timeout_seconds` in `evolution/loop.py` uses default `"0"` (no loop-level timeout); (2) `EvolveStepTool.TIMEOUT_SECONDS` in `mcp/tools/definitions.py` uses default `"7200"` (2-hour MCP protocol-level timeout). Setting this variable to `"0"` disables the loop-level timeout only — the MCP-level timeout is unaffected. |
+| `OUROBOROS_MCP_TOOL_TIMEOUT_SECONDS` | `runtime_controls.mcp_tool_timeout_seconds` | Adapter-level MCP timeout for progress-aware tools. `0` disables the wall-clock cap. |
+| `OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS` | `runtime_controls.generation_idle_timeout_seconds` | Idle timeout when no generation/execution activity is observed. |
+| `OUROBOROS_GENERATION_NO_PROGRESS_TIMEOUT_SECONDS` | `runtime_controls.generation_no_progress_timeout_seconds` | Timeout when activity continues without material progress. |
+| `OUROBOROS_GENERATION_SAFETY_TIMEOUT_SECONDS` | `runtime_controls.generation_safety_timeout_seconds` | Optional final hard cap for one generation. |
+| `OUROBOROS_WATCHDOG_POLL_SECONDS` | `runtime_controls.watchdog_poll_seconds` | EventStore polling interval for watchdog decisions. |
+| `OUROBOROS_GENERATION_TIMEOUT` | legacy alias | Backwards-compatible alias for `generation_no_progress_timeout_seconds`. It no longer creates a separate hard 2-hour MCP adapter timeout. Prefer `runtime_controls` in `config.yaml` for persistent tuning. |
 
 ### Observability & Agents
 
@@ -666,6 +839,13 @@ persistence:
 drift:
   warning_threshold: 0.3
   critical_threshold: 0.5
+
+runtime_controls:
+  mcp_tool_timeout_seconds: 0
+  generation_idle_timeout_seconds: 7200
+  generation_no_progress_timeout_seconds: 14400
+  generation_safety_timeout_seconds: 0
+  watchdog_poll_seconds: 15.0
 
 logging:
   level: info

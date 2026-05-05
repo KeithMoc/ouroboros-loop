@@ -399,6 +399,17 @@ class SubtaskUpdated(Message):
         status: str,
         current_tool_activity: dict[str, Any] | None = None,
         last_update: dict[str, Any] | None = None,
+        node_id: str | None = None,
+        parent_node_id: str | None = None,
+        path: list[int] | None = None,
+        display_path: str | None = None,
+        depth: int | None = None,
+        ordinal: int | None = None,
+        root_ac_index: int | None = None,
+        root_ac_number: int | None = None,
+        identity_model: str | None = None,
+        legacy_parent_node_id: str | None = None,
+        legacy_parent_node_aliases: list[str] | None = None,
     ) -> None:
         """Initialize SubtaskUpdated message."""
         super().__init__()
@@ -412,6 +423,21 @@ class SubtaskUpdated(Message):
             dict(current_tool_activity) if isinstance(current_tool_activity, dict) else {}
         )
         self.last_update = dict(last_update) if isinstance(last_update, dict) else {}
+        self.node_id = node_id
+        self.parent_node_id = parent_node_id
+        self.path = list(path) if isinstance(path, list) else []
+        self.display_path = display_path
+        self.node_depth = depth
+        self.ordinal = ordinal
+        self.root_ac_index = root_ac_index
+        self.root_ac_number = root_ac_number
+        self.identity_model = identity_model
+        self.legacy_parent_node_id = legacy_parent_node_id
+        self.legacy_parent_node_aliases = (
+            [alias for alias in legacy_parent_node_aliases if isinstance(alias, str)]
+            if isinstance(legacy_parent_node_aliases, list)
+            else []
+        )
 
 
 class LineageSelected(Message):
@@ -621,6 +647,26 @@ class TUIState:
 # =============================================================================
 
 
+def _coerce_event_int(value: object) -> int | None:
+    """Return event integer metadata while rejecting bools."""
+    return value if type(value) is int else None
+
+
+def _subtask_root_ac_index(data: dict[str, Any]) -> int:
+    """Return the 1-based top-level AC index for subtask dashboard grouping."""
+    root_ac_number = _coerce_event_int(data.get("root_ac_number"))
+    if root_ac_number is not None and root_ac_number > 0:
+        return root_ac_number
+
+    root_ac_index = _coerce_event_int(data.get("root_ac_index"))
+    if root_ac_index is not None and root_ac_index >= 0:
+        return root_ac_index + 1
+
+    legacy_ac_index = _coerce_event_int(data.get("legacy_ac_index"))
+    ac_index = _coerce_event_int(data.get("ac_index"))
+    return ac_index if ac_index is not None else legacy_ac_index or 0
+
+
 def create_message_from_event(event: BaseEvent) -> Message | None:
     """Convert an EventStore event to a TUI message.
 
@@ -797,16 +843,45 @@ def create_message_from_event(event: BaseEvent) -> Message | None:
             last_update=data.get("last_update"),
         )
 
-    elif event_type == "execution.subtask.updated":
+    elif event_type in {
+        "execution.subtask.updated",
+        "execution.node.created",
+        "execution.node.updated",
+    }:
         return SubtaskUpdated(
             execution_id=event.aggregate_id,
-            ac_index=data.get("ac_index", 0),
-            sub_task_index=data.get("sub_task_index", 0),
-            sub_task_id=data.get("sub_task_id", ""),
-            content=data.get("content", ""),
+            ac_index=_subtask_root_ac_index(data),
+            sub_task_index=data.get("sub_task_index", data.get("legacy_sub_task_index", 0)),
+            sub_task_id=data.get("sub_task_id", data.get("legacy_sub_task_id", "")),
+            content=data.get("content") or data.get("label", ""),
             status=data.get("status", "pending"),
             current_tool_activity=data.get("current_tool_activity"),
             last_update=data.get("last_update"),
+            node_id=data.get("node_id") if isinstance(data.get("node_id"), str) else None,
+            parent_node_id=data.get("parent_node_id")
+            if isinstance(data.get("parent_node_id"), str)
+            else None,
+            path=data.get("path") if isinstance(data.get("path"), list) else None,
+            display_path=data.get("display_path")
+            if isinstance(data.get("display_path"), str)
+            else None,
+            depth=data.get("depth") if isinstance(data.get("depth"), int) else None,
+            ordinal=data.get("ordinal") if isinstance(data.get("ordinal"), int) else None,
+            root_ac_index=data.get("root_ac_index")
+            if isinstance(data.get("root_ac_index"), int)
+            else None,
+            root_ac_number=data.get("root_ac_number")
+            if isinstance(data.get("root_ac_number"), int)
+            else None,
+            identity_model=data.get("identity_model")
+            if isinstance(data.get("identity_model"), str)
+            else None,
+            legacy_parent_node_id=data.get("legacy_parent_node_id")
+            if isinstance(data.get("legacy_parent_node_id"), str)
+            else None,
+            legacy_parent_node_aliases=data.get("legacy_parent_node_aliases")
+            if isinstance(data.get("legacy_parent_node_aliases"), list)
+            else None,
         )
 
     elif event_type == "execution.tool.started":

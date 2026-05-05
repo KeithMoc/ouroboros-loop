@@ -16,6 +16,7 @@ Classes:
     EvaluationConfig: Phase 4 configuration
     ConsensusConfig: Phase 5 configuration
     PersistenceConfig: Storage configuration
+    RuntimeControlsConfig: Long-running workflow timeout/progress controls
     LoggingConfig: Logging configuration
     OuroborosConfig: Top-level configuration combining all sections
 """
@@ -123,6 +124,33 @@ class LLMConfig(BaseModel, frozen=True):
     dependency_analysis_model: str = "claude-sonnet-4-6"
     ontology_analysis_model: str = "claude-sonnet-4-6"
     context_compression_model: str = "claude-haiku-4-5-20251001"
+
+
+class LLMProviderProfileConfig(BaseModel, frozen=True):
+    """Backend-specific overrides for an Ouroboros LLM task profile.
+
+    ``profile`` is intentionally generic here: for Codex it maps to a
+    ``codex exec --profile`` name, while other backends can ignore it and use
+    portable fields such as ``model`` or ``temperature``.
+    """
+
+    profile: str | None = None
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_turns: int | None = Field(default=None, ge=1)
+
+
+class LLMTaskProfileConfig(BaseModel, frozen=True):
+    """Provider-neutral LLM task profile with optional backend overrides."""
+
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_turns: int | None = Field(default=None, ge=1)
+    providers: dict[str, LLMProviderProfileConfig] = Field(default_factory=dict)
 
 
 class ClarificationConfig(BaseModel, frozen=True):
@@ -262,6 +290,32 @@ class DriftConfig(BaseModel, frozen=True):
         return v
 
 
+class RuntimeControlsConfig(BaseModel, frozen=True):
+    """Runtime liveness and progress controls for long-running work.
+
+    Attributes:
+        mcp_tool_timeout_seconds: Server-side MCP tool timeout. ``0`` disables
+            the adapter-level wall-clock timeout so progress-aware tools can
+            enforce their own liveness policy.
+        generation_idle_timeout_seconds: Seconds without any generation or
+            execution activity before the generation is considered idle.
+            ``0`` disables this guard.
+        generation_no_progress_timeout_seconds: Seconds with activity but no
+            material progress before the generation is considered stuck.
+            ``0`` disables this guard.
+        generation_safety_timeout_seconds: Optional final wall-clock safety
+            cap for a generation. ``0`` disables this guard.
+        watchdog_poll_seconds: How often the generation watchdog polls
+            EventStore for new progress.
+    """
+
+    mcp_tool_timeout_seconds: float = Field(default=0, ge=0)
+    generation_idle_timeout_seconds: float = Field(default=7200, ge=0)
+    generation_no_progress_timeout_seconds: float = Field(default=14400, ge=0)
+    generation_safety_timeout_seconds: float = Field(default=0, ge=0)
+    watchdog_poll_seconds: float = Field(default=15.0, gt=0.0)
+
+
 class LoggingConfig(BaseModel, frozen=True):
     """Logging configuration.
 
@@ -305,6 +359,7 @@ class OrchestratorConfig(BaseModel, frozen=True):
             - None: Resolve from PATH at runtime (or OUROBOROS_GEMINI_CLI_PATH)
         default_max_turns: Default max turns for agent execution
         max_parallel_workers: Default maximum concurrent AC workers
+        usage_limit_pause_hours: Default pause window for provider usage/quota limits
         use_worktrees: Whether mutating workflows run in dedicated git worktrees
         worktree_root: Root directory for managed task worktrees
         worktree_cleanup: Cleanup policy for managed task worktrees
@@ -327,6 +382,7 @@ class OrchestratorConfig(BaseModel, frozen=True):
     gemini_cli_path: str | None = None
     default_max_turns: int = Field(default=10, ge=1)
     max_parallel_workers: int = Field(default=3, ge=1)
+    usage_limit_pause_hours: float = Field(default=5.0, gt=0.0)
     use_worktrees: bool = True
     worktree_root: str = "~/.ouroboros/worktrees"
     worktree_cleanup: Literal["keep"] = "keep"
@@ -367,8 +423,11 @@ class OuroborosConfig(BaseModel, frozen=True):
         resilience: Phase 3 configuration
         evaluation: Phase 4 configuration
         consensus: Phase 5 configuration
+        llm_profiles: Named provider-neutral profiles for LLM-only tasks
+        llm_role_profiles: Mapping from logical task roles to profile names
         persistence: Storage configuration
         drift: Drift monitoring configuration
+        runtime_controls: Long-running workflow timeout/progress controls
         logging: Logging configuration
     """
 
@@ -379,8 +438,11 @@ class OuroborosConfig(BaseModel, frozen=True):
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     consensus: ConsensusConfig = Field(default_factory=ConsensusConfig)
+    llm_profiles: dict[str, LLMTaskProfileConfig] = Field(default_factory=dict)
+    llm_role_profiles: dict[str, str] = Field(default_factory=dict)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     drift: DriftConfig = Field(default_factory=DriftConfig)
+    runtime_controls: RuntimeControlsConfig = Field(default_factory=RuntimeControlsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 

@@ -4,6 +4,7 @@ import pytest
 
 from ouroboros.core.errors import PersistenceError
 from ouroboros.events.base import BaseEvent
+from ouroboros.orchestrator.execution_runtime_scope import normalize_execution_scope_id
 from ouroboros.persistence.event_store import EventStore
 
 
@@ -525,6 +526,39 @@ class TestEventStoreGetEventsAfter:
         with pytest.raises(PersistenceError, match="not initialized"):
             await store.get_events_after("test", "test-123", 0)
 
+    async def test_get_current_rowid_returns_global_tail_cursor(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        """get_current_rowid() returns a cursor that excludes existing rows."""
+        assert await event_store.get_current_rowid() == 0
+        await event_store.append(
+            BaseEvent(
+                type="test.event.created",
+                aggregate_type="execution",
+                aggregate_id="exec-tail",
+                data={},
+            )
+        )
+
+        cursor = await event_store.get_current_rowid()
+        assert cursor > 0
+        events, same_cursor = await event_store.get_events_after(
+            "execution",
+            "exec-tail",
+            cursor,
+        )
+        assert events == []
+        assert same_cursor == cursor
+
+    async def test_get_current_rowid_raises_when_not_initialized(self) -> None:
+        """get_current_rowid() raises PersistenceError when store not initialized."""
+        from ouroboros.core.errors import PersistenceError
+
+        store = EventStore("sqlite+aiosqlite:///test.db")
+        with pytest.raises(PersistenceError, match="not initialized"):
+            await store.get_current_rowid()
+
 
 class TestEventStoreErrorHandling:
     """Test error handling in EventStore."""
@@ -609,6 +643,264 @@ class TestSessionActivitySnapshots:
         assert by_id["sess-running"].last_activity is not None
         assert by_id["sess-completed"].status_event_type == "orchestrator.progress.updated"
         assert by_id["sess-completed"].runtime_status == "completed"
+
+    async def test_includes_terminal_session_without_started_event(
+        self, event_store: EventStore
+    ) -> None:
+        await event_store.append(
+            BaseEvent(
+                type="orchestrator.session.completed",
+                aggregate_type="session",
+                aggregate_id="sess-imported-complete",
+                data={"summary": "imported terminal event"},
+            )
+        )
+
+        snapshots = await event_store.get_session_activity_snapshots()
+        by_id = {snapshot.session_id: snapshot for snapshot in snapshots}
+
+        assert set(by_id) == {"sess-imported-complete"}
+        snapshot = by_id["sess-imported-complete"]
+        assert snapshot.execution_id is None
+        assert snapshot.seed_id is None
+        assert snapshot.start_time is not None
+        assert snapshot.last_activity is not None
+        assert snapshot.status_event_type == "orchestrator.session.completed"
+
+    async def test_includes_progress_only_session_without_started_event(
+        self, event_store: EventStore
+    ) -> None:
+        await event_store.append(
+            BaseEvent(
+                type="orchestrator.progress.updated",
+                aggregate_type="session",
+                aggregate_id="sess-imported-progress",
+                data={"progress": {"step": 1, "runtime_status": "running"}},
+            )
+        )
+
+        snapshots = await event_store.get_session_activity_snapshots()
+        by_id = {snapshot.session_id: snapshot for snapshot in snapshots}
+
+        assert set(by_id) == {"sess-imported-progress"}
+        snapshot = by_id["sess-imported-progress"]
+        assert snapshot.execution_id is None
+        assert snapshot.seed_id is None
+        assert snapshot.start_time is not None
+        assert snapshot.last_activity is not None
+        assert snapshot.status_event_type == "orchestrator.progress.updated"
+        assert snapshot.runtime_status == "running"
+
+
+class TestSessionRelatedEvents:
+    """Test cross-aggregate session activity queries."""
+
+    async def test_matches_normalized_evolve_execution_scope_ids(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        session_id = "sess-evolve"
+        execution_id = "evolve:lin-watch:generation:1"
+        execution_scope = normalize_execution_scope_id(execution_id)
+        events = [
+            BaseEvent(
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id=session_id,
+                data={
+                    "execution_id": execution_id,
+                    "seed_id": "seed-evolve",
+                    "start_time": "2026-04-01T00:00:00+00:00",
+                },
+            ),
+            BaseEvent(
+                type="workflow.progress.updated",
+                aggregate_type="execution",
+                aggregate_id=execution_id,
+                data={"session_id": session_id, "completed_count": 0, "total_count": 1},
+            ),
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                aggregate_type="execution",
+                aggregate_id=f"{execution_scope}_ac_0",
+                data={"session_id": session_id, "ac_index": 0, "message_count": 1},
+            ),
+            BaseEvent(
+                type="execution.coordinator.completed",
+                aggregate_type="execution",
+                aggregate_id=f"{execution_scope}_level_1_coordinator_reconciliation",
+                data={"session_id": session_id, "execution_id": execution_id},
+            ),
+            BaseEvent(
+                type="execution.subagent.started",
+                aggregate_type="execution",
+                aggregate_id=f"{execution_scope}_child_0",
+                data={"parent_execution_id": execution_id, "child_ac": "child task", "depth": 1},
+            ),
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                aggregate_type="execution",
+                aggregate_id="other_evolve_ac_0",
+                data={"session_id": "other-session", "ac_index": 0, "message_count": 1},
+            ),
+        ]
+        for event in events:
+            await event_store.append(event)
+
+        result = await event_store.query_session_related_events(
+            session_id,
+            execution_id=execution_id,
+            limit=None,
+        )
+        aggregate_ids = {event.aggregate_id for event in result}
+
+        assert session_id in aggregate_ids
+        assert execution_id in aggregate_ids
+        assert f"{execution_scope}_ac_0" in aggregate_ids
+        assert f"{execution_scope}_level_1_coordinator_reconciliation" in aggregate_ids
+        assert f"{execution_scope}_child_0" in aggregate_ids
+        assert "other_evolve_ac_0" not in aggregate_ids
+
+    async def test_session_related_events_do_not_join_on_lossy_normalized_scope(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        """Distinct execution IDs that normalize alike must stay isolated."""
+        session_id = "sess-lossy-normalized"
+        execution_id = "evolve:foo:bar:generation:1"
+        colliding_execution_id = "evolve:foo_bar:generation:1"
+        assert normalize_execution_scope_id(execution_id) == normalize_execution_scope_id(
+            colliding_execution_id
+        )
+        colliding_scope = normalize_execution_scope_id(colliding_execution_id)
+
+        events = [
+            BaseEvent(
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id=session_id,
+                data={"execution_id": execution_id, "seed_id": "seed-lossy"},
+            ),
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                aggregate_type="execution",
+                aggregate_id=f"{colliding_scope}_ac_0",
+                data={
+                    "session_id": "other-session",
+                    "execution_id": colliding_execution_id,
+                    "ac_index": 0,
+                    "message_count": 1,
+                },
+            ),
+        ]
+        for event in events:
+            await event_store.append(event)
+
+        result = await event_store.query_session_related_events(
+            session_id,
+            execution_id=execution_id,
+            limit=None,
+        )
+
+        assert [event.aggregate_id for event in result] == [session_id]
+
+    async def test_session_related_events_after_advances_one_cursor(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        session_id = "sess-incremental"
+        execution_id = "evolve:lin-incremental:generation:1"
+        execution_scope = normalize_execution_scope_id(execution_id)
+        await event_store.append(
+            BaseEvent(
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id=session_id,
+                data={"execution_id": execution_id, "seed_id": "seed-incremental"},
+            )
+        )
+
+        first_batch, cursor = await event_store.query_session_related_events_after(
+            session_id,
+            execution_id=execution_id,
+        )
+        assert [event.type for event in first_batch] == ["orchestrator.session.started"]
+
+        await event_store.append(
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                aggregate_type="execution",
+                aggregate_id=f"{execution_scope}_ac_0",
+                data={"session_id": session_id, "ac_index": 0, "message_count": 2},
+            )
+        )
+
+        second_batch, next_cursor = await event_store.query_session_related_events_after(
+            session_id,
+            execution_id=execution_id,
+            last_row_id=cursor,
+        )
+
+        assert [event.type for event in second_batch] == ["execution.ac.heartbeat"]
+        assert next_cursor > cursor
+
+    async def test_session_related_events_after_includes_exact_parent_execution_children(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        """Child execution scopes linked only by parent_execution_id remain visible."""
+        session_id = "sess-parent-execution"
+        execution_id = "evolve:lin-parent:generation:1"
+        await event_store.append(
+            BaseEvent(
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id=session_id,
+                data={"execution_id": execution_id, "seed_id": "seed-parent"},
+            )
+        )
+
+        first_batch, cursor = await event_store.query_session_related_events_after(
+            session_id,
+            execution_id=execution_id,
+        )
+        assert [event.type for event in first_batch] == ["orchestrator.session.started"]
+
+        await event_store.append(
+            BaseEvent(
+                type="execution.subagent.started",
+                aggregate_type="execution",
+                aggregate_id="evolve_lin_parent_generation_1_child_0",
+                data={
+                    "parent_execution_id": execution_id,
+                    "child_ac": "child task",
+                    "depth": 1,
+                },
+            )
+        )
+        await event_store.append(
+            BaseEvent(
+                type="execution.subagent.started",
+                aggregate_type="execution",
+                aggregate_id="evolve_lin_other_generation_1_child_0",
+                data={
+                    "parent_execution_id": "evolve:lin-other:generation:1",
+                    "child_ac": "other child",
+                    "depth": 1,
+                },
+            )
+        )
+
+        second_batch, next_cursor = await event_store.query_session_related_events_after(
+            session_id,
+            execution_id=execution_id,
+            last_row_id=cursor,
+        )
+
+        assert [(event.type, event.aggregate_id) for event in second_batch] == [
+            ("execution.subagent.started", "evolve_lin_parent_generation_1_child_0")
+        ]
+        assert next_cursor > cursor
 
 
 class TestGetAllSessions:

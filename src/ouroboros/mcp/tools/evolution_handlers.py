@@ -15,7 +15,11 @@ from typing import Any
 import structlog
 import yaml
 
-from ouroboros.config import get_parallel_default, get_skip_qa_default
+from ouroboros.config import (
+    get_parallel_default,
+    get_runtime_controls_config,
+    get_skip_qa_default,
+)
 from ouroboros.core.project_paths import resolve_path_against_base, resolve_seed_project_path
 from ouroboros.core.seed import Seed
 from ouroboros.core.text import truncate_head_tail
@@ -30,6 +34,7 @@ from ouroboros.core.worktree import (
 from ouroboros.evaluation.verification_artifacts import build_verification_artifacts
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
 from ouroboros.mcp.job_manager import JobLinks, JobManager
+from ouroboros.mcp.tools.bridge_mixin import BridgeAwareMixin
 from ouroboros.mcp.tools.subagent import (
     build_evolve_subagent,
     build_subagent_result,
@@ -101,12 +106,19 @@ def _resolve_evolve_verification_working_dir(
 
 
 @dataclass
-class EvolveStepHandler:
+class EvolveStepHandler(BridgeAwareMixin):
     """Handler for the ouroboros_evolve_step tool.
 
     Runs exactly ONE generation of the evolutionary loop.
     Designed for Ralph integration: stateless between calls,
     all state reconstructed from events.
+
+    Inherits :class:`BridgeAwareMixin` (#475) so the composition
+    root's loop-injection automatically populates ``mcp_manager`` and
+    ``mcp_tool_prefix`` when an MCP bridge is configured. The bridge
+    is forwarded into the inner ``EvolutionaryLoop`` runner whenever it
+    is available so dynamic external MCP servers reach the evolution
+    pipeline without per-handler explicit wiring.
     """
 
     evolutionary_loop: Any | None = field(default=None, repr=False)
@@ -114,9 +126,14 @@ class EvolveStepHandler:
     agent_runtime_backend: str | None = field(default=None, repr=False)
     opencode_mode: str | None = field(default=None, repr=False)
 
-    TIMEOUT_SECONDS: int = int(
-        os.environ.get("OUROBOROS_GENERATION_TIMEOUT", "7200")
-    )  # Override MCP adapter's default 30s
+    @property
+    def TIMEOUT_SECONDS(self) -> float:
+        """MCP adapter timeout for evolve_step.
+
+        Defaults to 0 so the generation watchdog, not adapter wall-clock,
+        decides whether long-running work is still productive.
+        """
+        return get_runtime_controls_config().mcp_tool_timeout_seconds
 
     @property
     def definition(self) -> MCPToolDefinition:
