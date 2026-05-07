@@ -85,6 +85,29 @@ class TestDetectKeywords:
         result = detect_keywords("hello world")
         assert result["detected"] is False
 
+    def test_ooo_auto_with_goal(self):
+        result = detect_keywords('ooo auto "Add /healthz endpoint"')
+        assert result["detected"] is True
+        assert result["suggested_skill"] == "/ouroboros:auto"
+        assert result["keyword"] == "ooo auto"
+
+    def test_ooo_auto_bare(self):
+        result = detect_keywords("ooo auto")
+        assert result["detected"] is True
+        assert result["suggested_skill"] == "/ouroboros:auto"
+
+    def test_ooo_auto_with_resume_flag(self):
+        result = detect_keywords("ooo auto --resume auto_abc123")
+        assert result["detected"] is True
+        assert result["suggested_skill"] == "/ouroboros:auto"
+
+    def test_ooo_auto_does_not_collide_with_autopilot_natural_language(self):
+        # Make sure the `auto` pattern does not over-match unrelated phrases.
+        result = detect_keywords("turn on autopilot")
+        assert result["suggested_skill"] != "/ouroboros:auto", (
+            "bare 'autopilot' should not route to ooo auto"
+        )
+
 
 class TestSetupBypass:
     """qa skill has a no-MCP fallback, so it must bypass the setup gate."""
@@ -138,3 +161,26 @@ class TestMainGate:
             main()
         out = capsys.readouterr().out
         assert "/ouroboros:setup" in out
+
+    @patch.object(_mod, "is_mcp_configured", return_value=False)
+    @patch.object(_mod, "is_first_time", return_value=False)
+    def test_ooo_auto_unconfigured_redirects_to_setup(self, _first, _mcp, capsys):
+        # ooo auto is not in SETUP_BYPASS_SKILLS, so an unconfigured environment
+        # must steer the user to /ouroboros:setup before running the skill.
+        with patch("sys.stdin") as mock_stdin:
+            mock_stdin.read.return_value = 'ooo auto "Add /healthz endpoint"'
+            main()
+        out = capsys.readouterr().out
+        assert "/ouroboros:setup" in out
+
+    @patch.object(_mod, "is_mcp_configured", return_value=True)
+    @patch.object(_mod, "is_first_time", return_value=False)
+    def test_ooo_auto_configured_routes_to_auto_skill(self, _first, _mcp, capsys):
+        # When MCP is configured, ooo auto must surface /ouroboros:auto rather
+        # than the setup redirect.
+        with patch("sys.stdin") as mock_stdin:
+            mock_stdin.read.return_value = 'ooo auto "Add /healthz endpoint"'
+            main()
+        out = capsys.readouterr().out
+        assert "/ouroboros:auto" in out
+        assert "/ouroboros:setup" not in out
