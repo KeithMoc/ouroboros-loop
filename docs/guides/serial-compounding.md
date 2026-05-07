@@ -1,8 +1,9 @@
 # Serial Compounding Execution — Design Notes
 
-> Status: phase 1 shipped (branch `claude/compounding-context-sequential-78EpQ`).
+> Status: phase 1, 1.5, and phase-2 milestones M5/M7 all shipped.
+> Phase-2 prompt caching remains deferred (adapter migration blocker).
 > This guide captures the brainstorming, audit findings, and design decisions
-> behind the compounding-execution loop, plus deferred work and open questions.
+> behind the compounding-execution loop, plus the remaining deferred work.
 
 ## TL;DR
 
@@ -206,23 +207,24 @@ reused across ACs.
 
 ---
 
-## What's deferred (and why)
+## Status of phase-1.5 / phase-2 milestones
 
-| Milestone | Why deferred | Cost/risk when it's time |
+| Milestone | Status | Where it shipped |
 |---|---|---|
-| M5 per-AC diff capture | `diff_summary` is populated as `""` today. Postmortems still useful without it (files / tools / public-API / gotchas are all present) but the "what actually changed" signal is missing. | Moderate. Needs a `WorkspaceSnapshotBackend` interface — plain git default, GitButler optional backend. Git backend can use `git stash create` or a session-start ref to produce `git diff --stat` without touching HEAD. |
-| M6 AC-granular checkpoint/resume | A 20-AC compounding run that crashes at AC 15 today loses everything. Not blocking for first use but crucial for long runs. | Moderate. Extend `CheckpointData.state` with `last_completed_ac_index` + serialized postmortems. Resume logic: skip 0..N, load chain, start at N+1. |
-| M7 inline QA + retry-with-QA-feedback | Currently the postmortem's `status` reflects whether the agent *said* it finished, not whether QA agrees. A passing-but-wrong AC corrupts the chain. | Low. Wire `QAHandler` after each AC. Retry prompt carries the failed verdict's `suggestions` verbatim. Opt-in via `--inline-qa` because it ~doubles model calls. |
-| Invariants extraction | `ACPostmortem.invariants_established` is always empty today. The "cumulative invariants" rendering works but never has anything to render. | Low. Post-AC hook asking the agent: "state 1-3 invariants future ACs can assume" (or parse `[[INVARIANT: ...]]` tags from the trace). This is where compounding actually compounds. |
-| Phase 2 prompt caching | Would cut cost significantly for long chains with large pinned prefixes (CLAUDE.md + ontology + seed = lots of stable tokens). | High. Adapter migration to raw anthropic SDK; structured system blocks; `cache_control` breakpoints; per-adapter capability gating. |
+| M5 per-AC diff capture | ✅ Shipped | `src/ouroboros/orchestrator/diff_capture.py` — `git stash create` boundary, 5s timeout, fallback to `git rev-parse HEAD` on clean tree, empty-on-error invariant. SerialCompoundingExecutor-only so parallel mode stays byte-identical. |
+| M6 AC-granular checkpoint/resume | ✅ Shipped (Q6.2) | `serial_executor.py` — `CompoundingCheckpointState.last_completed_ac_index`, partial sub-AC checkpoint, `--compounding --resume <id>` with `_validate_compounding_resume_not_fresh_seed` guard. |
+| M7 inline QA + retry-with-QA-feedback | ✅ Shipped | `src/ouroboros/orchestrator/inline_qa.py` — `run_inline_qa` wires `QAHandler` after each AC. CLI: `--inline-qa` and `--max-qa-retries` (default 1). |
+| Invariants extraction (Q3, C-plus) | ✅ Shipped | `level_context.py` — `_INVARIANT_TAG_RE` parses `[[INVARIANT: ...]]` tags, `Invariant` dataclass, reliability gate (`POSTMORTEM_DEFAULT_INVARIANT_MIN_RELIABILITY=0.7`, env `OUROBOROS_INVARIANT_MIN_RELIABILITY`), Haiku verifier. |
+| Q7 budget-overflow event | ✅ Shipped | `events.py` — `create_postmortem_chain_truncated_event` (`execution.postmortem_chain.truncated`), emitted alongside `log.warning`. |
+| Phase 2 prompt caching | ⏸ Still deferred | Blocked on Claude Code adapter migration off subprocess `claude_agent_sdk` to raw `anthropic` (or SDK exposing structured system blocks with `cache_control`). The serial executor builds `system_prompt` once per run so it benefits without further refactor when unblocked. |
 
 ---
 
 ## Tradeoffs we took (honest list)
 
 1. **Subclass over extract.** Keeps `_execute_single_ac` in one place. Downside: `SerialCompoundingExecutor` inherits `ParallelACExecutor`'s vocabulary — naming is slightly awkward ("compounding IS-A parallel executor"). Rename later if a cleaner hierarchy emerges.
-2. **Empty `diff_summary` in phase 1.** Postmortems read as "AC 3 [pass] | files: auth.py, middleware.py | invariants: —" today — useful but not as rich as `git diff --stat` would be. M5 fixes this.
-3. **Empty `invariants_established` in phase 1.** The "cumulative invariants" rendering block is defensive — it just doesn't emit when nothing's there. Adding the extraction step is low-cost but requires a small agent-side prompt convention.
+2. ~~**Empty `diff_summary` in phase 1.**~~ Resolved by M5 — `diff_capture.py` populates `diff_summary` via `git stash create` boundaries with `git diff --stat`. Empty-on-error invariant means the run is never blocked by capture failures.
+3. ~~**Empty `invariants_established` in phase 1.**~~ Resolved by Q3 — agents tag `[[INVARIANT: …]]` in their trace, a Haiku verifier scores reliability (default ≥0.7), and `PostmortemChain.merge_invariants` accumulates / contradicts / re-declares across the chain.
 4. **No CLI flag for fail-forward yet.** `--compounding` is fail-fast. Programmatic callers can pass `fail_fast=False`; CLI users can't. Add if a case surfaces.
 5. **No cost warning in CLI for long compounding runs.** A 20-AC seed with K=3 full forms will send large prompts. Not a phase-1 problem but worth a `--estimate-tokens` flag down the line.
 6. **Token budget heuristic is 4 chars/token.** Crude but deterministic. Real tokenization would require importing the model's tokenizer; not worth it for a guard rail.

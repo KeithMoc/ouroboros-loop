@@ -55,7 +55,6 @@ from ouroboros.orchestrator.inline_qa import (
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
     ACPostmortem,
-    Invariant,
     PostmortemChain,
     PostmortemStatus,
     build_postmortem_chain_prompt,
