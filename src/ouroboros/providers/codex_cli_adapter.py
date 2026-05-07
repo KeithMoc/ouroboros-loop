@@ -62,9 +62,50 @@ _RETRYABLE_ERROR_PATTERNS = (
     "connection reset",
 )
 
+_CODEX_AUTH_FAILURE_PATTERNS = (
+    "missing bearer or basic authentication",
+    "401 unauthorized",
+    "unauthorized",
+    "invalid api key",
+    "no api key",
+    "missing api key",
+    "invalid bearer token",
+)
+
+# A bare auth phrase ("401 unauthorized", "unauthorized") is ambiguous —
+# nested tools or MCP services routed through the same ``error`` /
+# ``turn.failed`` channel can surface their own 401s without involving Codex
+# auth at all. To avoid sending operators to inspect ``CODEX_HOME/auth.json``
+# for an unrelated failure, classification additionally requires that the
+# error mention a Codex/OpenAI-specific marker below.
+_CODEX_PROVIDER_MARKERS = (
+    "api.openai.com",
+    "openai.com",
+    "codex",
+)
+_OPENAI_RESPONSES_ENDPOINT = "api.openai.com/v1/responses"
+
 
 class CodexCliLLMAdapter:
-    """LLM adapter backed by local Codex CLI execution."""
+    """LLM adapter backed by local Codex CLI execution.
+
+    Streaming progress callback contract (``on_message``):
+
+    The callable receives ``(message_type, content)`` tuples derived from the
+    Codex JSONL stream. ``message_type`` is one of:
+
+    - ``"thinking"`` — agent reasoning, summaries, or to-do lists. Emitted
+      only on completion (started reasoning is suppressed to reduce noise).
+    - ``"tool_started"`` — a tool/MCP/file-change/web-search call has begun
+      executing. Useful for chat or terminal renderers that want to show
+      in-flight progress before completion. New in 0.34+.
+    - ``"tool"`` — a tool call has finished and the adapter has the
+      completed item information. Always emitted for tool-like items
+      regardless of whether ``"tool_started"`` was seen.
+
+    Consumers that switch on ``message_type`` should ignore unknown kinds to
+    stay forward-compatible with future categories.
+    """
 
     _provider_name = "codex_cli"
     _display_name = "Codex CLI"
@@ -491,6 +532,91 @@ class CodexCliLLMAdapter:
                 return candidate.strip()
         return ""
 
+    @staticmethod
+    def _redact_env_presence(value: str | None) -> bool:
+        """Return presence without exposing secret material in error details."""
+        return bool(value and value.strip())
+
+    @staticmethod
+    def _path_exists(value: str | None, child: str | None = None) -> bool:
+        """Return whether an env-backed path exists without raising."""
+        if not value:
+            return False
+        path = Path(value).expanduser()
+        if child:
+            path = path / child
+        return path.exists()
+
+    @classmethod
+    def _codex_auth_context(cls) -> dict[str, object]:
+        """Return non-secret Codex auth-plane diagnostics for nested CLI failures."""
+        codex_home = os.environ.get("CODEX_HOME")
+        home = os.environ.get("HOME")
+        auth_base = codex_home or (str(Path(home).expanduser() / ".codex") if home else None)
+        return {
+            "codex_home": codex_home or "",
+            "home": home or "",
+            "codex_auth_json_exists": cls._path_exists(auth_base, "auth.json"),
+            "codex_config_toml_exists": cls._path_exists(auth_base, "config.toml"),
+            "openai_api_key_present": cls._redact_env_presence(os.environ.get("OPENAI_API_KEY")),
+        }
+
+    @staticmethod
+    def _looks_like_codex_auth_failure(message: str) -> bool:
+        """Identify Codex/OpenAI auth failures that are otherwise opaque 401s.
+
+        Requires BOTH an auth-related phrase AND a Codex/OpenAI-specific
+        provider marker. Without the marker, generic 401s from nested tool
+        or MCP calls would be misclassified as Codex auth-plane failures
+        and routed to the wrong remediation (``CODEX_HOME/auth.json``).
+        """
+        normalized = message.lower()
+        has_auth_phrase = any(pattern in normalized for pattern in _CODEX_AUTH_FAILURE_PATTERNS)
+        if not has_auth_phrase:
+            return False
+        return any(marker in normalized for marker in _CODEX_PROVIDER_MARKERS)
+
+    @staticmethod
+    def _uses_openai_responses_endpoint(message: str) -> bool:
+        """Return whether the error mentions the OpenAI Responses API endpoint."""
+        return _OPENAI_RESPONSES_ENDPOINT in message.lower()
+
+    @classmethod
+    def _codex_failure_details(
+        cls,
+        *,
+        returncode: int | None,
+        session_id: str | None,
+        stderr: str,
+        stdout_errors: list[str],
+        message: str,
+    ) -> dict[str, object]:
+        """Build structured, non-secret details for a failed Codex CLI call."""
+        details: dict[str, object] = {
+            "returncode": returncode,
+            "session_id": session_id,
+            "stderr": stderr,
+            "stdout_errors": stdout_errors,
+        }
+        auth_failure = cls._looks_like_codex_auth_failure(message)
+        openai_responses = cls._uses_openai_responses_endpoint(message)
+        if auth_failure:
+            details.update(
+                {
+                    "failure_category": "codex_auth",
+                    "auth_plane": "codex_cli",
+                    "openai_responses_endpoint_seen": openai_responses,
+                    "codex_auth_context": cls._codex_auth_context(),
+                    "remediation": (
+                        "Verify that the nested Codex process inherits CODEX_HOME/HOME and "
+                        "that CODEX_HOME/auth.json contains the intended Codex OAuth login. "
+                        "If llm.backend is codex, this should not require OPENAI_API_KEY unless "
+                        "the selected Codex profile intentionally uses an OpenAI API-key provider."
+                    ),
+                }
+            )
+        return details
+
     def _fallback_content(self, stdout_lines: list[str], stderr: str) -> str:
         """Build a fallback response from JSON events or stderr."""
         for line in reversed(stdout_lines):
@@ -558,11 +684,18 @@ class CodexCliLLMAdapter:
         return tool_name
 
     def _emit_callback_for_event(self, event: dict[str, Any]) -> None:
-        """Emit best-effort debug callbacks from Codex JSON events."""
+        """Emit best-effort debug callbacks from Codex JSON events.
+
+        External chat hosts such as Hermes/Discord need to distinguish tool
+        start from tool completion when they render nested Codex progress.
+        Keep the historical ``tool`` callback for completed items and add a
+        non-breaking ``tool_started`` callback for started tool events.
+        """
         if self._on_message is None:
             return
 
-        if event.get("type") != "item.completed":
+        event_type = event.get("type")
+        if event_type not in {"item.started", "item.completed"}:
             return
 
         item = event.get("item")
@@ -574,6 +707,8 @@ class CodexCliLLMAdapter:
             return
 
         if item_type in {"agent_message", "reasoning", "todo_list"}:
+            if event_type == "item.started":
+                return
             content = self._extract_text(item)
             if content:
                 self._on_message("thinking", content)
@@ -582,23 +717,28 @@ class CodexCliLLMAdapter:
         if item_type == "command_execution":
             command = self._extract_text({"command": item.get("command")}) or ""
             tool_info = self._format_tool_info("Bash", {"command": command})
-            self._on_message("tool", tool_info)
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
             return
 
         if item_type == "mcp_tool_call":
             tool_name = item.get("name") if isinstance(item.get("name"), str) else "mcp_tool"
             tool_info = self._format_tool_info(tool_name, self._extract_tool_input(item))
-            self._on_message("tool", tool_info)
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
             return
 
         if item_type == "file_change":
             tool_info = self._format_tool_info("Edit", {"file_path": self._extract_path(item)})
-            self._on_message("tool", tool_info)
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
             return
 
         if item_type == "web_search":
-            tool_info = self._format_tool_info("WebSearch", {"query": self._extract_text(item)})
-            self._on_message("tool", tool_info)
+            query = (
+                item.get("query")
+                if isinstance(item.get("query"), str)
+                else self._extract_text(item)
+            )
+            tool_info = self._format_tool_info("WebSearch", {"query": query})
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
 
     async def _iter_stream_lines(
         self,
@@ -799,12 +939,15 @@ class CodexCliLLMAdapter:
                         or content
                         or f"{self._display_name} exited with code {process.returncode}",
                         provider=self._provider_name,
-                        details={
-                            "returncode": process.returncode,
-                            "session_id": session_id,
-                            "stderr": "\n".join(stderr_lines).strip(),
-                            "stdout_errors": stdout_errors,
-                        },
+                        details=self._codex_failure_details(
+                            returncode=process.returncode,
+                            session_id=session_id,
+                            stderr="\n".join(stderr_lines).strip(),
+                            stdout_errors=stdout_errors,
+                            message=(stdout_errors[-1] if stdout_errors else None)
+                            or content
+                            or f"{self._display_name} exited with code {process.returncode}",
+                        ),
                     )
                 )
 
@@ -963,12 +1106,15 @@ class CodexCliLLMAdapter:
                     or content
                     or f"{self._display_name} exited with code {process.returncode}",
                     provider=self._provider_name,
-                    details={
-                        "returncode": process.returncode,
-                        "session_id": session_id,
-                        "stderr": "\n".join(stderr_lines).strip(),
-                        "stdout_errors": stdout_errors,
-                    },
+                    details=self._codex_failure_details(
+                        returncode=process.returncode,
+                        session_id=session_id,
+                        stderr="\n".join(stderr_lines).strip(),
+                        stdout_errors=stdout_errors,
+                        message=(stdout_errors[-1] if stdout_errors else None)
+                        or content
+                        or f"{self._display_name} exited with code {process.returncode}",
+                    ),
                 )
             )
 
