@@ -17,8 +17,9 @@ from ouroboros.auto.adapters import (
 )
 from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.pipeline import AutoPipeline, AutoPipelineResult
+from ouroboros.auto.resume_render import render_resume_lines
 from ouroboros.auto.seed_repairer import SeedRepairer
-from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
+from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoResumeCapability, AutoStore
 from ouroboros.config import get_opencode_mode
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
@@ -247,7 +248,7 @@ def _result_meta(result: AutoPipelineResult) -> dict[str, Any]:
         "current_round": result.current_round,
         "last_progress_message": result.last_progress_message,
         "last_progress_at": result.last_progress_at,
-        "resume_command": f"ooo auto --resume {result.auto_session_id}",
+        "resume_capability": result.resume_capability.value,
         "blocker": result.blocker,
         "seed_path": result.seed_path,
         "seed_origin": result.seed_origin,
@@ -258,6 +259,14 @@ def _result_meta(result: AutoPipelineResult) -> dict[str, Any]:
         "job_id": result.job_id,
         "run_session_id": result.run_session_id,
     }
+    # Only advertise a runnable resume_command when --resume actually has
+    # something to do. NONE-capability sessions (COMPLETE, or unrecoverable
+    # BLOCKED/FAILED) must not surface a resume action via metadata —
+    # otherwise clients keying off ``meta.resume_command`` would push users
+    # into a guaranteed-failing ``--resume`` path even though the
+    # human-readable text intentionally omits the hint.
+    if result.resume_capability is not AutoResumeCapability.NONE:
+        meta["resume_command"] = f"ooo auto --resume {result.auto_session_id}"
     if result.pending_question:
         meta["pending_question"] = result.pending_question
     if result.run_handoff_status:
@@ -475,5 +484,13 @@ def _format_result(result: AutoPipelineResult) -> str:
         lines.extend(f"- {item}" for item in result.non_goals)
     if result.blocker:
         lines.append(f"Blocker: {result.blocker}")
-    lines.append(f"Resume: ooo auto --resume {result.auto_session_id}")
+    capability = result.resume_capability
+    lines.extend(
+        render_resume_lines(
+            capability,
+            result.auto_session_id,
+            goal=None,
+            use_markup=False,
+        )
+    )
     return "\n".join(lines)

@@ -472,6 +472,7 @@ async def test_auto_handler_meta_exposes_auto_progress_fields(monkeypatch) -> No
         "current_round": 2,
         "last_progress_message": "asking interview round 2/12",
         "last_progress_at": "2026-05-01T12:00:00+00:00",
+        "resume_capability": "resume",
         "resume_command": "ooo auto --resume auto_test",
         "blocker": "waiting for interview answer",
         "seed_path": "/tmp/seed.yaml",
