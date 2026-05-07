@@ -19,6 +19,7 @@ from typer.testing import CliRunner
 from ouroboros.cli.commands.mcp_doctor import (
     CheckResult,
     check_claude_agent_sdk_import,
+    check_codex_oauth_auth,
     check_event_store,
     check_litellm_import,
     check_mcp_import,
@@ -271,6 +272,78 @@ class TestCheckLitellmImport:
         with patch("builtins.__import__", side_effect=_import_error_for("litellm")):
             result = check_litellm_import()
         assert result.status != "fail"
+
+
+# ---------------------------------------------------------------------------
+# check_codex_oauth_auth
+# ---------------------------------------------------------------------------
+
+
+class TestCheckCodexOauthAuth:
+    def test_passes_when_codex_auth_json_exists_without_openai_key(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+        (codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="codex"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="codex"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "pass"
+        assert "auth.json" in result.message
+        assert "OPENAI_API_KEY not required" in result.message
+
+    def test_fails_when_codex_backend_active_without_auth_json(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="hermes"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="codex"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "fail"
+        assert "Codex backend active" in result.message
+        assert "CODEX_HOME/HOME" in result.remediation
+        assert "OPENAI_API_KEY" in result.remediation
+
+    def test_passes_when_codex_backend_uses_openai_api_key_without_auth_json(
+        self, tmp_path, monkeypatch
+    ):
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="hermes"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="codex"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "pass"
+        assert "OPENAI_API_KEY is present" in result.message
+        assert "API-key-backed Codex profile" in result.message
+        assert "codex login" in result.remediation
+
+    def test_warns_when_codex_backend_inactive_without_auth_json(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="claude"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="claude_code"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "warn"
+        assert "Codex backend not active" in result.message
 
 
 # ---------------------------------------------------------------------------

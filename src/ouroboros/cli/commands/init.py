@@ -54,6 +54,8 @@ class AgentRuntimeBackend(str, Enum):  # noqa: UP042
     OPENCODE = "opencode"
     HERMES = "hermes"
     GEMINI = "gemini"
+    KIRO = "kiro"
+    COPILOT = "copilot"
 
 
 class LLMBackend(str, Enum):  # noqa: UP042
@@ -62,8 +64,10 @@ class LLMBackend(str, Enum):  # noqa: UP042
     CLAUDE_CODE = "claude_code"
     LITELLM = "litellm"
     CODEX = "codex"
+    COPILOT = "copilot"
     OPENCODE = "opencode"
     GEMINI = "gemini"
+    KIRO = "kiro"
 
 
 class _DefaultStartGroup(typer.core.TyperGroup):
@@ -108,6 +112,10 @@ def _make_message_callback(debug: bool):
             display = first_line[:100] + "..." if len(first_line) > 100 else first_line
             if display:
                 console.print(f"  [dim]💭 {display}[/dim]")
+        elif msg_type == "tool_started":
+            # External chat renderers and debug terminals can show tool/MCP progress
+            # before completion when providers stream start events.
+            console.print(f"  [cyan]▶ {content}[/cyan]")
         elif msg_type == "tool":
             # Tool info now includes details like "Read: /path/to/file"
             console.print(f"  [yellow]🔧 {content}[/yellow]")
@@ -693,7 +701,7 @@ def start(
             "--runtime",
             help=(
                 "Agent runtime backend for the workflow execution step after seed generation "
-                "(claude, codex, opencode, or hermes)."
+                "(claude, codex, opencode, hermes, gemini, copilot, or kiro)."
             ),
             case_sensitive=False,
         ),
@@ -704,7 +712,7 @@ def start(
             "--llm-backend",
             help=(
                 "LLM backend for interview, ambiguity scoring, and seed generation "
-                "(claude_code, litellm, codex, or opencode)."
+                "(claude_code, litellm, codex, copilot, opencode, or gemini)."
             ),
             case_sensitive=False,
         ),

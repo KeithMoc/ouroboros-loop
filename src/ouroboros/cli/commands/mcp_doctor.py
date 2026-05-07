@@ -142,6 +142,16 @@ def _get_runtime_backend() -> str:
         return "claude"
 
 
+def _get_llm_backend() -> str:
+    """Return the configured LLM backend, with a safe fallback."""
+    try:
+        from ouroboros.config.loader import get_llm_backend
+
+        return get_llm_backend()
+    except Exception:
+        return "claude_code"
+
+
 def check_claude_agent_sdk_import() -> CheckResult:
     """Check that the ``claude`` extra (claude-agent-sdk) is installed.
 
@@ -202,6 +212,81 @@ def check_litellm_import() -> CheckResult:
             message="litellm not installed (optional)",
             remediation="pip install 'ouroboros-ai[litellm]'  or  uv add 'ouroboros-ai[litellm]'",
         )
+
+
+_CODEX_BACKENDS = frozenset({"codex", "codex_cli"})
+
+
+def _codex_home_from_env() -> Path:
+    """Return the Codex home directory implied by the current environment."""
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if codex_home:
+        return Path(codex_home).expanduser()
+    return Path.home() / ".codex"
+
+
+def _codex_backend_active() -> bool:
+    """Return whether any configured Ouroboros backend relies on Codex auth."""
+    return _get_runtime_backend() in _CODEX_BACKENDS or _get_llm_backend() in _CODEX_BACKENDS
+
+
+def check_codex_oauth_auth() -> CheckResult:
+    """Check Codex OAuth files when Codex is the selected runtime/LLM backend.
+
+    ``ouroboros_interview`` and ``ouroboros_auto`` can launch nested ``codex
+    exec`` calls from MCP server processes.  In Hermes/Discord deployments, an
+    opaque 401 from ``api.openai.com/v1/responses`` often means the nested
+    process did not see the expected Codex OAuth home, not that the user should
+    blindly add an OpenAI API key.
+    """
+    codex_home = _codex_home_from_env()
+    auth_json = codex_home / "auth.json"
+    config_toml = codex_home / "config.toml"
+    openai_key_present = bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    codex_active = _codex_backend_active()
+
+    if auth_json.exists():
+        config_note = "config.toml found" if config_toml.exists() else "config.toml missing"
+        key_note = "OPENAI_API_KEY present" if openai_key_present else "OPENAI_API_KEY not required"
+        return CheckResult(
+            name="codex_oauth_auth",
+            status="pass",
+            message=f"{auth_json} found ({config_note}; {key_note})",
+        )
+
+    if codex_active and openai_key_present:
+        return CheckResult(
+            name="codex_oauth_auth",
+            status="pass",
+            message=(
+                f"{auth_json} not found, but OPENAI_API_KEY is present for an "
+                "API-key-backed Codex profile"
+            ),
+            remediation=(
+                "If this deployment is intended to use Codex OAuth instead, run `codex login` "
+                "for the same user/environment or set CODEX_HOME/HOME so nested MCP/Codex "
+                "processes can read the existing auth.json."
+            ),
+        )
+
+    if codex_active:
+        return CheckResult(
+            name="codex_oauth_auth",
+            status="fail",
+            message=f"Codex backend active but {auth_json} not found",
+            remediation=(
+                "Run `codex login` for the same user/environment, or set CODEX_HOME/HOME "
+                "so nested MCP/Codex processes can read the existing Codex OAuth auth.json. "
+                "Do not add OPENAI_API_KEY unless you intentionally use an API-key Codex profile."
+            ),
+        )
+
+    return CheckResult(
+        name="codex_oauth_auth",
+        status="warn",
+        message=f"{auth_json} not found (Codex backend not active)",
+        remediation="Required only when runtime_backend or llm.backend is codex.",
+    )
 
 
 def check_event_store() -> CheckResult:
@@ -319,6 +404,7 @@ _ALL_CHECKS = [
     check_mcp_import,
     check_claude_agent_sdk_import,
     check_litellm_import,
+    check_codex_oauth_auth,
     check_event_store,
     check_pid_file,
 ]
@@ -342,7 +428,7 @@ def register_doctor_command(app: typer.Typer) -> None:
         """Run environment diagnostics for the MCP server.
 
         Checks Python version, installed extras (mcp, claude-agent-sdk,
-        litellm), EventStore health, and PID file liveness.  Backend-specific
+        litellm), Codex OAuth readiness, EventStore health, and PID file liveness.  Backend-specific
         extras are validated against the configured runtime so that non-Claude
         setups (codex, opencode) do not produce false failures.  Exit code 1
         if any check fails.
@@ -387,6 +473,7 @@ __all__ = [
     "check_mcp_import",
     "check_claude_agent_sdk_import",
     "check_litellm_import",
+    "check_codex_oauth_auth",
     "check_event_store",
     "check_pid_file",
     "register_doctor_command",
