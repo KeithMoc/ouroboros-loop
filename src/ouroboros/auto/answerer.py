@@ -116,13 +116,41 @@ class AutoAnswerer:
         if _is_feature_acceptance_question(lowered):
             return self._feature_acceptance_answer(question)
         if _is_actor_or_io_question(lowered):
-            return self._io_actor_answer(question)
-        if _is_runtime_context_question(lowered):
-            return self._runtime_answer(question, context)
-        if _is_product_behavior_question(lowered):
-            return self._product_behavior_answer(question)
+            answer = self._io_actor_answer(question)
+        elif _is_runtime_context_question(lowered):
+            answer = self._runtime_answer(question, context)
+        elif _is_product_behavior_question(lowered):
+            answer = self._product_behavior_answer(question)
+        else:
+            answer = self._default_answer(question, ledger)
 
-        return self._default_answer(question, ledger)
+        # When the chosen route produced a non-grounded fallback (ASSUMPTION,
+        # EXISTING_CONVENTION, CONSERVATIVE_DEFAULT) for a question that the
+        # safe-allowlist recognises as a regulated-product question, re-route
+        # to _product_behavior_answer() so the regulated-feature semantics
+        # (regulated noun, subject-specific constraints) are preserved in the
+        # ledger instead of being replaced by a generic IO/runtime/default
+        # template. Grounded answers (REPO_FACT etc.) are NOT in
+        # _RISKY_FALLBACK_SOURCES and so are left untouched — preserving the
+        # existing runtime/IO contract that "concrete repo fact wins".
+        if answer.source in _RISKY_FALLBACK_SOURCES and _is_safe_product_regulated_question(
+            lowered
+        ):
+            answer = self._product_behavior_answer(question)
+
+        if answer.source in _RISKY_FALLBACK_SOURCES:
+            risky_blocker = _risky_fallback_blocker_for(question, lowered)
+            if risky_blocker is not None:
+                return AutoAnswer(
+                    text=(
+                        "Cannot safely decide automatically with a generic default: "
+                        f"{risky_blocker.reason}"
+                    ),
+                    source=AutoAnswerSource.BLOCKER,
+                    confidence=1.0,
+                    blocker=risky_blocker,
+                )
+        return answer
 
     def apply(self, answer: AutoAnswer, ledger: SeedDraftLedger, *, question: str) -> None:
         """Apply answer updates to ``ledger``."""
@@ -526,6 +554,21 @@ def _is_product_behavior_question(lowered: str) -> bool:
             r"\b(should|must|can|will|do|does|enforce|track|edit|subscribe)\b",
             lowered,
         )
+        # Covers every product-semantics verb that
+        # ``_is_safe_product_regulated_question()`` allows (export, download,
+        # render, display, show, expose, support, enable, allow, view, access)
+        # and the "be able to <verb>" phrasing gap for ``view`` / ``access`` /
+        # ``download``.  Some of these verbs are already matched by the broader
+        # patterns above; listing the full set here keeps the safe-allowlist
+        # vocabulary explicitly aligned with the router so the two never drift
+        # silently. Any question allowed past the risky-fallback gate must also
+        # route through ``_product_behavior_answer()`` rather than silently
+        # falling to ``_default_answer()``.
+        or re.search(
+            r"\b(should|must|can|will|do|does|is|are)\b.+\b(be able to\s+)?"
+            r"(export|download|render|display|show|expose|support|enable|allow|view|access)\b",
+            lowered,
+        )
     )
 
 
@@ -626,6 +669,228 @@ def _is_safe_product_sensitive_question(lowered: str) -> bool:
             ),
         )
     )
+
+
+_RISKY_FALLBACK_SOURCES: frozenset[AutoAnswerSource] = frozenset(
+    {
+        AutoAnswerSource.CONSERVATIVE_DEFAULT,
+        AutoAnswerSource.ASSUMPTION,
+        # ``_runtime_answer`` returns EXISTING_CONVENTION when no concrete
+        # repo fact was supplied. The text is still a generic
+        # "use the existing repository runtime" template, so for regulated
+        # topics it must be gated like any other fallback. A REPO_FACT-backed
+        # runtime answer (full ``runtime_context`` supplied) is unaffected.
+        AutoAnswerSource.EXISTING_CONVENTION,
+    }
+)
+
+
+_DESTRUCTIVE_BULK_VERBS = (
+    r"truncate|truncates|truncating|truncated|"
+    r"purge|purges|purging|purged|"
+    r"wipe|wipes|wiping|wiped|"
+    r"drop|drops|dropping|dropped|"
+    r"erase|erases|erasing|erased"
+)
+# Strong data-object nouns that unambiguously indicate schema/data destruction.
+_DESTRUCTIVE_BULK_NOUNS = (
+    r"table|tables|schema|schemas|"
+    r"database|databases|"
+    r"record|records|row|rows|"
+    r"audit log|audit logs|audit trail|audit trails|"
+    r"index|indexes|indices|"
+    r"migration|migrations"
+)
+# When the question contains one of these non-data qualifier phrases the
+# destructive-bulk match is referring to a process artefact (release plan, docs,
+# roadmap, …) rather than schema/data destruction — skip the gate for those.
+#
+# The qualifier is strictly phrase-scoped: bare tokens like ``documentation`` or
+# ``release plan`` anywhere in the sentence would let an actual destructive
+# operation slip past the gate (e.g. "Which tables should we drop according to
+# the documentation before redeploying?"). The exemption fires only when the
+# artefact is the explicit object of the drop/wipe — introduced by
+# ``from the …`` or ``in the …`` — which is the phrasing that signals
+# "remove/edit an entry inside a process artefact" rather than "delete data from
+# a system". Authority/reference phrasings (``according to the documentation``,
+# ``per the release plan``) do NOT match this pattern and therefore do NOT
+# suppress the destructive-bulk gate.
+_DESTRUCTIVE_BULK_NON_DATA_QUALIFIERS = re.compile(
+    r"\b(?:from|in)\s+the\s+"
+    r"(?:release\s+plan|docs|documentation|roadmap|backlog|changelog|spec)"
+    r"\b"
+)
+
+
+_RISKY_FALLBACK_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        r"\b(pii|personally identifiable information)\b",
+        "regulated personal data handling",
+    ),
+    (
+        r"\b(gdpr|hipaa|sox|pci[- ]?dss)\b",
+        "regulated data handling",
+    ),
+    # Verb-then-noun, e.g. "How should the migration purge tables for old users?"
+    (
+        rf"\b(?:{_DESTRUCTIVE_BULK_VERBS})\b.+\b(?:{_DESTRUCTIVE_BULK_NOUNS})\b",
+        "destructive bulk data operation",
+    ),
+    # Noun-then-verb, e.g. "Which tables should the migration truncate?"
+    (
+        rf"\b(?:{_DESTRUCTIVE_BULK_NOUNS})\b.+\b(?:{_DESTRUCTIVE_BULK_VERBS})\b",
+        "destructive bulk data operation",
+    ),
+)
+
+
+_REGULATED_NOUNS_RE = re.compile(
+    r"\b(pii|personally identifiable information|gdpr|hipaa|sox|pci[- ]?dss)\b"
+)
+_PRODUCT_SEMANTICS_REGULATED_VERBS_RE = re.compile(
+    r"\b(export|exports|exporting|exported|"
+    r"download|downloads|downloading|downloaded|"
+    r"render|renders|rendering|rendered|"
+    r"display|displays|displaying|displayed|"
+    r"show|shows|showing|shown|"
+    r"expose|exposes|exposing|exposed|"
+    r"support|supports|supporting|supported|"
+    r"enable|enables|enabling|enabled|"
+    r"allow|allows|allowing|allowed|"
+    r"view|views|viewing|viewed|"
+    r"access|accesses|accessing|accessed)\b"
+)
+# Compliance-policy verbs in *active* form only (base / -s / -ing).
+# Past-participle forms (``stored``, ``encrypted``, ``retained``, …) are
+# deliberately excluded because they routinely act as adjectives modifying a
+# regulated noun (``view stored PII``, ``display encrypted HIPAA files``) — the
+# main verb of those sentences is the product-semantics one, not a request for
+# a compliance-policy decision.
+#
+# When an active-form compliance verb appears, the question is asking the
+# pipeline to decide regulated-data handling (``How should the system store …?``,
+# ``Should we retain and export PII records?``) and must remain blocked even if
+# the same sentence also mentions a product-semantics verb.
+_COMPLIANCE_POLICY_ACTIVE_VERBS_RE = re.compile(
+    r"\b(store|stores|storing|"
+    r"handle|handles|handling|"
+    r"retain|retains|retaining|"
+    r"collect|collects|collecting|"
+    r"encrypt|encrypts|encrypting|"
+    r"process|processes|processing|"
+    r"transmit|transmits|transmitting|"
+    r"disclose|discloses|disclosing|"
+    r"share|shares|sharing|"
+    r"manage|manages|managing|"
+    r"govern|governs|governing)\b"
+)
+# Broad product-question indicator: contains a modal/question word.  Looser than
+# ``_is_product_behavior_question`` so that phrasings like "Should users be able
+# to download …" are captured even when ``download`` is not in that helper's verb list.
+_PRODUCT_QUESTION_MODAL_RE = re.compile(r"\b(should|must|can|will|do|does|is|are)\b")
+# Reject "compliance-scope-as-feature-flag" phrasings: a wide-coverage
+# enablement verb (``support`` / ``enable`` / ``allow``) directly followed by a
+# bare regulated noun with no further qualifying noun. Such prompts
+# ("Should the platform support HIPAA?", "Should the app enable GDPR?",
+# "Should the system allow PII?") are treating the entire compliance regime as
+# a feature toggle, which is a regulated-policy decision rather than a bounded
+# product-behavior question. The trailing negative lookahead ``(?!\s+[a-z])``
+# fires when the regulated noun is the last lexical token of the clause; if any
+# qualifying noun follows ("HIPAA audit logs", "GDPR consent banners", "PII
+# redaction in exports", "GDPR data") the question describes a concrete
+# product feature and is not rejected here.
+_BARE_COMPLIANCE_SCOPE_RE = re.compile(
+    r"\b(?:support|supports|supporting|supported|"
+    r"enable|enables|enabling|enabled|"
+    r"allow|allows|allowing|allowed)\s+"
+    r"(?:pii|personally identifiable information|gdpr|hipaa|sox|pci[- ]?dss)\b"
+    r"(?!\s+[a-z])"
+)
+
+
+def _is_safe_product_regulated_question(lowered: str) -> bool:
+    """Allow product-semantics questions that mention regulated-data nouns.
+
+    Auto mode must not decide compliance policy (how to store/handle/retain PII,
+    which fields are HIPAA-regulated, etc.), but it can answer bounded product
+    requirements questions such as "Should the app export PII reports?" or
+    "Should users be able to download GDPR exports?".  Those are asking for
+    feature-level behavior, not compliance-policy decisions.
+
+    Strategy: pass through when the question
+      1. mentions a regulated noun (PII/GDPR/HIPAA/SOX/PCI-DSS),
+      2. contains a product-question modal (should/can/will/must/do/does/is/are),
+      3. does NOT use an *active*-form compliance-policy verb (``store``,
+         ``stores``, ``storing``, ``handle``, ``encrypt``, ``share``, …) — those
+         signal a regulated-data handling decision and must stay blocked even
+         when mixed with product-semantics verbs (``How should the system store
+         and display HIPAA files?``, ``Should we retain and export PII
+         records?``),
+      4. is NOT a bare compliance-scope-as-feature-flag phrasing
+         (``support|enable|allow`` + bare regulated noun with no qualifying
+         feature noun). ``Should the platform support HIPAA?`` and
+         ``Should the app enable GDPR?`` are framing the entire regulatory
+         regime as a toggle, which remains a compliance-policy decision.
+      5. uses a product-semantics verb (export, download, display, show, view …).
+
+    Past-participle compliance forms (``stored``, ``encrypted``, ``retained``,
+    …) are intentionally NOT in the negative list: in product-behavior questions
+    they routinely act as adjectives modifying a regulated noun (``view stored
+    PII``, ``display encrypted HIPAA files``), and the sentence's main action is
+    the product-semantics verb. Pure-compliance phrasings using past-participle
+    forms (``Should PII be stored …?``) lack a product-semantics verb and are
+    rejected by step (4) instead.
+    """
+    if not _REGULATED_NOUNS_RE.search(lowered):
+        return False
+    if not _PRODUCT_QUESTION_MODAL_RE.search(lowered):
+        return False
+    if _COMPLIANCE_POLICY_ACTIVE_VERBS_RE.search(lowered):
+        return False
+    if _BARE_COMPLIANCE_SCOPE_RE.search(lowered):
+        return False
+    return bool(_PRODUCT_SEMANTICS_REGULATED_VERBS_RE.search(lowered))
+
+
+def _risky_fallback_blocker_for(question: str, lowered: str) -> AutoBlocker | None:
+    """Return a blocker when a generative fallback answer would touch a high-risk topic.
+
+    The gate only fires for *generative* answer routes (actor/IO, runtime,
+    product behavior, default). Meta-question routes — non-goal listing,
+    verification policy, feature acceptance criteria — are checked earlier in
+    ``answer`` and never reach this function, because phrasing such as
+    "What acceptance criteria should the HIPAA worker satisfy?" is asking
+    about a generic acceptance template, not asking the auto pipeline to
+    decide regulated-data handling.
+
+    Targeted topics: regulated personal data (PII/GDPR/HIPAA/SOX/PCI-DSS) and
+    destructive bulk schema/table operations.  Production-deployment and
+    credential authority are already gated by the explicit ``_blocker_for``
+    allow/deny lists.
+
+    Product-feature questions covered by existing safe-allowlists — such as
+    "should users be able to configure production credentials?" or
+    "should the app export PII reports?" — are skipped so the auto pipeline
+    keeps answering them with feature semantics.
+    """
+    if (
+        _is_safe_product_branch_question(lowered)
+        or _is_safe_product_sensitive_question(lowered)
+        or _is_safe_product_regulated_question(lowered)
+    ):
+        return None
+    for pattern, reason in _RISKY_FALLBACK_PATTERNS:
+        if re.search(pattern, lowered):
+            # For destructive-bulk matches, skip when the question context
+            # indicates a non-data artefact (release plan, docs, etc.) rather
+            # than actual schema/data destruction.
+            if (
+                reason == "destructive bulk data operation"
+                and _DESTRUCTIVE_BULK_NON_DATA_QUALIFIERS.search(lowered)
+            ):
+                continue
+            return AutoBlocker(reason=reason, question=question)
+    return None
 
 
 def _blocker_for(question: str) -> AutoBlocker | None:

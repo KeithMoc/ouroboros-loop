@@ -963,3 +963,595 @@ def test_auto_answerer_still_blocks_real_production_credential_authority() -> No
         answer = answerer.answer(question, SeedDraftLedger.from_goal("Deploy a service"))
         assert answer.blocker is not None
         assert answer.source == AutoAnswerSource.BLOCKER
+
+
+def test_auto_answerer_blocks_regulated_data_questions_instead_of_falling_back() -> None:
+    answerer = AutoAnswerer()
+    questions = (
+        ("What PII should the system collect?", "regulated personal data handling"),
+        (
+            "Which fields are HIPAA regulated and how should we store them?",
+            "regulated data handling",
+        ),
+        ("How should the migration purge tables for old users?", "destructive bulk data operation"),
+    )
+
+    for question, reason in questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == reason, question
+
+
+def test_auto_answerer_does_not_block_regulated_topic_when_repo_fact_supplied() -> None:
+    answerer = AutoAnswerer()
+    context = AutoAnswerContext(
+        repo_facts={"runtime_context": "Compliance worker on Python 3.14 (HIPAA-aware)"},
+        evidence={"runtime_context": ("docs/compliance.md",)},
+    )
+
+    answer = answerer.answer(
+        "Which runtime should the HIPAA worker use?",
+        SeedDraftLedger.from_goal("Build a HIPAA worker"),
+        context,
+    )
+
+    assert answer.source == AutoAnswerSource.REPO_FACT
+    assert answer.blocker is None
+
+
+def test_auto_answerer_skips_risky_fallback_for_safe_product_credential_questions() -> None:
+    answerer = AutoAnswerer()
+    questions = (
+        "Should users be able to configure production credentials?",
+        "Should the app store production credentials?",
+    )
+
+    for question in questions:
+        answer = answerer.answer(
+            question, SeedDraftLedger.from_goal("Build credential management settings")
+        )
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_does_not_block_meta_questions_that_mention_regulated_topics() -> None:
+    """Acceptance/verification meta-questions must not be gated by keyword match.
+
+    Phrasing such as 'What acceptance criteria should the HIPAA worker satisfy?'
+    or 'Which command output verifies the GDPR export flow?' is asking for an
+    acceptance template or a verification plan, not for regulated-data
+    handling decisions.  These routes are safe templates and predate the
+    risky-fallback gate; they must continue to return non-blocker answers.
+    """
+    answerer = AutoAnswerer()
+    feature_acceptance_questions = (
+        "What acceptance criteria should the HIPAA worker satisfy?",
+        "What acceptance criteria should the GDPR exporter satisfy?",
+        "What acceptance criteria should the PII pipeline satisfy?",
+    )
+
+    for question in feature_acceptance_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.blocker is None, question
+        assert answer.source == AutoAnswerSource.CONSERVATIVE_DEFAULT, question
+
+    verification_questions = (
+        "Which command output verifies the GDPR export flow?",
+        "How should we verify the HIPAA worker tests pass?",
+        "What is the verification plan for PII handling?",
+    )
+
+    for question in verification_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.blocker is None, question
+        assert answer.source == AutoAnswerSource.CONSERVATIVE_DEFAULT, question
+
+
+def test_auto_answerer_blocks_existing_convention_runtime_fallback_for_regulated_topic() -> None:
+    """Generic 'use the existing repo runtime' fallback must also block for regulated topics.
+
+    ``_runtime_answer`` returns ``AutoAnswerSource.EXISTING_CONVENTION`` when
+    no concrete ``runtime_context`` repo fact is supplied.  The answer text
+    is still a generic template, so a regulated runtime question without
+    grounded facts must be gated like any other fallback path.
+    """
+    answer = AutoAnswerer().answer(
+        "Which runtime should the HIPAA worker use?",
+        SeedDraftLedger.from_goal("Build a HIPAA worker"),
+    )
+
+    assert answer.source == AutoAnswerSource.BLOCKER
+    assert answer.blocker is not None
+    assert answer.blocker.reason == "regulated data handling"
+
+
+def test_auto_answerer_blocks_destructive_bulk_operations_in_either_order() -> None:
+    """Destructive bulk operations must be blocked regardless of verb/noun order.
+
+    The previous matcher only caught ``verb ... noun`` phrasings such as
+    ``purge tables``, so reversed phrasings ``Which tables should the
+    migration truncate?`` slipped through. Broaden the verb vocabulary
+    (truncate/purge/wipe with their tense variants) and the noun list
+    (tables/schemas/databases/indexes/migrations) and cover both orders.
+    """
+    answerer = AutoAnswerer()
+    blocked_questions = (
+        # verb-then-noun
+        "How should the migration purge tables for old users?",
+        "Should we wipe the user_data schema during the rollout?",
+        "How should the system truncate the audit databases?",
+        "Which tables should the migration drop?",
+        "Should we erase these schemas before re-seeding?",
+        # noun-then-verb (reverse phrasing)
+        "Which tables should the migration truncate?",
+        "Which schemas should the cleanup script purge?",
+        "Which migrations should we wipe before redeploying?",
+        "Which schemas should the data team erase tomorrow?",
+    )
+
+    for question in blocked_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build cleanup tooling"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == "destructive bulk data operation", question
+
+
+def test_auto_answerer_allows_release_plan_drop_question() -> None:
+    """Process-artefact drop questions must NOT trigger the destructive-bulk gate.
+
+    ``Which migration should we drop from the release plan?`` is asking about
+    removing a migration from a planning artefact, not about schema destruction.
+    The non-data qualifier ``release plan`` must exempt the match.
+
+    Ref: ouroboros-agent[bot] follow-up warning on #738 — ``answerer.py:666``.
+    """
+    answerer = AutoAnswerer()
+    allowed_questions = (
+        "Which migration should we drop from the release plan?",
+        "Which migrations should we drop from the release plan?",
+        "Should we drop this migration from the release plan?",
+    )
+
+    for question in allowed_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a release pipeline"))
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_allows_docs_index_drop_question() -> None:
+    """Documentation-index drop questions must NOT trigger the destructive-bulk gate.
+
+    ``Which indexes should we drop from the docs?`` is asking about removing
+    entries from documentation, not about dropping database indexes.
+    The non-data qualifier ``from the docs`` must exempt the match.
+
+    Ref: ouroboros-agent[bot] follow-up warning on #738 — ``answerer.py:666``.
+    """
+    answerer = AutoAnswerer()
+    allowed_questions = (
+        "Which indexes should we drop from the docs?",
+        "Which index should we drop from the documentation?",
+    )
+
+    for question in allowed_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a docs site"))
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_blocks_destructive_bulk_with_only_documentation_reference() -> None:
+    """Authority/reference-style mentions of documentation must NOT bypass the gate.
+
+    Earlier the non-data qualifier regex matched on bare tokens such as
+    ``documentation`` or ``release plan`` anywhere in the sentence. That allowed
+    real destructive operations to slip past the gate when the question merely
+    *referenced* documentation as an authority (e.g. ``according to the
+    documentation``, ``per the release plan``) rather than describing the
+    documentation as the artefact being modified.
+
+    The qualifier is now phrase-scoped to ``from the …``/``in the …`` so the
+    exemption fires only when the artefact is the explicit object of the
+    drop/wipe — i.e. ``drop X from the docs`` or ``drop X in the roadmap``,
+    not ``drop X according to the docs``.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:688``.
+    """
+    answerer = AutoAnswerer()
+    blocked_questions = (
+        "Which tables should we drop according to the documentation before redeploying?",
+        "Which tables should we drop per the release plan?",
+        "Per the documentation, which audit logs should we purge?",
+        "According to the docs, which tables should we drop?",
+        "Following the release plan, which schemas should the data team erase?",
+    )
+
+    for question in blocked_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build cleanup tooling"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == "destructive bulk data operation", question
+
+
+def test_auto_answerer_blocks_destructive_bulk_with_ambiguous_singular_tokens() -> None:
+    """Standalone ``doc`` and ``plan`` tokens are too ambiguous to exempt.
+
+    ``from the doc`` is rare phrasing (use ``from the docs`` or ``from the
+    documentation``), and bare ``plan`` collides with database-side meanings
+    (query plan, execution plan, db plan). Both have been removed from the
+    non-data qualifier list. Only the unambiguous artefact phrasings
+    (``release plan``, ``docs``, ``documentation``, ``roadmap``, ``backlog``,
+    ``changelog``, ``spec``) exempt the destructive-bulk gate.
+    """
+    answerer = AutoAnswerer()
+    blocked_questions = (
+        "Which tables should we drop from the plan before redeploying?",
+        "Which schemas should we wipe in the plan after migration?",
+        "Which tables should we drop from the doc before the cutover?",
+    )
+
+    for question in blocked_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build cleanup tooling"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == "destructive bulk data operation", question
+
+
+def test_auto_answerer_allows_in_the_artefact_drop_questions() -> None:
+    """``in the …`` artefact phrasings must also exempt the destructive-bulk gate.
+
+    The qualifier accepts both ``from the …`` and ``in the …`` artefact phrasings
+    so that "Which indexes should we drop in the docs?" and "Which migration
+    should we drop in the roadmap?" are recognised as process-artefact edits and
+    not blocked as destructive data operations.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:698``.
+    """
+    answerer = AutoAnswerer()
+    allowed_questions = (
+        "Which indexes should we drop in the docs?",
+        "Which migration should we drop in the roadmap?",
+        "Which migration should we drop in the release plan?",
+        "Which tables should we drop in the changelog?",
+    )
+
+    for question in allowed_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Maintain release docs"))
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_allows_product_semantics_questions_for_regulated_topics() -> None:
+    """Product-feature questions that mention regulated nouns must NOT be blocked.
+
+    The risky-fallback gate targets compliance-policy decisions (how to store,
+    handle, retain, collect PII/HIPAA/GDPR data).  Questions that ask for
+    bounded product-behavior semantics — exporting a PII report, downloading a
+    GDPR export, showing SOX audit data — are asking for feature-level behavior
+    and must flow through to a generative product answer instead of BLOCKER.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:716``.
+    """
+    answerer = AutoAnswerer()
+    allowed_questions = (
+        "Should the app export PII reports?",
+        "Should users be able to download GDPR exports?",
+        "Should the dashboard display HIPAA audit data?",
+        "Should the system expose a SOX compliance report endpoint?",
+        "Should admins be able to view PII fields in the admin panel?",
+        "Should the app allow users to access their GDPR data?",
+    )
+
+    for question in allowed_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_allows_product_questions_with_adjectival_compliance_verbs() -> None:
+    """Past-participle compliance verbs (``stored``, ``encrypted``) acting as
+    adjectives must NOT reject a product-behavior question.
+
+    The earlier allowlist rejected any question containing a compliance-policy
+    verb anywhere in the text. That over-blocked legitimate product-semantics
+    questions where the compliance verb appears as a past-participle adjective
+    modifying the noun (``view stored PII fields``, ``display encrypted HIPAA
+    files``). The main verb of the sentence is the product-semantics one
+    (``view`` / ``display``), so the question is asking for product behavior
+    over already-existing regulated data, not for a compliance-policy decision.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:782``.
+    """
+    answerer = AutoAnswerer()
+    allowed_questions = (
+        "Should admins be able to view stored PII fields?",
+        "Should the dashboard display encrypted HIPAA files?",
+        "Should users be able to download retained GDPR exports?",
+        "Should the app show collected SOX records to auditors?",
+        "Can the audit panel display shared PII access events?",
+    )
+
+    for question in allowed_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_routes_regulated_product_questions_before_io_or_runtime() -> None:
+    """Regulated-product questions must reach ``_product_behavior_answer()`` —
+    but only when the IO/runtime branch would otherwise return a non-grounded
+    fallback.
+
+    The router still checks ``_is_actor_or_io_question`` and
+    ``_is_runtime_context_question`` first so grounded answers (REPO_FACT for
+    runtime, ASSUMPTION-but-confirmed for IO) keep priority. When that route
+    produces a *non-grounded* fallback (``ASSUMPTION``,
+    ``EXISTING_CONVENTION``, ``CONSERVATIVE_DEFAULT``) for a question that
+    ``_is_safe_product_regulated_question`` recognises, the answer is then
+    re-routed through ``_product_behavior_answer()`` so the regulated-feature
+    semantics (regulated noun, subject-specific constraints) are preserved
+    in the ledger instead of being replaced by a generic IO/runtime template.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:837``.
+    """
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a regulated data app")
+
+    cases = [
+        ("What inputs should the GDPR export take?", "gdpr"),
+        ("What outputs should the PII export produce?", "pii"),
+        ("Which runtime should the GDPR export use?", "gdpr"),
+        ("What inputs should the HIPAA audit log download accept?", "hipaa"),
+    ]
+
+    for question, regulated_noun in cases:
+        answer = answerer.answer(question, ledger)
+
+        # Routed away from blocker
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+        # Routed to _product_behavior_answer(), not _io_actor_answer / _runtime_answer
+        update_keys = [u[1].key for u in answer.ledger_updates]
+        assert any("behavior." in k for k in update_keys), (
+            f"Expected behavior.* ledger key for {question!r}, got {update_keys}"
+        )
+        assert not any(k.startswith("io.") or k.startswith("runtime.") for k in update_keys), (
+            f"Question {question!r} fell through to IO/runtime answer "
+            f"(found IO/runtime ledger key in {update_keys})"
+        )
+
+        # Regulated noun preserved in answer text or ledger value
+        combined = answer.text + " ".join(u[1].value for u in answer.ledger_updates)
+        assert regulated_noun in combined.lower(), (
+            f"Regulated noun {regulated_noun!r} not preserved for {question!r}"
+        )
+
+
+def test_auto_answerer_preserves_repo_fact_for_regulated_runtime_question() -> None:
+    """The regulated-product reroute must NOT override grounded
+    ``REPO_FACT`` runtime answers.
+
+    ``Which runtime should the GDPR export use?`` is a regulated-product
+    question, but when the caller supplies a concrete ``runtime_context``
+    repo fact, the runtime contract requires the answer to carry that
+    grounded evidence (``AutoAnswerSource.REPO_FACT``,
+    ``LedgerSource.REPO_FACT``, runtime_context ledger entry with the
+    supplied evidence). The reroute is gated on
+    ``answer.source in _RISKY_FALLBACK_SOURCES``, and ``REPO_FACT`` is
+    not a risky-fallback source, so this case must remain unchanged.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:126``.
+    """
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a GDPR-compliant export pipeline")
+    context = AutoAnswerContext(
+        repo_facts={"runtime_context": "Python 3.12 project managed with uv and Typer CLI."},
+        evidence={"runtime_context": ("pyproject.toml", "src/ouroboros/cli/main.py")},
+    )
+
+    answer = answerer.answer("Which runtime should the GDPR export use?", ledger, context)
+
+    assert answer.source == AutoAnswerSource.REPO_FACT
+    assert "Python 3.12" in answer.text
+
+    update_sections = {section for section, _ in answer.ledger_updates}
+    assert "runtime_context" in update_sections, (
+        "Grounded runtime_context entry was dropped — regulated-product reroute "
+        "must not override REPO_FACT runtime answers."
+    )
+
+    runtime_entries = [
+        entry for section, entry in answer.ledger_updates if section == "runtime_context"
+    ]
+    assert runtime_entries, "Expected at least one runtime_context ledger entry"
+    assert runtime_entries[0].source == LedgerSource.REPO_FACT
+    assert runtime_entries[0].status == LedgerStatus.CONFIRMED
+    assert runtime_entries[0].evidence == ["pyproject.toml", "src/ouroboros/cli/main.py"]
+
+
+def test_auto_answerer_blocks_bare_compliance_scope_questions() -> None:
+    """``support|enable|allow + bare regulated noun`` is a compliance-scope
+    decision, not a product-behavior question.
+
+    Prompts that frame the entire regulatory regime as a binary feature flag —
+    "Should the platform support HIPAA?", "Should the app enable GDPR?",
+    "Should the system allow PII?" — are compliance-policy decisions and must
+    remain blocked even though they contain a product-question modal and a
+    product-semantics verb. Concrete-feature variants ("support HIPAA audit
+    logs", "enable GDPR consent banners", "allow GDPR data exports") still
+    pass through.
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:793``.
+    """
+    answerer = AutoAnswerer()
+    blocked_questions = (
+        ("Should the platform support HIPAA?", "regulated data handling"),
+        ("Should the app enable GDPR?", "regulated data handling"),
+        ("Should the system allow PII?", "regulated personal data handling"),
+        ("Should the service support SOX?", "regulated data handling"),
+        ("Should the platform support PCI-DSS?", "regulated data handling"),
+    )
+
+    for question, reason in blocked_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == reason, question
+
+
+def test_auto_answerer_allows_qualified_compliance_scope_questions() -> None:
+    """The bare-scope rejector must not over-block concrete-feature variants.
+
+    When the regulated noun is followed by a qualifying feature noun
+    ("HIPAA audit logs", "GDPR consent banners", "PII redaction"), the
+    question is asking for bounded product behavior over a specific feature
+    and must still pass through to ``_product_behavior_answer()``.
+    """
+    answerer = AutoAnswerer()
+    allowed_questions = (
+        "Should the platform support HIPAA audit logs?",
+        "Should the app enable GDPR consent banners?",
+        "Should the system allow PII redaction in exports?",
+        "Should the service support SOX compliance reporting?",
+        "Should the app allow users to access their GDPR data?",
+    )
+
+    for question in allowed_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.blocker is None, question
+        assert answer.source != AutoAnswerSource.BLOCKER, question
+
+
+def test_auto_answerer_blocks_mixed_intent_regulated_questions() -> None:
+    """Mixed-intent questions with both product-semantics and active-form
+    compliance verbs must remain blocked.
+
+    Active-form compliance verbs (``store`` / ``stores`` / ``storing``,
+    ``retain`` / ``retains`` / ``retaining``, ``encrypt``, ``handle``, …)
+    indicate that the question is asking the pipeline to decide regulated-data
+    handling, even when it also mentions a product-semantics verb. The
+    allowlist must not unblock those.
+
+    Past-participle forms (``stored``, ``encrypted``) acting as adjectives are
+    a different case and remain allowed (covered by
+    ``test_auto_answerer_allows_product_questions_with_adjectival_compliance_verbs``).
+
+    Ref: ouroboros-agent[bot] BLOCKING on #738 — ``answerer.py:750``.
+    """
+    answerer = AutoAnswerer()
+    blocked_questions = (
+        ("How should the system store and display HIPAA files?", "regulated data handling"),
+        ("Should we retain and export PII records?", "regulated personal data handling"),
+        (
+            "Should the platform encrypt and render GDPR exports?",
+            "regulated data handling",
+        ),
+        (
+            "Can the system share and display SOX audit data with auditors?",
+            "regulated data handling",
+        ),
+        (
+            "Should we collect and show new PII fields on the dashboard?",
+            "regulated personal data handling",
+        ),
+    )
+
+    for question, reason in blocked_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == reason, question
+
+
+def test_auto_answerer_still_blocks_compliance_policy_regulated_questions() -> None:
+    """Compliance-policy questions must still be blocked after the product-semantics allowlist.
+
+    Ensure the new ``_is_safe_product_regulated_question`` allowlist does not
+    swallow questions that genuinely ask the auto pipeline to decide regulated-data
+    handling (storage, retention, collection, encryption policy).
+    """
+    answerer = AutoAnswerer()
+    blocked_questions = (
+        ("What PII should the system collect?", "regulated personal data handling"),
+        (
+            "Which fields are HIPAA regulated and how should we store them?",
+            "regulated data handling",
+        ),
+        ("How should the system handle GDPR data retention?", "regulated data handling"),
+        ("Which runtime should the HIPAA worker use?", "regulated data handling"),
+    )
+
+    for question, reason in blocked_questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Build a regulated data app"))
+        assert answer.source == AutoAnswerSource.BLOCKER, question
+        assert answer.blocker is not None, question
+        assert answer.blocker.reason == reason, question
+
+
+def test_auto_answerer_routes_safe_regulated_product_questions_to_product_behavior_answerer() -> (
+    None
+):
+    """Safe regulated-product questions must route to _product_behavior_answer(), not _default_answer().
+
+    When _is_safe_product_regulated_question() passes a question through the risky-fallback
+    gate, _is_product_behavior_question() must also return True so the router at answerer.py:122
+    sends the question to _product_behavior_answer().  If that alignment is missing the question
+    silently falls to _default_answer(), which produces a generic conservative-MVP ledger entry
+    that discards the regulated-product feature semantics.
+
+    Three bot example questions from ouroboros-agent[bot] BLOCKING on #738 (answerer.py:741):
+    - ``Should users be able to download GDPR exports?``
+    - ``Should admins be able to view PII fields in the admin panel?``
+    - ``Should the app allow users to access their GDPR data?``
+
+    Assertions:
+    1. answer.blocker is None  (gate passes)
+    2. answer.source == CONSERVATIVE_DEFAULT  (product-behavior, not BLOCKER)
+    3. ledger_updates contain a subject-specific key (not the generic conservative_mvp key
+       from _default_answer), confirming the regulated-product feature is preserved.
+    4. The ledger entry value or the answer text includes the regulated noun
+       (gdpr / pii) so the subject is not silently stripped.
+    """
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a regulated data app")
+
+    # Cover every verb in ``_PRODUCT_SEMANTICS_REGULATED_VERBS_RE`` so the
+    # allowlist↔router alignment is locked in and cannot drift silently for
+    # any single verb.
+    cases = [
+        ("Should users be able to download GDPR exports?", "gdpr"),
+        ("Should admins be able to view PII fields in the admin panel?", "pii"),
+        ("Should the app allow users to access their GDPR data?", "gdpr"),
+        ("Should the app export PII reports?", "pii"),
+        ("Should the app show PII reports?", "pii"),
+        ("Should the dashboard display HIPAA audit data?", "hipaa"),
+        ("Should the system render GDPR consent notices?", "gdpr"),
+        ("Should the platform expose a SOX compliance report endpoint?", "sox"),
+        ("Should the app support PII redaction in exports?", "pii"),
+        ("Should the system enable HIPAA audit log download?", "hipaa"),
+    ]
+
+    for question, regulated_noun in cases:
+        answer = answerer.answer(question, ledger)
+
+        # Gate passed — not blocked
+        assert answer.blocker is None, question
+        assert answer.source == AutoAnswerSource.CONSERVATIVE_DEFAULT, question
+
+        # Routed to _product_behavior_answer() — ledger has subject-specific keys,
+        # not the generic "constraints.conservative_mvp" key from _default_answer().
+        update_keys = [u[1].key for u in answer.ledger_updates]
+        assert any("behavior." in k for k in update_keys), (
+            f"Expected subject-specific behavior key in ledger updates for {question!r}, "
+            f"got {update_keys}"
+        )
+        assert not any(k == "constraints.conservative_mvp" for k in update_keys), (
+            f"Question {question!r} fell through to _default_answer() (conservative_mvp key found)"
+        )
+
+        # Regulated noun preserved in the answer text or a ledger entry value
+        combined = answer.text + " ".join(u[1].value for u in answer.ledger_updates)
+        assert regulated_noun in combined.lower(), (
+            f"Regulated noun {regulated_noun!r} not found in answer/ledger for {question!r}"
+        )
