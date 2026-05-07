@@ -18,7 +18,7 @@ from ouroboros.auto.adapters import (
 from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.pipeline import AutoPipeline, AutoPipelineResult
 from ouroboros.auto.seed_repairer import SeedRepairer
-from ouroboros.auto.state import AutoPipelineState, AutoStore
+from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
 from ouroboros.config import get_opencode_mode
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
@@ -86,6 +86,43 @@ class AutoHandler:
                     required=False,
                     default=False,
                 ),
+                MCPToolParameter(
+                    "attach_execution",
+                    ToolInputType.STRING,
+                    "Attach an externally verified execution id to an unknown run handoff",
+                    required=False,
+                ),
+                MCPToolParameter(
+                    "attach_job",
+                    ToolInputType.STRING,
+                    "Attach an externally verified job id to an unknown run handoff",
+                    required=False,
+                ),
+                MCPToolParameter(
+                    "attach_session",
+                    ToolInputType.STRING,
+                    "Attach an externally verified run session id to an unknown run handoff",
+                    required=False,
+                ),
+                MCPToolParameter(
+                    "attach_source",
+                    ToolInputType.STRING,
+                    "Source label for an attached run handle",
+                    required=False,
+                ),
+                MCPToolParameter(
+                    "reconcile_run",
+                    ToolInputType.BOOLEAN,
+                    "Try to reconcile an unknown run handoff without starting a duplicate run",
+                    required=False,
+                    default=False,
+                ),
+                MCPToolParameter(
+                    "reconcile_source",
+                    ToolInputType.STRING,
+                    "Source label for run handoff reconciliation",
+                    required=False,
+                ),
             ),
         )
 
@@ -96,19 +133,7 @@ class AutoHandler:
             return Result.err(
                 MCPToolError(f"Auto pipeline failed: {exc}", tool_name="ouroboros_auto")
             )
-        meta: dict[str, Any] = {
-            "status": result.status,
-            "auto_session_id": result.auto_session_id,
-            "phase": result.phase,
-            "grade": result.grade,
-            "seed_path": result.seed_path,
-            "interview_session_id": result.interview_session_id,
-            "execution_id": result.execution_id,
-            "job_id": result.job_id,
-            "run_session_id": result.run_session_id,
-            "resume_command": f"ooo auto --resume {result.auto_session_id}",
-            "blocker": result.blocker,
-        }
+        meta = _result_meta(result)
         text = _format_result(result)
         if result.run_subagent is not None:
             meta["_subagent"] = result.run_subagent
@@ -125,6 +150,17 @@ class AutoHandler:
         store = self.store or AutoStore()
         resume = arguments.get("resume")
         requested_skip_run = bool(arguments.get("skip_run", False))
+        attach_execution = _optional_text_arg(arguments, "attach_execution")
+        attach_job = _optional_text_arg(arguments, "attach_job")
+        attach_session = _optional_text_arg(arguments, "attach_session")
+        attach_source = _optional_text_arg(arguments, "attach_source")
+        reconcile_run = bool(arguments.get("reconcile_run", False))
+        reconcile_source = _optional_text_arg(arguments, "reconcile_source")
+        attach_requested = any((attach_execution, attach_job, attach_session))
+        if attach_requested and not (isinstance(resume, str) and resume):
+            raise ValueError("attach_* arguments require resume")
+        if reconcile_run and not (isinstance(resume, str) and resume):
+            raise ValueError("reconcile_run requires resume")
         if isinstance(resume, str) and resume:
             state = store.load(resume)
             cwd = state.cwd
@@ -181,6 +217,7 @@ class AutoHandler:
             HandlerInterviewBackend(interview_handler, cwd=cwd),
             store=store,
             max_rounds=max_interview_rounds,
+            timeout_seconds=state.phase_timeout_seconds(AutoPhase.INTERVIEW),
         )
         pipeline = AutoPipeline(
             driver,
@@ -191,14 +228,67 @@ class AutoHandler:
             seed_saver=save_seed,
             seed_loader=load_seed,
             skip_run=skip_run,
+            attach_execution_id=attach_execution,
+            attach_job_id=attach_job,
+            attach_run_session_id=attach_session,
+            attach_source=attach_source,
+            reconcile_run=reconcile_run,
+            reconcile_source=reconcile_source,
         )
         return await pipeline.run(state)
+
+
+def _result_meta(result: AutoPipelineResult) -> dict[str, Any]:
+    """Build MCP metadata for clients that render auto progress outside CLI text."""
+    meta: dict[str, Any] = {
+        "status": result.status,
+        "auto_session_id": result.auto_session_id,
+        "phase": result.phase,
+        "current_round": result.current_round,
+        "last_progress_message": result.last_progress_message,
+        "last_progress_at": result.last_progress_at,
+        "resume_command": f"ooo auto --resume {result.auto_session_id}",
+        "blocker": result.blocker,
+        "seed_path": result.seed_path,
+        "seed_origin": result.seed_origin,
+        "grade": result.grade,
+        "last_grade": result.last_grade,
+        "interview_session_id": result.interview_session_id,
+        "execution_id": result.execution_id,
+        "job_id": result.job_id,
+        "run_session_id": result.run_session_id,
+    }
+    if result.pending_question:
+        meta["pending_question"] = result.pending_question
+    if result.run_handoff_status:
+        meta["run_handoff_status"] = result.run_handoff_status
+    if result.run_handoff_guidance:
+        meta["run_handoff_guidance"] = result.run_handoff_guidance
+    if result.attached_run_handle:
+        meta["attached_run_handle"] = result.attached_run_handle
+        meta["attached_run_source"] = result.attached_run_source
+        meta["attached_at"] = result.attached_at
+    if result.run_reconciliation_status:
+        meta["run_reconciliation_status"] = result.run_reconciliation_status
+        meta["run_reconciliation_source"] = result.run_reconciliation_source
+        meta["run_reconciled_at"] = result.run_reconciled_at
+    return meta
 
 
 def _resolved_opencode_mode(runtime_backend: str | None, opencode_mode: str | None) -> str | None:
     if runtime_backend != "opencode":
         return None
     return opencode_mode or get_opencode_mode()
+
+
+def _optional_text_arg(arguments: dict[str, Any], name: str) -> str | None:
+    value = arguments.get(name)
+    if value in {None, ""}:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        msg = f"{name} must be a non-empty string"
+        raise ValueError(msg)
+    return value.strip()
 
 
 def _positive_int_arg(arguments: dict[str, Any], name: str, default: int) -> int:
@@ -355,6 +445,7 @@ def _format_result(result: AutoPipelineResult) -> str:
         lines.append(f"Interview session: {result.interview_session_id}")
     if result.seed_path:
         lines.append(f"Seed: {result.seed_path}")
+    lines.append(f"Seed origin: {result.seed_origin}")
     if result.job_id or result.execution_id or result.run_session_id:
         lines.extend(
             [
@@ -364,6 +455,18 @@ def _format_result(result: AutoPipelineResult) -> str:
                 f"  session_id: {result.run_session_id}",
             ]
         )
+    if result.run_handoff_status:
+        lines.append(f"Run handoff status: {result.run_handoff_status}")
+    if result.run_handoff_guidance:
+        lines.append(f"Run handoff guidance: {result.run_handoff_guidance}")
+    if result.attached_run_handle:
+        lines.append(f"Attached run handle: {result.attached_run_handle}")
+        lines.append(f"Attached run source: {result.attached_run_source}")
+        lines.append(f"Attached at: {result.attached_at}")
+    if result.run_reconciliation_status:
+        lines.append(f"Run reconciliation status: {result.run_reconciliation_status}")
+        lines.append(f"Run reconciliation source: {result.run_reconciliation_source}")
+        lines.append(f"Run reconciled at: {result.run_reconciled_at}")
     if result.assumptions:
         lines.append("Assumptions:")
         lines.extend(f"- {item}" for item in result.assumptions)

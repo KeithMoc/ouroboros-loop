@@ -10,7 +10,11 @@ from ouroboros.auto.adapters import HandlerInterviewBackend
 from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
 from ouroboros.cli.main import app
 from ouroboros.core.types import Result
-from ouroboros.mcp.tools.authoring_handlers import GenerateSeedHandler, InterviewHandler
+from ouroboros.mcp.tools.authoring_handlers import (
+    GenerateSeedHandler,
+    InterviewHandler,
+    _interview_allowed_tools,
+)
 from ouroboros.mcp.tools.auto_handler import (
     AutoHandler,
     _authoring_interview_handler,
@@ -35,6 +39,17 @@ def test_cli_auto_runtime_enum_matches_supported_backends() -> None:
         "copilot",
         "kiro",
     }
+
+
+def test_interview_allowed_tools_omits_unsupported_hermes_envelope(monkeypatch) -> None:
+    assert _interview_allowed_tools("hermes") is None
+    assert _interview_allowed_tools("codex")
+
+    monkeypatch.setattr(
+        "ouroboros.mcp.tools.authoring_handlers.resolve_llm_backend",
+        lambda *_args, **_kwargs: "hermes",
+    )
+    assert _interview_allowed_tools(None) is None
 
 
 def test_cli_auto_help_is_registered() -> None:
@@ -72,6 +87,7 @@ def test_cli_auto_status_prints_persisted_session(monkeypatch, tmp_path) -> None
     assert "Current interview round:" in output
     assert "Which runtime should be used?" in output
     assert "Seed grade:" in output
+    assert "Seed origin: none" in output
     assert "Resume:" in output
 
 
@@ -223,6 +239,25 @@ class _FakeErrorInterviewHandler:
 async def test_handler_interview_backend_rejects_mcp_error_payloads() -> None:
     with pytest.raises(RuntimeError, match="recoverable failure"):
         await HandlerInterviewBackend(_FakeErrorInterviewHandler(), cwd=".").start("goal", cwd=".")
+
+
+@pytest.mark.asyncio
+async def test_handler_interview_backend_does_not_fabricate_partial_evidence() -> None:
+    """When the handler does NOT include ``meta.session_id`` we must NOT raise
+    ``PartialInterviewStartError`` even if the caller pre-allocated an id.
+
+    Regression for the Q00/ouroboros#723 review: synthesising persistence
+    evidence from caller input lets auto state record an id the handler
+    never confirmed it wrote to disk.
+    """
+    from ouroboros.auto.adapters import HandlerError, PartialInterviewStartError
+
+    backend = HandlerInterviewBackend(_FakeErrorInterviewHandler(), cwd=".")
+    with pytest.raises(HandlerError) as excinfo:
+        await backend.start("goal", cwd=".", interview_id="interview_caller_supplied")
+    assert not isinstance(excinfo.value, PartialInterviewStartError), (
+        "adapter must require explicit meta.session_id, not synthesise from interview_id"
+    )
 
 
 def test_auto_handler_uses_synchronous_authoring_mode_for_opencode_plugin() -> None:
@@ -399,6 +434,116 @@ async def test_auto_handler_forwards_run_subagent_envelope(monkeypatch) -> None:
     assert result.is_ok
     assert result.value.meta["_subagent"]["tool_name"] == "ouroboros_execute_seed"
     assert '"_subagent"' in result.value.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_auto_handler_meta_exposes_auto_progress_fields(monkeypatch) -> None:
+    async def fake_run(self, arguments):  # noqa: ARG001
+        from ouroboros.auto.pipeline import AutoPipelineResult
+
+        return AutoPipelineResult(
+            status="blocked",
+            auto_session_id="auto_test",
+            phase="interview",
+            grade="B",
+            seed_path="/tmp/seed.yaml",
+            interview_session_id="interview_1",
+            execution_id="execution_1",
+            job_id="job_1",
+            run_session_id="session_1",
+            current_round=2,
+            pending_question="Which runtime should be used?",
+            last_progress_message="asking interview round 2/12",
+            last_progress_at="2026-05-01T12:00:00+00:00",
+            last_grade="B",
+            blocker="waiting for interview answer",
+        )
+
+    monkeypatch.setattr(AutoHandler, "_run", fake_run)
+
+    result = await AutoHandler().handle({"goal": "Build a CLI"})
+
+    assert result.is_ok
+    assert result.value.is_error is True
+    assert result.value.meta == {
+        "status": "blocked",
+        "auto_session_id": "auto_test",
+        "phase": "interview",
+        "current_round": 2,
+        "last_progress_message": "asking interview round 2/12",
+        "last_progress_at": "2026-05-01T12:00:00+00:00",
+        "resume_command": "ooo auto --resume auto_test",
+        "blocker": "waiting for interview answer",
+        "seed_path": "/tmp/seed.yaml",
+        "seed_origin": "none",
+        "grade": "B",
+        "last_grade": "B",
+        "interview_session_id": "interview_1",
+        "execution_id": "execution_1",
+        "job_id": "job_1",
+        "run_session_id": "session_1",
+        "pending_question": "Which runtime should be used?",
+    }
+
+
+@pytest.mark.asyncio
+async def test_auto_handler_meta_uses_pipeline_state_progress(monkeypatch, tmp_path) -> None:
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.auto.state import AutoStore
+    from ouroboros.mcp.tools import auto_handler as auto_module
+
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003, ARG002
+            pass
+
+        async def run(self, run_state):  # noqa: ANN001
+            run_state.transition(AutoPhase.INTERVIEW, "asking interview round 3/12")
+            run_state.current_round = 3
+            run_state.pending_question = "What should the command output?"
+            run_state.last_progress_message = "asking interview round 3/12"
+            run_state.last_progress_at = "2026-05-01T12:30:00+00:00"
+            run_state.seed_path = "/tmp/seed.yaml"
+            run_state.last_grade = "A"
+            captured["auto_session_id"] = run_state.auto_session_id
+            return AutoPipelineResult(
+                status=run_state.phase.value,
+                auto_session_id=run_state.auto_session_id,
+                phase=run_state.phase.value,
+                seed_path=run_state.seed_path,
+                current_round=run_state.current_round,
+                pending_question=run_state.pending_question,
+                last_progress_message=run_state.last_progress_message,
+                last_progress_at=run_state.last_progress_at,
+                last_grade=run_state.last_grade,
+            )
+
+    class FakeHandler:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003, ARG002
+            pass
+
+    monkeypatch.setattr(auto_module, "AutoStore", lambda: AutoStore(tmp_path / "store"))
+    monkeypatch.setattr(auto_module, "AutoPipeline", FakePipeline)
+    monkeypatch.setattr(auto_module, "InterviewHandler", FakeHandler)
+    monkeypatch.setattr(auto_module, "GenerateSeedHandler", FakeHandler)
+    monkeypatch.setattr(auto_module, "ExecuteSeedHandler", FakeHandler)
+    monkeypatch.setattr(auto_module, "StartExecuteSeedHandler", FakeHandler)
+
+    result = await AutoHandler().handle({"goal": "Build a CLI", "cwd": str(tmp_path)})
+
+    assert result.is_ok
+    assert result.value.meta["auto_session_id"] == captured["auto_session_id"]
+    assert result.value.meta["phase"] == "interview"
+    assert result.value.meta["current_round"] == 3
+    assert result.value.meta["pending_question"] == "What should the command output?"
+    assert result.value.meta["last_progress_message"] == "asking interview round 3/12"
+    assert result.value.meta["last_progress_at"] == "2026-05-01T12:30:00+00:00"
+    assert result.value.meta["seed_path"] == "/tmp/seed.yaml"
+    assert result.value.meta["last_grade"] == "A"
+    assert result.value.meta["resume_command"] == (
+        f"ooo auto --resume {captured['auto_session_id']}"
+    )
 
 
 def test_cli_opencode_plugin_uses_subprocess_for_plain_cli(monkeypatch) -> None:
@@ -1116,3 +1261,611 @@ async def test_auto_handler_rejects_zero_loop_bounds() -> None:
         assert result.is_err
         assert field_name in str(result.error)
         assert ">= 1" in str(result.error)
+
+
+def test_auto_state_loads_legacy_sessions_without_attached_run_fields() -> None:
+    from ouroboros.auto.state import AutoPipelineState
+
+    payload = AutoPipelineState(goal="Build a CLI", cwd="/repo").to_dict()
+    payload.pop("attached_run_handle")
+    payload.pop("attached_run_source")
+    payload.pop("attached_at")
+    payload.pop("run_reconciliation_status")
+    payload.pop("run_reconciliation_source")
+    payload.pop("run_reconciled_at")
+
+    restored = AutoPipelineState.from_dict(payload)
+
+    assert restored.attached_run_handle is None
+    assert restored.attached_run_source is None
+    assert restored.attached_at is None
+    assert restored.run_reconciliation_status is None
+    assert restored.run_reconciliation_source is None
+    assert restored.run_reconciled_at is None
+
+
+def test_auto_handler_definition_exposes_attach_arguments() -> None:
+    names = {param.name for param in AutoHandler().definition.parameters}
+
+    assert {
+        "attach_execution",
+        "attach_job",
+        "attach_session",
+        "attach_source",
+        "reconcile_run",
+        "reconcile_source",
+    } <= names
+
+
+def test_auto_handler_meta_exposes_attached_run_fields() -> None:
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.mcp.tools.auto_handler import _result_meta
+
+    meta = _result_meta(
+        AutoPipelineResult(
+            status="complete",
+            auto_session_id="auto_test",
+            phase="complete",
+            execution_id="exec_existing",
+            run_handoff_status="attached",
+            attached_run_handle="exec_existing",
+            attached_run_source="operator",
+            attached_at="2026-05-07T00:00:00+00:00",
+        )
+    )
+
+    assert meta["run_handoff_status"] == "attached"
+    assert meta["attached_run_handle"] == "exec_existing"
+    assert meta["attached_run_source"] == "operator"
+    assert meta["attached_at"] == "2026-05-07T00:00:00+00:00"
+
+
+def test_auto_handler_meta_exposes_run_reconciliation_fields() -> None:
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.mcp.tools.auto_handler import _result_meta
+
+    meta = _result_meta(
+        AutoPipelineResult(
+            status="blocked",
+            auto_session_id="auto_test",
+            phase="blocked",
+            run_handoff_status="unknown_no_handle",
+            run_reconciliation_status="unsupported",
+            run_reconciliation_source="generic",
+            run_reconciled_at="2026-05-07T00:00:00+00:00",
+        )
+    )
+
+    assert meta["run_reconciliation_status"] == "unsupported"
+    assert meta["run_reconciliation_source"] == "generic"
+    assert meta["run_reconciled_at"] == "2026-05-07T00:00:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_auto_handler_passes_state_interview_timeout_to_driver(monkeypatch, tmp_path) -> None:
+    """Regression for #686: MCP entrypoint must wire state interview timeout into driver."""
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.auto.state import AutoStore
+    from ouroboros.mcp.tools import auto_handler as auto_module
+
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, driver, _seed_generator, **kwargs):  # noqa: ANN001, ANN003, ARG002
+            captured["driver_timeout_seconds"] = driver.timeout_seconds
+
+        async def run(self, run_state):  # noqa: ANN001
+            return AutoPipelineResult(
+                status="complete",
+                auto_session_id=run_state.auto_session_id,
+                phase="complete",
+            )
+
+    monkeypatch.setattr(auto_module, "AutoStore", lambda: AutoStore(tmp_path / "store"))
+    monkeypatch.setattr(auto_module, "AutoPipeline", FakePipeline)
+
+    result = await AutoHandler().handle({"goal": "Build a CLI", "cwd": str(tmp_path)})
+
+    assert result.is_ok
+    assert captured["driver_timeout_seconds"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_auto_handler_resume_honours_persisted_interview_timeout(
+    monkeypatch, tmp_path
+) -> None:
+    """Resumed sessions must keep the persisted interview-phase timeout."""
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.auto.state import AutoPipelineState, AutoStore
+    from ouroboros.mcp.tools import auto_handler as auto_module
+
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    store = AutoStore(store_root)
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    state.runtime_backend = "claude"
+    state.timeout_seconds_by_phase[AutoPhase.INTERVIEW.value] = 240
+    state.transition(AutoPhase.INTERVIEW, "interview")
+    state.mark_blocked(
+        "auto interview reached max rounds with unresolved gaps: actors",
+        tool_name="interview_driver",
+    )
+    store.save(state)
+
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, driver, _seed_generator, **kwargs):  # noqa: ANN001, ANN003, ARG002
+            captured["driver_timeout_seconds"] = driver.timeout_seconds
+
+        async def run(self, run_state):  # noqa: ANN001
+            return AutoPipelineResult(
+                status="complete",
+                auto_session_id=run_state.auto_session_id,
+                phase="complete",
+            )
+
+    monkeypatch.setattr(auto_module, "AutoStore", lambda: store)
+    monkeypatch.setattr(auto_module, "AutoPipeline", FakePipeline)
+
+    result = await AutoHandler().handle({"resume": state.auto_session_id})
+
+    assert result.is_ok
+    assert captured["driver_timeout_seconds"] == 240.0
+
+
+def test_auto_state_default_seed_origin_is_none() -> None:
+    from ouroboros.auto.state import AutoPipelineState, SeedOrigin
+
+    state = AutoPipelineState(goal="Build a CLI", cwd="/repo")
+
+    assert state.seed_origin is SeedOrigin.NONE
+
+
+def test_auto_state_persists_seed_origin_round_trip() -> None:
+    from ouroboros.auto.state import AutoPipelineState, SeedOrigin
+
+    state = AutoPipelineState(goal="Build a CLI", cwd="/repo")
+    state.seed_origin = SeedOrigin.AUTO_PIPELINE
+
+    payload = state.to_dict()
+    assert payload["seed_origin"] == "auto_pipeline"
+
+    restored = AutoPipelineState.from_dict(payload)
+    assert restored.seed_origin is SeedOrigin.AUTO_PIPELINE
+
+
+def test_auto_state_loads_legacy_session_with_default_seed_origin() -> None:
+    from ouroboros.auto.state import AutoPipelineState, SeedOrigin
+
+    payload = AutoPipelineState(goal="Build a CLI", cwd="/repo").to_dict()
+    payload.pop("seed_origin")
+
+    restored = AutoPipelineState.from_dict(payload)
+
+    assert restored.seed_origin is SeedOrigin.NONE
+
+
+def test_auto_state_rejects_unknown_seed_origin() -> None:
+    from ouroboros.auto.state import AutoPipelineState
+
+    payload = AutoPipelineState(goal="Build a CLI", cwd="/repo").to_dict()
+    payload["seed_origin"] = "manual"
+
+    with pytest.raises(ValueError, match="seed_origin must be one of"):
+        AutoPipelineState.from_dict(payload)
+
+
+def test_auto_pipeline_result_default_seed_origin_is_none_string() -> None:
+    from ouroboros.auto.pipeline import AutoPipelineResult
+
+    result = AutoPipelineResult(
+        status="created",
+        auto_session_id="auto_test",
+        phase="created",
+    )
+
+    assert result.seed_origin == "none"
+
+
+def test_cli_auto_status_renders_seed_origin(monkeypatch, tmp_path) -> None:
+    from ouroboros.auto.state import (
+        AutoPhase,
+        AutoPipelineState,
+        AutoStore,
+        SeedOrigin,
+    )
+
+    store = AutoStore(tmp_path)
+    state = AutoPipelineState(goal="Build a CLI", cwd="/tmp/project")
+    state.transition(AutoPhase.INTERVIEW, "asking interview round 1/12")
+    state.seed_path = "/tmp/seed.yaml"
+    state.seed_origin = SeedOrigin.AUTO_PIPELINE
+    store.save(state)
+
+    monkeypatch.setattr("ouroboros.cli.commands.auto.AutoStore", lambda: store)
+
+    cli_result = CliRunner().invoke(app, ["auto", "--resume", state.auto_session_id, "--status"])
+    output = re.sub(r"\x1b\[[0-9;]*m", "", cli_result.output)
+
+    assert cli_result.exit_code == 0
+    assert "Seed origin: auto_pipeline" in output
+
+
+@pytest.mark.asyncio
+async def test_auto_pipeline_backfills_seed_origin_for_legacy_persisted_seed(tmp_path) -> None:
+    """Pre-PR sessions persisted ``seed_artifact`` without ``seed_origin``.
+
+    On the first resume after this PR ships, the pipeline must infer the
+    origin (auto_pipeline) so the new CLI/MCP surfaces don't keep reporting
+    a stale ``none`` value.
+    """
+    from ouroboros.auto.pipeline import AutoPipeline
+    from ouroboros.auto.state import (
+        AutoPhase,
+        AutoPipelineState,
+        AutoStore,
+        SeedOrigin,
+    )
+    from ouroboros.core.seed import (
+        EvaluationPrinciple,
+        ExitCondition,
+        OntologyField,
+        OntologySchema,
+        Seed,
+        SeedMetadata,
+    )
+
+    seed = Seed(
+        goal="Build a CLI",
+        constraints=("Use existing project patterns",),
+        acceptance_criteria=("Command prints stable output",),
+        ontology_schema=OntologySchema(
+            name="CliTask",
+            description="CLI task ontology",
+            fields=(
+                OntologyField(
+                    name="command",
+                    field_type="string",
+                    description="Command",
+                ),
+            ),
+        ),
+        evaluation_principles=(
+            EvaluationPrinciple(
+                name="testability",
+                description="Observable behavior",
+                weight=1.0,
+            ),
+        ),
+        exit_conditions=(
+            ExitCondition(
+                name="verified",
+                description="Checks pass",
+                evaluation_criteria="All acceptance criteria pass",
+            ),
+        ),
+        metadata=SeedMetadata(ambiguity_score=0.12),
+    )
+
+    class _StubInterviewDriver:
+        async def run(self, _state, _ledger):  # noqa: ARG002
+            raise AssertionError("interview driver must not run for this resume path")
+
+    async def fake_seed_generator(_session_id: str):  # noqa: ARG001
+        raise AssertionError("seed generator must not run when artifact is persisted")
+
+    store = AutoStore(tmp_path)
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    state.seed_artifact = seed.to_dict()
+    state.seed_path = str(tmp_path / "seed.yaml")
+    state.last_grade = "A"
+    state.transition(AutoPhase.INTERVIEW, "primed")
+    state.transition(AutoPhase.SEED_GENERATION, "ready for seed generation")
+    state.transition(AutoPhase.REVIEW, "review queued")
+    state.transition(AutoPhase.COMPLETE, "skip-run requested")
+    # Simulate the legacy persisted state: seed_artifact present but
+    # seed_origin still at the schema default (the field did not exist
+    # when the session was first written).
+    assert state.seed_origin is SeedOrigin.NONE
+    store.save(state)
+
+    pipeline = AutoPipeline(
+        _StubInterviewDriver(),
+        fake_seed_generator,
+        store=store,
+        skip_run=True,
+    )
+
+    result = await pipeline.run(state)
+
+    assert state.seed_origin is SeedOrigin.AUTO_PIPELINE
+    assert result.seed_origin == "auto_pipeline"
+
+
+def test_print_result_renders_seed_origin_line() -> None:
+    """The terminal CLI summary must surface the seed_origin field."""
+    import re
+
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.cli.commands.auto import _print_result
+    from ouroboros.cli.formatters import console
+
+    result = AutoPipelineResult(
+        status="complete",
+        auto_session_id="auto_x",
+        phase="complete",
+        grade="A",
+        seed_path="/tmp/seed.yaml",
+        seed_origin="auto_pipeline",
+    )
+
+    with console.capture() as capture:
+        _print_result(result, show_ledger=False)
+    output = re.sub(r"\x1b\[[0-9;]*m", "", capture.get())
+
+    assert "Seed origin: auto_pipeline" in output
+
+
+def test_mcp_format_result_renders_seed_origin_line() -> None:
+    """The MCP text body must surface the seed_origin field too."""
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.mcp.tools.auto_handler import _format_result
+
+    result = AutoPipelineResult(
+        status="complete",
+        auto_session_id="auto_x",
+        phase="complete",
+        grade="A",
+        seed_path="/tmp/seed.yaml",
+        seed_origin="auto_pipeline",
+    )
+
+    text = _format_result(result)
+
+    assert "Seed origin: auto_pipeline" in text
+
+
+@pytest.mark.asyncio
+async def test_auto_pipeline_resets_seed_origin_when_invalid_artifact_is_wiped(tmp_path) -> None:
+    """A discarded malformed seed_artifact must reset seed_origin to ``none``.
+
+    Otherwise the public CLI/MCP surfaces would still report the prior
+    provenance (e.g. ``auto_pipeline``) for a session that no longer
+    holds any Seed at all, leaking incorrect status metadata.
+    """
+    from ouroboros.auto.pipeline import AutoPipeline
+    from ouroboros.auto.state import AutoPipelineState, SeedOrigin
+
+    class _StubInterviewDriver:
+        async def run(self, _state, _ledger):  # noqa: ARG002
+            raise AssertionError("interview driver must not run on the malformed-artifact path")
+
+    async def fake_seed_generator(_session_id: str):  # noqa: ARG001
+        raise AssertionError("seed generator must not run on the malformed-artifact path")
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    # Simulate a corrupt persisted Seed: ``Seed.from_dict`` will reject
+    # this payload at the start of ``run``. The store is left ``None``
+    # so the pipeline does not try to persist the malformed value back
+    # through ``AutoStore.save``'s strict validator.
+    state.seed_artifact = {"not": "a real seed"}
+    state.seed_origin = SeedOrigin.AUTO_PIPELINE
+
+    pipeline = AutoPipeline(
+        _StubInterviewDriver(),
+        fake_seed_generator,
+        store=None,
+        skip_run=True,
+    )
+
+    result = await pipeline.run(state)
+
+    assert state.seed_artifact == {}
+    assert state.seed_origin is SeedOrigin.NONE
+    assert result.seed_origin == "none"
+    assert result.status in {"failed", "blocked"}
+
+
+@pytest.mark.asyncio
+async def test_auto_pipeline_backfills_seed_origin_for_seed_path_only_resume(tmp_path) -> None:
+    """Resume that only carries ``seed_path`` (no ``seed_artifact``) must backfill provenance.
+
+    Pre-PR auto pipelines were the only writer of ``seed_path`` via
+    ``seed_saver``, so a session that resumes through the loader path
+    with ``seed_origin=none`` is by definition a legacy session whose
+    Seed was authored by the auto pipeline. The new CLI/MCP surfaces
+    must not report ``none`` for it.
+    """
+    from ouroboros.auto.grading import GradeResult, SeedGrade
+    from ouroboros.auto.ledger import SeedDraftLedger
+    from ouroboros.auto.pipeline import AutoPipeline
+    from ouroboros.auto.seed_repairer import RepairResult
+    from ouroboros.auto.seed_reviewer import SeedReview
+    from ouroboros.auto.state import (
+        AutoPhase,
+        AutoPipelineState,
+        AutoStore,
+        SeedOrigin,
+    )
+    from ouroboros.core.seed import (
+        EvaluationPrinciple,
+        ExitCondition,
+        OntologyField,
+        OntologySchema,
+        Seed,
+        SeedMetadata,
+    )
+
+    seed = Seed(
+        goal="Build a CLI",
+        constraints=("Use existing project patterns",),
+        acceptance_criteria=("Command prints stable output",),
+        ontology_schema=OntologySchema(
+            name="CliTask",
+            description="CLI task ontology",
+            fields=(OntologyField(name="command", field_type="string", description="Command"),),
+        ),
+        evaluation_principles=(
+            EvaluationPrinciple(name="testability", description="Observable behavior", weight=1.0),
+        ),
+        exit_conditions=(
+            ExitCondition(
+                name="verified",
+                description="Checks pass",
+                evaluation_criteria="All acceptance criteria pass",
+            ),
+        ),
+        metadata=SeedMetadata(ambiguity_score=0.12),
+    )
+
+    class _StubInterviewDriver:
+        async def run(self, _state, _ledger):  # noqa: ARG002
+            raise AssertionError("interview driver must not run on the seed_path resume")
+
+    async def fake_seed_generator(_session_id):  # noqa: ARG001
+        raise AssertionError("seed generator must not run when seed_path is persisted")
+
+    def fake_seed_saver(_seed):
+        return str(tmp_path / "seed.yaml")
+
+    def fake_seed_loader(_path):
+        return seed
+
+    class _PassingReviewer:
+        def review(self, _seed, *, ledger=None):  # noqa: ARG002
+            grade = GradeResult(grade=SeedGrade.A, scores={}, may_run=True)
+            return SeedReview(grade_result=grade, findings=())
+
+    class _PassingRepairer:
+        def converge(self, seed_in, *, ledger=None):
+            review = _PassingReviewer().review(seed_in, ledger=ledger)
+            return (
+                seed_in,
+                review,
+                [
+                    RepairResult(
+                        changed=False,
+                        seed=seed_in,
+                        applied_repairs=(),
+                        unresolved_findings=(),
+                    )
+                ],
+            )
+
+    store = AutoStore(tmp_path / "store")
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    # Loader path: only seed_path is persisted, seed_artifact is empty,
+    # seed_origin is at the legacy default ``none``.
+    state.seed_path = str(tmp_path / "seed.yaml")
+    state.last_grade = "A"
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    state.ledger = ledger.to_dict()
+    state.transition(AutoPhase.INTERVIEW, "primed")
+    state.transition(AutoPhase.SEED_GENERATION, "ready for seed generation")
+    state.transition(AutoPhase.REVIEW, "review queued")
+    state.skip_run = True
+    assert state.seed_origin is SeedOrigin.NONE
+    store.save(state)
+
+    pipeline = AutoPipeline(
+        _StubInterviewDriver(),
+        fake_seed_generator,
+        store=store,
+        seed_saver=fake_seed_saver,
+        seed_loader=fake_seed_loader,
+        skip_run=True,
+        reviewer=_PassingReviewer(),
+        repairer=_PassingRepairer(),
+    )
+
+    result = await pipeline.run(state)
+
+    assert state.seed_origin is SeedOrigin.AUTO_PIPELINE
+    assert result.seed_origin == "auto_pipeline"
+
+
+@pytest.mark.asyncio
+async def test_auto_pipeline_marks_seed_origin_after_seed_generation(tmp_path) -> None:
+    from ouroboros.auto.ledger import SeedDraftLedger
+    from ouroboros.auto.pipeline import AutoPipeline
+    from ouroboros.auto.state import (
+        AutoPhase,
+        AutoPipelineState,
+        AutoStore,
+        SeedOrigin,
+    )
+    from ouroboros.core.seed import (
+        EvaluationPrinciple,
+        ExitCondition,
+        OntologyField,
+        OntologySchema,
+        Seed,
+        SeedMetadata,
+    )
+
+    class _StubInterviewDriver:
+        async def run(self, _state, _ledger):  # noqa: ARG002
+            raise AssertionError("interview driver should not be invoked at SEED_GENERATION")
+
+    seed = Seed(
+        goal="Build a CLI",
+        constraints=("Use existing project patterns",),
+        acceptance_criteria=("Command prints stable output",),
+        ontology_schema=OntologySchema(
+            name="CliTask",
+            description="CLI task ontology",
+            fields=(
+                OntologyField(
+                    name="command",
+                    field_type="string",
+                    description="Command",
+                ),
+            ),
+        ),
+        evaluation_principles=(
+            EvaluationPrinciple(
+                name="testability",
+                description="Observable behavior",
+                weight=1.0,
+            ),
+        ),
+        exit_conditions=(
+            ExitCondition(
+                name="verified",
+                description="Checks pass",
+                evaluation_criteria="All acceptance criteria pass",
+            ),
+        ),
+        metadata=SeedMetadata(ambiguity_score=0.12),
+    )
+
+    async def fake_seed_generator(session_id: str) -> Seed:  # noqa: ARG001
+        return seed
+
+    def fake_seed_saver(_seed: Seed) -> str:
+        return str(tmp_path / "seed.yaml")
+
+    store = AutoStore(tmp_path)
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    state.ledger = ledger.to_dict()
+    state.interview_session_id = "interview_xyz"
+    state.interview_completed = True
+    state.transition(AutoPhase.INTERVIEW, "primed for resume")
+    state.transition(AutoPhase.SEED_GENERATION, "ready for seed generation")
+    state.skip_run = True
+    store.save(state)
+
+    pipeline = AutoPipeline(
+        _StubInterviewDriver(),
+        fake_seed_generator,
+        store=store,
+        seed_saver=fake_seed_saver,
+        skip_run=True,
+    )
+
+    result = await pipeline.run(state)
+
+    assert state.seed_origin is SeedOrigin.AUTO_PIPELINE
+    assert result.seed_origin == "auto_pipeline"

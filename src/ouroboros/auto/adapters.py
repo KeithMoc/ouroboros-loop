@@ -18,6 +18,20 @@ class HandlerError(RuntimeError):
     """Raised when an MCP handler returns an error result."""
 
 
+class PartialInterviewStartError(HandlerError):
+    """Raised when interview start failed but a session_id was persisted server-side.
+
+    Carries the persisted ``session_id`` so callers (e.g. the auto interview
+    driver) can record it on durable state and resume the same interview
+    after a transient first-question failure such as an LLM timeout.
+    See Q00/ouroboros#687.
+    """
+
+    def __init__(self, message: str, *, session_id: str) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+
+
 def _unwrap(result, *, tool_name: str) -> MCPToolResult:
     if result.is_err:
         error: MCPServerError = result.error
@@ -36,11 +50,33 @@ class HandlerInterviewBackend(InterviewBackend):
         self.handler = handler
         self.cwd = cwd
 
-    async def start(self, goal: str, *, cwd: str) -> InterviewTurn:
-        result = _unwrap(
-            await self.handler.handle({"initial_context": goal, "cwd": cwd or self.cwd}),
-            tool_name="ouroboros_interview",
-        )
+    async def start(self, goal: str, *, cwd: str, interview_id: str | None = None) -> InterviewTurn:
+        arguments: dict[str, str] = {"initial_context": goal, "cwd": cwd or self.cwd}
+        if interview_id:
+            arguments["interview_id"] = interview_id
+        outcome = await self.handler.handle(arguments)
+        # Recoverable error path: handler persisted state but failed to
+        # produce the first question.  ONLY trust an explicit
+        # ``meta.session_id`` from the handler — never fall back to the
+        # caller-supplied ``interview_id``, otherwise auto state would
+        # record persistence evidence that the handler never produced
+        # (Q00/ouroboros#723 review).
+        if not outcome.is_err:
+            value = outcome.value
+            if value.is_error:
+                meta = value.meta or {}
+                session_id = _optional_str(meta.get("session_id"))
+                if session_id:
+                    text = (
+                        value.content[0].text
+                        if value.content
+                        else "ouroboros_interview returned error"
+                    )
+                    raise PartialInterviewStartError(
+                        f"ouroboros_interview failed: {text}",
+                        session_id=session_id,
+                    )
+        result = _unwrap(outcome, tool_name="ouroboros_interview")
         return _turn_from_result(result)
 
     async def answer(self, session_id: str, answer: str) -> InterviewTurn:
@@ -56,6 +92,22 @@ class HandlerInterviewBackend(InterviewBackend):
             tool_name="ouroboros_interview",
         )
         return _turn_from_result(result, fallback_session_id=session_id)
+
+    def is_session_persisted(self, session_id: str) -> bool:
+        """Return True when ``interview_<session_id>.json`` exists on disk.
+
+        Used by ``AutoInterviewDriver`` to decide whether a pre-allocated
+        id may be retained on auto state after a driver-level
+        ``asyncio.wait_for`` cancel — without this probe the driver cannot
+        distinguish "handler crashed before persisting" from "handler
+        persisted then got cancelled".  Routes through
+        ``InterviewHandler.resolved_state_dir`` so the probe always
+        targets the directory the engine actually writes to (Q00/ouroboros#723).
+        """
+        if not session_id:
+            return False
+        state_dir = self.handler.resolved_state_dir()
+        return (state_dir / f"interview_{session_id}.json").exists()
 
 
 class HandlerSeedGenerator:

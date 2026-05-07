@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import Annotated
 
+from rich.markup import escape as _rich_escape
 import typer
 
 from ouroboros.auto.adapters import (
@@ -19,8 +20,10 @@ from ouroboros.auto.adapters import (
 )
 from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.pipeline import AutoPipeline, AutoPipelineResult
+from ouroboros.auto.progress import AutoProgressCallback, AutoProgressEvent
+from ouroboros.auto.provenance import resolve_provenance
 from ouroboros.auto.seed_repairer import SeedRepairer
-from ouroboros.auto.state import AutoPipelineState, AutoStore
+from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
 from ouroboros.cli.formatters import console
 from ouroboros.cli.formatters.panels import print_error, print_info, print_success
 from ouroboros.config import get_opencode_mode
@@ -54,7 +57,18 @@ def auto_command(
     ] = None,
     runtime: Annotated[
         AgentRuntimeBackend | None,
-        typer.Option("--runtime", help="Execution runtime backend.", case_sensitive=False),
+        typer.Option(
+            "--runtime",
+            help=(
+                "Runtime backend used by ooo auto. The same flag is applied to "
+                "BOTH (a) interview/Seed authoring (in-process via the matching "
+                "MCP authoring handler) AND (b) the run-handoff that dispatches "
+                "the executor. The first interview question is generated "
+                "in-process even when --runtime is set to a heavyweight backend "
+                "like codex; see docs/auto-runtime-semantics.md."
+            ),
+            case_sensitive=False,
+        ),
     ] = None,
     max_interview_rounds: Annotated[
         int | None,
@@ -89,6 +103,43 @@ def auto_command(
     status: Annotated[
         bool, typer.Option("--status", help="Print persisted auto session status without running.")
     ] = False,
+    attach_execution: Annotated[
+        str | None,
+        typer.Option(
+            "--attach-execution",
+            help="Attach an externally verified execution id to an unknown run handoff.",
+        ),
+    ] = None,
+    attach_job: Annotated[
+        str | None,
+        typer.Option("--attach-job", help="Attach an externally verified job id."),
+    ] = None,
+    attach_session: Annotated[
+        str | None,
+        typer.Option("--attach-session", help="Attach an externally verified run session id."),
+    ] = None,
+    attach_source: Annotated[
+        str | None,
+        typer.Option("--attach-source", help="Source label for an attached run handle."),
+    ] = None,
+    reconcile_run: Annotated[
+        bool,
+        typer.Option(
+            "--reconcile-run",
+            help="Try to reconcile an unknown run handoff without starting a duplicate run.",
+        ),
+    ] = False,
+    reconcile_source: Annotated[
+        str | None,
+        typer.Option("--reconcile-source", help="Source label for run handoff reconciliation."),
+    ] = None,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            help="Suppress live phase/grade/repair progress lines; only the final summary prints.",
+        ),
+    ] = False,
 ) -> None:
     """Run an A-grade-gated auto pipeline.
 
@@ -118,6 +169,13 @@ def auto_command(
                 max_interview_rounds=max_interview_rounds,
                 max_repair_rounds=max_repair_rounds,
                 skip_run=skip_run,
+                attach_execution=attach_execution,
+                attach_job=attach_job,
+                attach_session=attach_session,
+                attach_source=attach_source,
+                reconcile_run=reconcile_run,
+                reconcile_source=reconcile_source,
+                progress_callback=_make_progress_renderer(quiet=quiet),
             )
         )
     except Exception as exc:
@@ -152,8 +210,24 @@ async def _run_auto(
     max_interview_rounds: int | None,
     max_repair_rounds: int | None,
     skip_run: bool,
+    attach_execution: str | None = None,
+    attach_job: str | None = None,
+    attach_session: str | None = None,
+    attach_source: str | None = None,
+    reconcile_run: bool = False,
+    reconcile_source: str | None = None,
+    progress_callback: AutoProgressCallback | None = None,
 ) -> AutoPipelineResult:
     store = AutoStore()
+    incoming_provenance = resolve_provenance()
+    attach_requested = any(
+        isinstance(item, str) and item.strip()
+        for item in (attach_execution, attach_job, attach_session)
+    )
+    if attach_requested and not resume:
+        raise ValueError("--attach-execution/--attach-job/--attach-session require --resume")
+    if reconcile_run and not resume:
+        raise ValueError("--reconcile-run requires --resume")
     if resume:
         state = store.load(resume)
         persisted_runtime = state.runtime_backend
@@ -216,6 +290,20 @@ async def _run_auto(
     state.runtime_backend = runtime
     state.opencode_mode = opencode_mode
     state.skip_run = skip_run
+    if incoming_provenance is not None:
+        if resume and state.provenance is None:
+            msg = (
+                "cannot attach provenance on resume of a session originally "
+                "invoked without provenance; re-attribution would mislead audit"
+            )
+            raise ValueError(msg)
+        if state.provenance is not None and state.provenance != incoming_provenance:
+            msg = (
+                "provenance conflict on resume: persisted state recorded "
+                f"{state.provenance} but caller supplied {incoming_provenance}"
+            )
+            raise ValueError(msg)
+        state.provenance = incoming_provenance
 
     authoring_opencode_mode = "subprocess" if opencode_mode == "plugin" else opencode_mode
     interview = InterviewHandler(
@@ -232,6 +320,7 @@ async def _run_auto(
         HandlerInterviewBackend(interview, cwd=state.cwd),
         store=store,
         max_rounds=max_interview_rounds,
+        timeout_seconds=state.phase_timeout_seconds(AutoPhase.INTERVIEW),
     )
     pipeline = AutoPipeline(
         driver,
@@ -242,9 +331,77 @@ async def _run_auto(
         seed_saver=save_seed,
         seed_loader=load_seed,
         skip_run=skip_run,
+        attach_execution_id=attach_execution,
+        attach_job_id=attach_job,
+        attach_run_session_id=attach_session,
+        attach_source=attach_source,
+        reconcile_run=reconcile_run,
+        reconcile_source=reconcile_source,
+        progress_callback=progress_callback,
     )
     result = await pipeline.run(state)
     return result
+
+
+_OPENCODE_RUNTIMES = frozenset({"opencode", "opencode_cli"})
+
+
+def _format_runtime_labels(
+    runtime_backend: str | None, opencode_mode: str | None
+) -> tuple[str, str]:
+    """Return (authoring backend, run backend) labels for status/result output.
+
+    Both auto entry points demote ``opencode_mode == "plugin"`` to
+    ``"subprocess"`` because a ``_subagent`` envelope would have no
+    receiver outside an active OpenCode bridge plugin session. The two
+    entry points differ in scope:
+
+    - ``cli/commands/auto.py`` (this file) overwrites
+      ``state.opencode_mode`` to ``"subprocess"`` for **both** authoring
+      and run-handoff handlers.
+    - ``mcp/tools/auto_handler.py`` only demotes the authoring handlers
+      and keeps the persisted ``"plugin"`` value for the run-handoff
+      handler, because that one is invoked from inside the OpenCode
+      session that owns the bridge plugin.
+
+    The labels here faithfully reflect the persisted ``state``: in CLI
+    flow that is always ``"subprocess"`` after demotion, in MCP flow it
+    can still be ``"plugin"`` (visible via ``--status`` on a session
+    that was created by the MCP entry point). Authoring is always shown
+    as in-process because both entry points hand the authoring handler
+    the demoted ``"subprocess"`` value.
+    """
+    backend_name = runtime_backend or "unspecified"
+    authoring = f"in-process ({backend_name})"
+    backend_key = (runtime_backend or "").strip().lower()
+    mode_key = (opencode_mode or "").strip().lower()
+    if backend_key in _OPENCODE_RUNTIMES and mode_key:
+        run_label = f"{runtime_backend} ({opencode_mode})"
+    else:
+        run_label = backend_name
+    return authoring, run_label
+
+
+def _make_progress_renderer(*, quiet: bool) -> AutoProgressCallback | None:
+    """Build a callback that prints live phase/grade/repair lines, unless quiet."""
+    if quiet:
+        return None
+
+    def render(event: AutoProgressEvent) -> None:
+        if event.kind == "grade":
+            label = f"grade {event.grade}" if event.grade else "grade"
+        elif event.kind == "repair":
+            label = f"repair round {event.round}"
+        else:
+            label = event.phase
+        # A live trace should be a single dim line per event, not a Rich
+        # panel — using ``console.print`` keeps the stream lightweight so
+        # consumers can grep on the ``[auto]`` prefix without parsing
+        # panel chrome. The leading ``[`` is escaped so Rich treats
+        # ``[auto]`` as literal text rather than as a markup style name.
+        console.print(rf"[dim]\[auto][/] {label} — {event.message}")
+
+    return render
 
 
 def _print_status(state: AutoPipelineState) -> None:
@@ -252,6 +409,13 @@ def _print_status(state: AutoPipelineState) -> None:
     print_info("Auto session status")
     console.print(f"Auto session: [cyan]{state.auto_session_id}[/]")
     console.print(f"Phase: [bold]{state.phase.value}[/]")
+    authoring, run_label = _format_runtime_labels(state.runtime_backend, state.opencode_mode)
+    console.print(f"Authoring backend: [bold]{authoring}[/]")
+    console.print(f"Run backend: [bold]{run_label}[/]")
+    invoked_by = state.invoked_by()
+    if invoked_by != "direct":
+        source = (state.provenance or {}).get("source", "unknown")
+        console.print(f"Invoked by: [bold]{invoked_by}[/] (source={_rich_escape(source)})")
     console.print(f"Last progress: {state.last_progress_message}")
     console.print(f"Last progress at: {state.last_progress_at}")
     if state.interview_session_id:
@@ -264,6 +428,7 @@ def _print_status(state: AutoPipelineState) -> None:
         console.print(f"Pending question: {question}")
     if state.seed_path:
         console.print(f"Seed: {state.seed_path}")
+    console.print(f"Seed origin: {state.seed_origin.value}")
     if state.last_grade:
         console.print(f"Seed grade: [bold]{state.last_grade}[/]")
     if state.job_id or state.execution_id or state.run_session_id:
@@ -271,8 +436,36 @@ def _print_status(state: AutoPipelineState) -> None:
         console.print(f"  Job ID: {state.job_id}")
         console.print(f"  Execution ID: {state.execution_id}")
         console.print(f"  Session ID: {state.run_session_id}")
+    if state.run_handoff_status:
+        console.print(f"Run handoff status: [bold]{state.run_handoff_status}[/]")
+    if state.run_handoff_guidance:
+        console.print(f"Run handoff guidance: [yellow]{state.run_handoff_guidance}[/]")
+    if state.attached_run_handle:
+        console.print(f"Attached run handle: {state.attached_run_handle}")
+        console.print(f"Attached run source: {state.attached_run_source}")
+        console.print(f"Attached at: {state.attached_at}")
+    if state.run_reconciliation_status:
+        console.print(f"Run reconciliation status: {state.run_reconciliation_status}")
+        console.print(f"Run reconciliation source: {state.run_reconciliation_source}")
+        console.print(f"Run reconciled at: {state.run_reconciled_at}")
     if state.last_error:
         console.print(f"Blocker: [yellow]{state.last_error}[/]")
+    if state.auto_answer_log:
+        recent = state.auto_answer_log[-5:]
+        console.print(f"Recent auto answers (last {len(recent)}):")
+        for entry in recent:
+            round_value = entry.get("round", "?")
+            source = _rich_escape(str(entry.get("source", "?")))
+            # Persisted question/answer text comes straight from the
+            # interview backend and may contain "[" / "]" sequences that
+            # Rich would otherwise interpret as markup, breaking the
+            # rendered text or raising a parse error. Escape both fields
+            # before printing so the status surface stays robust against
+            # arbitrary backend output.
+            question = _rich_escape(str(entry.get("question", "")))
+            answer = _rich_escape(str(entry.get("answer", "")))
+            console.print(f"  round {round_value} \\[{source}] Q: {question}")
+            console.print(f"    A: {answer}")
     console.print(f"Resume: [bold]ooo auto --resume {state.auto_session_id}[/]")
 
 
@@ -285,17 +478,36 @@ def _print_result(result: AutoPipelineResult, *, show_ledger: bool) -> None:
         print_info("Auto pipeline status")
     console.print(f"Auto session: [cyan]{result.auto_session_id}[/]")
     console.print(f"Status: [bold]{result.status}[/]")
+    authoring, run_label = _format_runtime_labels(result.runtime_backend, result.opencode_mode)
+    console.print(f"Authoring backend: [bold]{authoring}[/]")
+    console.print(f"Run backend: [bold]{run_label}[/]")
+    if result.invoked_by != "direct":
+        source = (result.provenance or {}).get("source", "unknown")
+        console.print(f"Invoked by: [bold]{result.invoked_by}[/] (source={_rich_escape(source)})")
     if result.grade:
         console.print(f"Seed grade: [bold]{result.grade}[/]")
     if result.interview_session_id:
         console.print(f"Interview session: {result.interview_session_id}")
     if result.seed_path:
         console.print(f"Seed: {result.seed_path}")
+    console.print(f"Seed origin: {result.seed_origin}")
     if result.job_id or result.execution_id or result.run_session_id:
         console.print("Execution started:")
         console.print(f"  Job ID: {result.job_id}")
         console.print(f"  Execution ID: {result.execution_id}")
         console.print(f"  Session ID: {result.run_session_id}")
+    if result.run_handoff_status:
+        console.print(f"Run handoff status: [bold]{result.run_handoff_status}[/]")
+    if result.run_handoff_guidance:
+        console.print(f"Run handoff guidance: [yellow]{result.run_handoff_guidance}[/]")
+    if result.attached_run_handle:
+        console.print(f"Attached run handle: {result.attached_run_handle}")
+        console.print(f"Attached run source: {result.attached_run_source}")
+        console.print(f"Attached at: {result.attached_at}")
+    if result.run_reconciliation_status:
+        console.print(f"Run reconciliation status: {result.run_reconciliation_status}")
+        console.print(f"Run reconciliation source: {result.run_reconciliation_source}")
+        console.print(f"Run reconciled at: {result.run_reconciled_at}")
     if show_ledger:
         if result.assumptions:
             console.print("Assumptions:")

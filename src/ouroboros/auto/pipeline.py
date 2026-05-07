@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from ouroboros.auto.blocker_attribution import record_authoring_backend
 from ouroboros.auto.grading import GradeGate
 from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.ledger import SeedDraftLedger
+from ouroboros.auto.progress import AutoProgressCallback, AutoProgressEvent
 from ouroboros.auto.seed_repairer import SeedRepairer
 from ouroboros.auto.seed_reviewer import SeedReview, SeedReviewer
-from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore, utc_now_iso
+from ouroboros.auto.state import (
+    AutoPhase,
+    AutoPipelineState,
+    AutoStore,
+    SeedOrigin,
+    utc_now_iso,
+)
 from ouroboros.core.seed import Seed
 
 SeedGenerator = Callable[[str], Awaitable[Seed]]
@@ -30,14 +38,33 @@ class AutoPipelineResult:
     phase: str
     grade: str | None = None
     seed_path: str | None = None
+    seed_origin: str = SeedOrigin.NONE.value
     interview_session_id: str | None = None
     execution_id: str | None = None
     job_id: str | None = None
     run_session_id: str | None = None
     run_subagent: dict[str, Any] | None = None
+    current_round: int = 0
+    pending_question: str | None = None
+    last_progress_message: str | None = None
+    last_progress_at: str | None = None
+    last_grade: str | None = None
+    run_handoff_status: str | None = None
+    run_handoff_guidance: str | None = None
+    attached_run_handle: str | None = None
+    attached_run_source: str | None = None
+    attached_at: str | None = None
+    run_reconciliation_status: str | None = None
+    run_reconciliation_source: str | None = None
+    run_reconciled_at: str | None = None
     assumptions: tuple[str, ...] = ()
     non_goals: tuple[str, ...] = ()
     blocker: str | None = None
+    runtime_backend: str | None = None
+    opencode_mode: str | None = None
+    invoked_by: str = "direct"
+    provenance: dict[str, Any] | None = None
+    last_authoring_backend: str | None = None
 
 
 @dataclass(slots=True)
@@ -54,11 +81,29 @@ class AutoPipeline:
     seed_saver: SeedSaver | None = None
     seed_loader: SeedLoader | None = None
     skip_run: bool = False
+    attach_execution_id: str | None = None
+    attach_job_id: str | None = None
+    attach_run_session_id: str | None = None
+    attach_source: str | None = None
+    reconcile_run: bool = False
+    reconcile_source: str | None = None
     seed_timeout_seconds: float = 120.0
     run_start_timeout_seconds: float = 60.0
+    progress_callback: AutoProgressCallback | None = None
+    _last_emitted_phase: str | None = field(default=None, init=False, repr=False)
+    _last_emitted_grade: str | None = field(default=None, init=False, repr=False)
+    _last_emitted_repair: int | None = field(default=None, init=False, repr=False)
 
     async def run(self, state: AutoPipelineState) -> AutoPipelineResult:
         """Run a bounded auto pipeline using injected side-effecting dependencies."""
+        self._last_emitted_phase = None
+        self._last_emitted_grade = None
+        self._last_emitted_repair = None
+        # Push the same progress callback down into the interview driver so
+        # the longest-running phase (auto interview rounds) emits live
+        # snapshots through the same observer contract instead of forcing
+        # consumers to scrape persisted state for per-round updates.
+        self.interview_driver.progress_callback = self.progress_callback
         ledger = (
             SeedDraftLedger.from_dict(state.ledger)
             if state.ledger
@@ -74,8 +119,30 @@ class AutoPipeline:
                 _mark_invalid_seed_artifact(state, f"persisted Seed artifact is invalid: {exc}")
                 self._save(state)
                 return self._result(state, ledger, blocker=state.last_error)
+            # Backfill legacy resumed sessions: pre-PR auto pipelines were the
+            # only writer of state.seed_artifact, so a valid persisted Seed
+            # paired with seed_origin=none can only have come from this
+            # pipeline. Inferring it once on resume keeps the new contract
+            # accurate for sessions created before this field existed.
+            if state.seed_origin is SeedOrigin.NONE:
+                state.seed_origin = SeedOrigin.AUTO_PIPELINE
         self._save(state)
 
+        if self.reconcile_run and state.phase == AutoPhase.COMPLETE:
+            reconciled, transient_blocker = self._reconcile_run_if_requested(state)
+            if reconciled is not None:
+                self._save(state)
+                if reconciled is False:
+                    blocker = transient_blocker or state.last_error
+                else:
+                    blocker = None
+                status_override = "blocked" if reconciled is False else None
+                return self._result(
+                    state,
+                    ledger,
+                    blocker=blocker,
+                    status_override=status_override,
+                )
         if state.phase == AutoPhase.COMPLETE:
             return self._result(state, ledger, blocker=state.last_error)
         if state.phase in {AutoPhase.BLOCKED, AutoPhase.FAILED}:
@@ -160,15 +227,21 @@ class AutoPipeline:
                         raise TypeError(msg)
                     state.seed_id = seed.metadata.seed_id
                     state.seed_artifact = seed.to_dict()
+                    state.seed_origin = SeedOrigin.AUTO_PIPELINE
                 except TimeoutError as exc:
                     state.mark_blocked(
                         f"seed generation timed out after {self.seed_timeout_seconds:.0f}s",
                         tool_name="seed_generator",
                     )
+                    record_authoring_backend(state)
                     self._save(state)
                     return self._result(state, ledger, blocker=str(exc) or state.last_error)
                 except Exception as exc:
-                    state.mark_failed(f"seed generation failed: {exc}", tool_name="seed_generator")
+                    state.mark_failed(
+                        f"seed generation failed: {exc}",
+                        tool_name="seed_generator",
+                    )
+                    record_authoring_backend(state)
                     self._save(state)
                     return self._result(state, ledger, blocker=state.last_error)
                 state.mark_progress("Seed generated", tool_name="seed_generator")
@@ -217,6 +290,8 @@ class AutoPipeline:
             state.last_grade = review.grade_result.grade.value
             state.findings = [asdict(finding) for finding in review.findings]
             state.ledger = ledger.to_dict()
+            self._maybe_emit_repair(state)
+            self._maybe_emit_grade(state)
             if self.seed_saver is not None:
                 try:
                     state.seed_path = self.seed_saver(seed)
@@ -250,15 +325,28 @@ class AutoPipeline:
                 return self._result(state, ledger, review=review)
 
         if state.phase == AutoPhase.RUN:
+            attached = self._attach_run_if_requested(state)
+            if attached is not None:
+                self._save(state)
+                return self._result(state, ledger, review=review)
+            reconciled, transient_blocker = self._reconcile_run_if_requested(state)
+            if reconciled is not None:
+                self._save(state)
+                blocker = transient_blocker or state.last_error
+                return self._result(state, ledger, review=review, blocker=blocker)
             if any((state.job_id, state.execution_id, state.run_session_id)):
+                state.run_handoff_status = "started"
+                state.run_handoff_guidance = None
                 state.transition(
                     AutoPhase.COMPLETE, "execution already started; using persisted run handle"
                 )
                 self._save(state)
                 return self._result(state, ledger, review=review)
             if state.run_start_attempted:
+                _mark_unknown_run_handoff(state)
                 state.mark_blocked(
-                    "Run start status is unknown; refusing to start a duplicate execution",
+                    state.run_handoff_guidance
+                    or "Run start status is unknown; refusing to start a duplicate execution",
                     tool_name="run_starter",
                 )
                 self._save(state)
@@ -275,6 +363,7 @@ class AutoPipeline:
                 review = reviewer.review(seed, ledger=ledger)
                 state.last_grade = review.grade_result.grade.value
                 state.findings = [asdict(finding) for finding in review.findings]
+                self._maybe_emit_grade(state)
                 self._save(state)
             if not review.may_run:
                 state.mark_blocked(
@@ -291,6 +380,8 @@ class AutoPipeline:
 
         if state.phase != AutoPhase.RUN:
             state.run_start_attempted = False
+            state.run_handoff_status = None
+            state.run_handoff_guidance = None
             state.transition(
                 AutoPhase.RUN,
                 f"starting execution for grade {state.last_grade or state.required_grade} Seed",
@@ -308,6 +399,7 @@ class AutoPipeline:
             state.job_id = _optional_str(run_meta.get("job_id"))
             state.execution_id = _optional_str(run_meta.get("execution_id"))
         except TimeoutError as exc:
+            _mark_unknown_run_handoff(state, status="unknown_timeout")
             state.mark_blocked(
                 f"run start timed out after {self.run_start_timeout_seconds:.0f}s",
                 tool_name="run_starter",
@@ -325,10 +417,15 @@ class AutoPipeline:
         )
         state.run_subagent = run_subagent or {}
         if not any((state.job_id, state.execution_id, state.run_session_id)):
-            state.run_start_attempted = False
-            state.mark_blocked("Run starter returned no tracking handle", tool_name="run_starter")
+            _mark_unknown_run_handoff(state)
+            state.mark_blocked(
+                state.run_handoff_guidance or "Run starter returned no tracking handle",
+                tool_name="run_starter",
+            )
             self._save(state)
             return self._result(state, ledger, review=review, blocker=state.last_error)
+        state.run_handoff_status = "started"
+        state.run_handoff_guidance = None
         state.transition(
             AutoPhase.COMPLETE,
             f"execution started for grade {state.last_grade or state.required_grade} Seed",
@@ -354,6 +451,15 @@ class AutoPipeline:
             )
             self._save(state)
             return None
+        # Loader-based resume paths previously left ``seed_origin`` at the
+        # legacy default ``none`` even though a Seed had clearly been
+        # persisted by an earlier auto pipeline run (the Seed file at
+        # ``seed_path`` was written by ``seed_saver``). Backfill the
+        # provenance once on first post-PR resume so the new CLI/MCP
+        # surfaces don't keep reporting an inaccurate ``none`` for valid
+        # resumed sessions. Existing non-default values are preserved.
+        if state.seed_origin is SeedOrigin.NONE:
+            state.seed_origin = SeedOrigin.AUTO_PIPELINE
         return seed
 
     def _result(
@@ -364,30 +470,208 @@ class AutoPipeline:
         review: SeedReview | None = None,
         blocker: str | None = None,
         run_subagent: dict[str, Any] | None = None,
+        status_override: str | None = None,
     ) -> AutoPipelineResult:
         return AutoPipelineResult(
-            status=state.phase.value,
+            status=status_override or state.phase.value,
             auto_session_id=state.auto_session_id,
             phase=state.phase.value,
             grade=review.grade_result.grade.value if review else state.last_grade,
             seed_path=state.seed_path,
+            seed_origin=state.seed_origin.value,
             interview_session_id=state.interview_session_id,
             execution_id=state.execution_id,
             job_id=state.job_id,
             run_session_id=state.run_session_id,
             run_subagent=run_subagent or state.run_subagent or None,
+            current_round=state.current_round,
+            pending_question=state.pending_question,
+            last_progress_message=state.last_progress_message,
+            last_progress_at=state.last_progress_at,
+            last_grade=state.last_grade,
+            run_handoff_status=state.run_handoff_status,
+            run_handoff_guidance=state.run_handoff_guidance,
+            attached_run_handle=state.attached_run_handle,
+            attached_run_source=state.attached_run_source,
+            attached_at=state.attached_at,
+            run_reconciliation_status=state.run_reconciliation_status,
+            run_reconciliation_source=state.run_reconciliation_source,
+            run_reconciled_at=state.run_reconciled_at,
             assumptions=tuple(ledger.assumptions()),
             non_goals=tuple(ledger.non_goals()),
             blocker=blocker or state.last_error,
+            runtime_backend=state.runtime_backend,
+            opencode_mode=state.opencode_mode,
+            invoked_by=state.invoked_by(),
+            provenance=dict(state.provenance) if state.provenance else None,
+            last_authoring_backend=state.last_authoring_backend,
         )
+
+    def _attach_run_if_requested(self, state: AutoPipelineState) -> bool | None:
+        handle = _first_nonempty(
+            self.attach_execution_id, self.attach_job_id, self.attach_run_session_id
+        )
+        if handle is None:
+            return None
+        if not state.run_start_attempted or state.run_handoff_status not in {
+            "unknown_no_handle",
+            "unknown_timeout",
+        }:
+            msg = (
+                "Attach requires an auto session with unknown run handoff status "
+                "after a prior run start attempt"
+            )
+            state.mark_blocked(msg, tool_name="run_starter")
+            return False
+        state.execution_id = _optional_str(self.attach_execution_id)
+        state.job_id = _optional_str(self.attach_job_id)
+        state.run_session_id = _optional_str(self.attach_run_session_id)
+        state.attached_run_handle = handle
+        state.attached_run_source = _optional_str(self.attach_source) or "manual"
+        state.attached_at = utc_now_iso()
+        state.run_handoff_status = "attached"
+        state.run_handoff_guidance = (
+            "Attached an externally verified execution handle to this auto session; "
+            "resume will use the attached handle and will not start a duplicate run."
+        )
+        # Successful attach supersedes any prior reconciliation outcome on the
+        # same unknown handoff, so clear stale reconciliation metadata to avoid
+        # surfacing contradictory state (attached + previous reconciliation failure).
+        state.run_reconciliation_status = None
+        state.run_reconciliation_source = None
+        state.run_reconciled_at = None
+        state.transition(AutoPhase.COMPLETE, "attached existing execution handle")
+        return True
+
+    def _reconcile_run_if_requested(
+        self, state: AutoPipelineState
+    ) -> tuple[bool | None, str | None]:
+        """Run the generic reconciliation contract.
+
+        Returns ``(outcome, transient_blocker)``:
+
+        - ``outcome`` is ``None`` when reconcile was not requested, ``True`` for
+          a successful reconciliation, and ``False`` when the request fails.
+        - ``transient_blocker`` carries an invocation-only error message that
+          must be surfaced to the caller for the current call only. It is used
+          for failure paths (notably invalid-context against a terminal complete
+          session) where mutating ``state.last_error`` durably would leak the
+          error into every later plain ``--resume``/``--status`` response.
+        """
+        if not self.reconcile_run:
+            return None, None
+        if state.run_handoff_status == "attached" and state.attached_run_handle:
+            state.run_reconciliation_status = "attached"
+            state.run_reconciliation_source = _optional_str(self.reconcile_source) or "attached_run"
+            state.run_reconciled_at = utc_now_iso()
+            state.run_handoff_guidance = (
+                "Reconciliation confirmed the session already has an attached run handle; "
+                "resume will not start a duplicate run."
+            )
+            if state.phase == AutoPhase.COMPLETE:
+                state.mark_progress(
+                    "reconciled existing attached execution handle",
+                    tool_name="run_starter",
+                )
+            else:
+                state.transition(
+                    AutoPhase.COMPLETE, "reconciled existing attached execution handle"
+                )
+            return True, None
+        if not state.run_start_attempted or state.run_handoff_status not in {
+            "unknown_no_handle",
+            "unknown_timeout",
+        }:
+            msg = (
+                "Reconciliation requires an auto session with unknown run handoff "
+                "status after a prior run start attempt"
+            )
+            state.run_reconciliation_status = "invalid_context"
+            state.run_reconciliation_source = _optional_str(self.reconcile_source) or "generic"
+            state.run_reconciled_at = utc_now_iso()
+            state.run_handoff_guidance = msg
+            if state.phase == AutoPhase.COMPLETE:
+                # Keep the terminal phase intact and avoid corrupting durable
+                # state.last_error: future plain --resume/--status calls must
+                # not report this per-invocation misuse as a steady-state
+                # blocker. The message is returned as a transient blocker so
+                # the current call still surfaces it via the result.
+                state.last_tool_name = "run_starter"
+                state.mark_progress(msg, tool_name="run_starter")
+                return False, msg
+            state.mark_blocked(msg, tool_name="run_starter")
+            return False, None
+        state.run_reconciliation_status = "unsupported"
+        state.run_reconciliation_source = _optional_str(self.reconcile_source) or "generic"
+        state.run_reconciled_at = utc_now_iso()
+        state.run_handoff_guidance = (
+            "Generic reconciliation has no runtime-specific discovery adapter for this "
+            "unknown handoff. No duplicate run was started. Attach a verified execution, "
+            "job, or run session handle, or add a runtime-specific reconciler that returns "
+            "attached, not_found, ambiguous, or unsupported."
+        )
+        state.mark_blocked(state.run_handoff_guidance, tool_name="run_starter")
+        return False, None
 
     def _save(self, state: AutoPipelineState) -> None:
         if self.store is not None:
             self.store.save(state)
+        self._maybe_emit_phase(state)
+
+    def _maybe_emit_phase(self, state: AutoPipelineState) -> None:
+        phase = state.phase.value
+        if phase == self._last_emitted_phase:
+            return
+        self._last_emitted_phase = phase
+        self._emit(state, "phase", state.last_progress_message)
+
+    def _maybe_emit_grade(self, state: AutoPipelineState) -> None:
+        grade = state.last_grade
+        if grade is None or grade == self._last_emitted_grade:
+            return
+        self._last_emitted_grade = grade
+        self._emit(state, "grade", f"Seed grade {grade}", grade=grade)
+
+    def _maybe_emit_repair(self, state: AutoPipelineState) -> None:
+        rounds = state.repair_round
+        if rounds <= 0 or rounds == self._last_emitted_repair:
+            return
+        self._last_emitted_repair = rounds
+        self._emit(state, "repair", f"repair round {rounds}", round=rounds)
+
+    def _emit(
+        self,
+        state: AutoPipelineState,
+        kind: str,
+        message: str,
+        *,
+        round: int | None = None,
+        grade: str | None = None,
+    ) -> None:
+        if self.progress_callback is None:
+            return
+        event = AutoProgressEvent(
+            auto_session_id=state.auto_session_id,
+            phase=state.phase.value,
+            kind=kind,
+            message=message,
+            round=round,
+            grade=grade,
+        )
+        try:
+            self.progress_callback(event)
+        except Exception:
+            # Observers must never break the pipeline. Swallow callback errors.
+            pass
 
 
 def _mark_invalid_seed_artifact(state: AutoPipelineState, message: str) -> None:
     state.seed_artifact = {}
+    # Keep seed_origin consistent with the now-empty seed_artifact: the
+    # session no longer has a persisted Seed of any provenance, so the
+    # publicly surfaced "auto_pipeline" / "external_authoring" claim
+    # would otherwise become a misleading orphan attribution.
+    state.seed_origin = SeedOrigin.NONE
     if state.phase in {AutoPhase.COMPLETE, AutoPhase.BLOCKED, AutoPhase.FAILED}:
         now = utc_now_iso()
         state.phase = AutoPhase.FAILED
@@ -399,6 +683,30 @@ def _mark_invalid_seed_artifact(state: AutoPipelineState, message: str) -> None:
         state.last_error = message
         return
     state.mark_failed(message, tool_name="auto_pipeline")
+
+
+def _mark_unknown_run_handoff(
+    state: AutoPipelineState, *, status: str = "unknown_no_handle"
+) -> None:
+    if status == "unknown_no_handle" and state.run_handoff_status in {
+        "unknown_no_handle",
+        "unknown_timeout",
+    }:
+        status = state.run_handoff_status
+    state.run_handoff_status = status
+    if status == "unknown_timeout":
+        state.run_handoff_guidance = (
+            "Run starter timed out before a durable tracking handle was captured. "
+            "The runtime may still have created an execution. Resume will not start "
+            "another run automatically or risk duplicate execution; inspect the "
+            "runtime for an existing execution before rerunning manually."
+        )
+        return
+    state.run_handoff_guidance = (
+        "Run starter was attempted, but no durable tracking handle was captured. "
+        "Resume will not start another run automatically or risk duplicate execution; "
+        "inspect the runtime for an existing execution before rerunning manually."
+    )
 
 
 def _grade_meets_required(actual: str | None, required: str) -> bool:
@@ -426,5 +734,13 @@ def _recoverable_phase_for_tool(tool_name: str | None) -> AutoPhase | None:
     return None
 
 
+def _first_nonempty(*values: str | None) -> str | None:
+    for value in values:
+        normalized = _optional_str(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
 def _optional_str(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
+    return value.strip() if isinstance(value, str) and value.strip() else None

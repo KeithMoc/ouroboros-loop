@@ -16,6 +16,7 @@ from pydantic import ValidationError as PydanticValidationError
 import structlog
 import yaml
 
+from ouroboros.backends import backend_supports_tool_envelope
 from ouroboros.bigbang.ambiguity import (
     AMBIGUITY_THRESHOLD,
     AUTO_COMPLETE_STREAK_REQUIRED,
@@ -60,12 +61,18 @@ from ouroboros.orchestrator.policy import (
     allowed_runtime_builtin_tool_names,
 )
 from ouroboros.persistence.event_store import EventStore
-from ouroboros.providers import create_llm_adapter
+from ouroboros.providers import create_llm_adapter, resolve_llm_backend
 from ouroboros.providers.base import LLMAdapter
 
 log = structlog.get_logger(__name__)
 
 _DATA_DIR = Path.home() / ".ouroboros" / "data"
+
+# Strict format for caller-supplied ``interview_id`` arguments — matches
+# the server's own generation pattern (``f"interview_{uuid4().hex[:16]}"``)
+# so external clients cannot inject arbitrary identifiers.  See
+# Q00/ouroboros#723 review.
+_SUGGESTED_INTERVIEW_ID_RE = re.compile(r"^interview_[a-f0-9]{16}$")
 
 _LIVE_AMBIGUITY_MAX_RETRIES = 3
 
@@ -96,11 +103,14 @@ _INTERVIEW_COMPLETION_PHRASES = (
 )
 
 
-def _interview_allowed_tools(runtime_backend: str | None) -> list[str]:
+def _interview_allowed_tools(runtime_backend: str | None) -> list[str] | None:
     """Return the policy-derived read-only tool envelope for interviews."""
+    effective_backend = resolve_llm_backend(runtime_backend)
+    if not backend_supports_tool_envelope(effective_backend):
+        return None
     return allowed_runtime_builtin_tool_names(
         PolicyContext(
-            runtime_backend=runtime_backend,
+            runtime_backend=effective_backend,
             session_role=PolicySessionRole.INTERVIEW,
             execution_phase=PolicyExecutionPhase.INTERVIEW,
         )
@@ -757,6 +767,20 @@ class InterviewHandler:
             await self._event_store.close()
             self._initialized = False
 
+    def resolved_state_dir(self) -> Path:
+        """Return the directory the handler actually writes interview state to.
+
+        Single source of truth for the interview persistence location used
+        by collision checks, the auto-driver persistence probe, and the
+        plugin/subprocess save paths.  When an ``InterviewEngine`` is
+        injected (e.g. by ``create_ouroboros_server`` with a custom
+        ``state_dir``), the engine's directory wins — the handler's own
+        ``data_dir`` may be stale or unset.  See Q00/ouroboros#723 review.
+        """
+        if self.interview_engine is not None:
+            return self.interview_engine.state_dir
+        return self.data_dir or _DATA_DIR
+
     async def _emit_event(self, event: Any) -> None:
         """Emit event to store. Swallows errors to not break interview flow."""
         try:
@@ -989,6 +1013,23 @@ class InterviewHandler:
                     ),
                     required=False,
                 ),
+                MCPToolParameter(
+                    name="interview_id",
+                    type=ToolInputType.STRING,
+                    description=(
+                        "Optional caller-supplied id for a brand-new interview. "
+                        "Must match the server format 'interview_<16 lowercase hex>' "
+                        "and must NOT collide with an existing interview file. "
+                        "Only valid for the start action — supplying it together with "
+                        "session_id (resume) or answer is rejected with an error to "
+                        "prevent silent identifier hijacking; do not preserve this "
+                        "argument across turns. "
+                        "Used by the bounded auto driver to pre-allocate the id so a "
+                        "driver-level cancel cannot leave auto state out of sync with "
+                        "the persisted interview file (see Q00/ouroboros#687)."
+                    ),
+                    required=False,
+                ),
             ),
         )
 
@@ -1007,6 +1048,14 @@ class InterviewHandler:
         initial_context = arguments.get("initial_context")
         session_id = arguments.get("session_id")
         answer = arguments.get("answer")
+        # Optional caller-supplied id for new interviews (Q00/ouroboros#687).
+        # Only honoured for the ``start`` action; ignored otherwise.
+        suggested_interview_id_arg = arguments.get("interview_id")
+        suggested_interview_id = (
+            suggested_interview_id_arg
+            if isinstance(suggested_interview_id_arg, str) and suggested_interview_id_arg
+            else None
+        )
         last_question = arguments.get("last_question")
 
         # --- Argument validation (before any dispatch) ---
@@ -1027,12 +1076,46 @@ class InterviewHandler:
                 )
             )
 
+        # Validate caller-supplied ``interview_id`` strictly to keep the
+        # MCP contract narrow.  The id must match the server's own
+        # ``interview_<16 hex>`` format (matching ``uuid4().hex[:16]``)
+        # and must not collide with an existing on-disk interview file —
+        # this prevents cross-client spoofing/hijacking and accidental
+        # reuse of an active session.  Q00/ouroboros#723 review.
+        if suggested_interview_id is not None:
+            if action != "start":
+                return Result.err(
+                    MCPToolError(
+                        "interview_id is only valid for new interviews; resume via session_id",
+                        tool_name="ouroboros_interview",
+                    )
+                )
+            if not _SUGGESTED_INTERVIEW_ID_RE.fullmatch(suggested_interview_id):
+                return Result.err(
+                    MCPToolError(
+                        "interview_id must match the server format 'interview_<16 hex>'",
+                        tool_name="ouroboros_interview",
+                    )
+                )
+            collision_path = self.resolved_state_dir() / f"interview_{suggested_interview_id}.json"
+            if collision_path.exists():
+                return Result.err(
+                    MCPToolError(
+                        "interview_id collides with an existing interview; pick a fresh id",
+                        tool_name="ouroboros_interview",
+                    )
+                )
+
         # --- Subagent dispatch: gate on runtime + opencode_mode ---
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
             # Plugin mode: persist state server-side WITHOUT creating an LLM adapter.
             # Only state I/O is needed here — the subagent handles all LLM work.
             # This avoids importing litellm (optional dep) on plugin-only installs.
-            state_dir = self.data_dir or _DATA_DIR
+            # Route through ``resolved_state_dir`` so an injected
+            # ``InterviewEngine`` with a custom ``state_dir`` keeps plugin
+            # writes and the collision check on the same directory
+            # (Q00/ouroboros#723 review).
+            state_dir = self.resolved_state_dir()
             state_dir.mkdir(parents=True, exist_ok=True)
 
             transcript = ""
@@ -1058,7 +1141,10 @@ class InterviewHandler:
                     return Result.err(MCPToolError(error_msg, tool_name="ouroboros_interview"))
                 from uuid import uuid4
 
-                interview_id = f"interview_{uuid4().hex[:16]}"
+                # Honour caller-supplied id when present (auto driver
+                # pre-allocates the id for Q00/ouroboros#687).  Fall back
+                # to a fresh uuid otherwise.
+                interview_id = suggested_interview_id or f"interview_{uuid4().hex[:16]}"
                 state = InterviewState(
                     interview_id=interview_id,
                     initial_context=resolved_context.value,
@@ -1190,7 +1276,11 @@ class InterviewHandler:
                         )
                     )
 
-                result = await engine.start_interview(resolved_context.value, cwd=cwd)
+                result = await engine.start_interview(
+                    resolved_context.value,
+                    cwd=cwd,
+                    interview_id=suggested_interview_id,
+                )
                 if result.is_err:
                     return Result.err(
                         MCPToolError(
@@ -1218,10 +1308,11 @@ class InterviewHandler:
                             phase="question_generation",
                         )
                     )
+                    # ``InterviewEngine.start_interview`` already persisted
+                    # the initial state on disk (Q00/ouroboros#687), so the
+                    # ``session_id`` returned below is guaranteed resumable.
                     # Return recoverable result with session ID for retry
                     if "empty response" in error_msg.lower():
-                        # Persist state so the session can actually be resumed
-                        await engine.save_state(state)
                         amb_warning = _ambiguity_warning_for_failed_question(
                             live_score,
                             is_brownfield=state.is_brownfield,
@@ -1250,7 +1341,30 @@ class InterviewHandler:
                                 meta={"session_id": state.interview_id, "recoverable": True},
                             )
                         )
-                    return Result.err(MCPToolError(error_msg, tool_name="ouroboros_interview"))
+                    # Generic question-generation failure (timeout etc.):
+                    # return a recoverable result so callers can resume
+                    # using the persisted ``session_id`` instead of losing
+                    # the interview handle (Q00/ouroboros#687).  Truncate
+                    # ``error_msg`` to avoid leaking provider internals into
+                    # the user-facing envelope; full details remain in the
+                    # ``interview_failed`` event emitted above.
+                    safe_error = error_msg[:200] if error_msg else "unknown error"
+                    return Result.ok(
+                        MCPToolResult(
+                            content=(
+                                MCPContentItem(
+                                    type=ContentType.TEXT,
+                                    text=(
+                                        f"Question generation failed: {safe_error}. "
+                                        f"Session ID: {state.interview_id}\n\n"
+                                        f'Resume with: session_id="{state.interview_id}"'
+                                    ),
+                                ),
+                            ),
+                            is_error=True,
+                            meta={"session_id": state.interview_id, "recoverable": True},
+                        )
+                    )
 
                 question = question_result.value
                 display_question = _format_question_with_ambiguity(question, live_score)
