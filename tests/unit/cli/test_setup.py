@@ -792,7 +792,7 @@ class TestClaudeSetup:
                 "ouroboros",
                 ["mcp", "serve"],
             ),
-            # no uvx, no binary → python3 -m fallback
+            # no uvx, no binary → python3 -m fallback (with importable ouroboros)
             (
                 lambda _cmd: None,
                 "python3",
@@ -808,7 +808,12 @@ class TestClaudeSetup:
         expected_cmd: str,
         expected_args: list[str],
     ) -> None:
-        """New MCP entry command/args should match the detected install method."""
+        """New MCP entry command/args should match the detected install method.
+
+        The pip-fallback case additionally relies on ``python3 -c "import ouroboros"``
+        succeeding; we mock ``subprocess.run`` so the probe is a no-op regardless of
+        the harness ``python3`` (which may not have ouroboros importable).
+        """
         config_dir = tmp_path / ".ouroboros"
         config_dir.mkdir()
         config_path = config_dir / "config.yaml"
@@ -823,6 +828,10 @@ class TestClaudeSetup:
             patch("pathlib.Path.home", return_value=tmp_path),
             patch("ouroboros.config.loader.ensure_config_dir", return_value=config_dir),
             patch("ouroboros.cli.commands.setup.shutil.which", side_effect=which_side_effect),
+            # _detect_mcp_entry verifies the pip fallback by spawning
+            # `python3 -c "import ouroboros"`. The harness python3 may not have
+            # ouroboros importable, so stub the probe to succeed unconditionally.
+            patch("subprocess.run"),
         ):
             setup_cmd._setup_claude("/usr/local/bin/claude")
 
