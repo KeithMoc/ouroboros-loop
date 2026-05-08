@@ -1,0 +1,271 @@
+"""Per-plugin trust store.
+
+Persists granted trust scopes per plugin at
+`~/.ouroboros/plugins/<name>/trust.json`. Per the locked Q00/ouroboros#732
+spec (which consumes the locked Q00/ouroboros-plugins#9 trust UX answers):
+
+- **Per-user storage** (Q5): one trust file per installed plugin, in the
+  same per-user directory as the plugin home.
+- **Version-bump invalidation** (Q4): when a plugin's version changes,
+  the trust file is reset (granted_scopes emptied). The user must re-grant
+  scopes via `ooo plugin trust` after upgrading.
+- **Exact scope grants** (Q3): each grant records the exact scope string;
+  parent scopes do not imply children.
+- **No raw tokens stored.** Only the scope name, timestamp, and granting
+  user identity are persisted.
+
+The trust store does NOT emit audit events itself; the firewall (#729) and
+CLI (#731) emit `plugin.trusted` when grants happen, sourcing the data
+from this store.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+
+TRUST_SCHEMA_VERSION = "0.1"
+
+# Default location root. Each plugin gets a subdirectory here.
+DEFAULT_TRUST_ROOT = Path.home() / ".ouroboros" / "plugins"
+
+# Plugin name pattern, matching plugin.schema.json `/name`. Enforced here at
+# the persistence-API boundary so that a plugin name with path separators or
+# `..` cannot escape the trust root via `<root>/<plugin>/trust.json` and
+# read/write/delete arbitrary files. Higher layers (manifest validation,
+# manager) also reject malformed names; this is defence in depth.
+_PLUGIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+
+
+def _validate_plugin_name(plugin: str) -> None:
+    """Reject plugin identifiers that could escape the trust root.
+
+    Raises:
+        ValueError: if ``plugin`` does not match the locked manifest name
+            pattern (lowercase alphanumeric + dashes, 3-64 chars, no leading
+            or trailing dash, no path separators).
+    """
+    if not isinstance(plugin, str) or not _PLUGIN_NAME_RE.fullmatch(plugin):
+        raise ValueError(
+            f"invalid plugin name {plugin!r}: must match "
+            r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$"
+        )
+
+
+@dataclass(frozen=True)
+class GrantedScope:
+    scope: str
+    granted_at: str  # RFC3339
+    granted_by: str  # e.g. "user:<id>"
+
+
+@dataclass(frozen=True)
+class TrustRecord:
+    plugin: str
+    version: str
+    granted_scopes: tuple[GrantedScope, ...] = ()
+
+    def has_scope(self, scope: str) -> bool:
+        """Exact-string scope check (per Q00/ouroboros-plugins#9 Q3 lock —
+        parent scope does NOT imply child)."""
+        return any(g.scope == scope for g in self.granted_scopes)
+
+    def missing(self, required_scopes: Iterable[str]) -> list[str]:
+        """Return required scopes that are not granted, in order."""
+        granted = {g.scope for g in self.granted_scopes}
+        return [s for s in required_scopes if s not in granted]
+
+
+class TrustStore:
+    """Per-plugin trust store at <root>/<plugin-name>/trust.json."""
+
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = root or DEFAULT_TRUST_ROOT
+
+    def _path(self, plugin: str) -> Path:
+        return self.root / plugin / "trust.json"
+
+    def read(self, plugin: str) -> TrustRecord | None:
+        """Read the trust record for `plugin`, or None if not present."""
+        _validate_plugin_name(plugin)
+        path = self._path(plugin)
+        if not path.is_file():
+            return None
+        with path.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        version = data.get("schema_version")
+        if version != TRUST_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported trust file schema_version {version!r}; "
+                f"expected {TRUST_SCHEMA_VERSION!r}"
+            )
+        return TrustRecord(
+            plugin=data["plugin"],
+            version=data["version"],
+            granted_scopes=tuple(
+                GrantedScope(
+                    scope=g["scope"],
+                    granted_at=g["granted_at"],
+                    granted_by=g["granted_by"],
+                )
+                for g in data.get("granted_scopes", [])
+            ),
+        )
+
+    def _write_atomic(self, plugin: str, payload: dict) -> None:
+        path = self._path(plugin)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".trust.", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @contextmanager
+    def _grant_lock(self, plugin: str) -> Iterator[None]:
+        """Serialize `grant` / `reset` updates for one plugin.
+
+        Without this guard, two concurrent `grant()` calls for the
+        same plugin can both observe the same prior file and each
+        write back a one-scope payload, so the last writer silently
+        deletes the other grant — a real trust-state data-loss bug.
+        Lockfile uses the same `fcntl.flock` pattern; this mirrors it
+        per-plugin so cross-plugin grants don't serialize against
+        each other.
+        """
+        path = self._path(plugin)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover — non-POSIX platforms
+            yield
+            return
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("w") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def grant(
+        self,
+        *,
+        plugin: str,
+        version: str,
+        scope: str,
+        granted_by: str,
+        when: datetime | None = None,
+    ) -> TrustRecord:
+        """Grant `scope` to `plugin@version`. Idempotent: granting an
+        already-granted scope is a no-op (timestamps preserved).
+
+        Concurrency-safe: the read-modify-write cycle is bracketed by
+        a per-plugin POSIX file lock so two concurrent `grant()` calls
+        cannot drop one another's scope.
+        """
+        _validate_plugin_name(plugin)
+        when = when or datetime.now(tz=UTC)
+        ts = when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        with self._grant_lock(plugin):
+            existing = self.read(plugin)
+            # Per Q00/ouroboros-plugins#9 Q4: version bump invalidates trust.
+            if existing is not None and existing.version != version:
+                existing = None  # treat as fresh
+
+            granted = list(existing.granted_scopes) if existing else []
+            if all(g.scope != scope for g in granted):
+                granted.append(GrantedScope(scope=scope, granted_at=ts, granted_by=granted_by))
+
+            payload = {
+                "schema_version": TRUST_SCHEMA_VERSION,
+                "plugin": plugin,
+                "version": version,
+                "granted_scopes": [
+                    {"scope": g.scope, "granted_at": g.granted_at, "granted_by": g.granted_by}
+                    for g in granted
+                ],
+            }
+            self._write_atomic(plugin, payload)
+        return TrustRecord(plugin=plugin, version=version, granted_scopes=tuple(granted))
+
+    def reset_for_version_bump(self, plugin: str, new_version: str) -> None:
+        """Invalidate trust because the plugin's version changed.
+
+        Writes a new trust file with version=new_version and empty grants.
+        Per Q00/ouroboros-plugins#9 Q4 lock. Bracketed by the same
+        per-plugin lock as `grant()` so a reset cannot race with a
+        concurrent grant for the prior version.
+        """
+        _validate_plugin_name(plugin)
+        payload = {
+            "schema_version": TRUST_SCHEMA_VERSION,
+            "plugin": plugin,
+            "version": new_version,
+            "granted_scopes": [],
+        }
+        with self._grant_lock(plugin):
+            self._write_atomic(plugin, payload)
+
+    def remove(self, plugin: str) -> bool:
+        """Remove the trust file for `plugin`. Returns True if removed.
+
+        Bracketed by the same per-plugin lock as `grant()` /
+        `reset_for_version_bump()`. Without the lock, a concurrent
+        `grant()` could win a race against `remove()` and recreate
+        `trust.json` after this method reported success — leaving a
+        supposedly-removed plugin still trusted, or non-deterministically
+        dropping grants. The lock makes the unlink/prune sequence
+        observable as a single critical section.
+        """
+        _validate_plugin_name(plugin)
+        path = self._path(plugin)
+        with self._grant_lock(plugin):
+            if not path.is_file():
+                return False
+            path.unlink()
+            # Deliberately do NOT unlink `trust.json.lock` here. POSIX
+            # `flock` is attached to the inode behind the lock-file
+            # path, so unlinking the lock-file (while we still hold
+            # the lock above us) only removes the dirent: a concurrent
+            # `grant()` would `open(lock_path, "w")` against a brand-
+            # new inode, `flock` *that* exclusively, and run in
+            # parallel with this `remove()`. By the time we release
+            # our `flock` on the now-orphan inode, the concurrent
+            # writer has already recreated `trust.json` — reopening
+            # the very race the per-plugin lock was added to close.
+            # The lock-file is a synchronization primitive, not
+            # operation-scoped state; leaving it on disk is correct.
+            # Best-effort dir cleanup still tolerates the leftover
+            # because `rmdir` raises `OSError(ENOTEMPTY)` and we swallow
+            # it below.
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+            return True
+
+
+__all__ = [
+    "DEFAULT_TRUST_ROOT",
+    "TRUST_SCHEMA_VERSION",
+    "GrantedScope",
+    "TrustRecord",
+    "TrustStore",
+]

@@ -31,16 +31,20 @@ _configure_utf8_stdio()
 
 # Skills that work without MCP setup (bypass the setup gate)
 # qa has a built-in fallback that adopts the qa-judge agent directly
+# resume-session reads the EventStore directly — its purpose is recovering after
+# an MCP disconnect, so the no-MCP path is exactly when the user needs it.
 SETUP_BYPASS_SKILLS = [
     "/ouroboros:setup",
     "/ouroboros:help",
     "/ouroboros:qa",
+    "/ouroboros:resume-session",
 ]
 
 # Keyword → skill mapping
 # "ooo <cmd>" prefix always works; natural language keywords also supported
 KEYWORD_MAP = [
     # ooo prefix shortcuts (checked first for priority)
+    {"patterns": ["ooo auto"], "skill": "/ouroboros:auto"},
     {"patterns": ["ooo interview", "ooo socratic"], "skill": "/ouroboros:interview"},
     {"patterns": ["ooo seed", "ooo crystallize"], "skill": "/ouroboros:seed"},
     {"patterns": ["ooo run", "ooo execute"], "skill": "/ouroboros:run"},
@@ -58,6 +62,12 @@ KEYWORD_MAP = [
     {"patterns": ["ooo cancel", "ooo abort"], "skill": "/ouroboros:cancel"},
     {"patterns": ["ooo update", "ooo upgrade"], "skill": "/ouroboros:update"},
     {"patterns": ["ooo brownfield"], "skill": "/ouroboros:brownfield"},
+    {"patterns": ["ooo publish"], "skill": "/ouroboros:publish"},
+    # Canonical form only. The short `ooo resume` alias was rejected because
+    # word-boundary matching would route prose like "please ooo resume work on
+    # this" to /ouroboros:resume-session, and skills/resume-session/SKILL.md
+    # explicitly chose the hyphenated name to avoid /resume collision.
+    {"patterns": ["ooo resume-session"], "skill": "/ouroboros:resume-session"},
     # Natural language triggers
     # PM triggers must precede generic interview to avoid "pm interview" being shadowed
     {

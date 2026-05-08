@@ -12,12 +12,19 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 OUROBOROS ARCHITECTURE                                               │
+│                            USERLEVEL PROGRAMS LAYER  (Section 7)                                     │
+│        Installable plugins:  github-pr-ops  ·  jira-sync  ·  release-coordinator   ...               │
+│        First-party programs: ooo auto       ·  ooo run    ·  ooo pm                                  │
+└──────────────────────────────────────────────┬──────────────────────────────────────────────────────┘
+                                               │ declared manifest contract / declared scopes
+                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          OUROBOROS ARCHITECTURE  (core, Sections 1–6)                                │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                     │
 │  ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐                 │
-│  │      PLUGIN LAYER    │     │      CORE LAYER     │     │      PRESENTATION    │                 │
-│  │                     │     │                     │     │      LAYER           │                 │
+│  │  SKILLS & AGENTS    │     │      CORE LAYER     │     │      PRESENTATION    │                 │
+│  │     REGISTRY        │     │                     │     │      LAYER           │                 │
 │  │  ┌───────────────┐  │     │  ┌───────────────┐  │     │  ┌───────────────┐  │                 │
 │  │  │   Skills      │──┼─────┼─▶│   Seed Spec    │──┼─────┼─▶│   TUI Dashboard │  │                 │
 │  │  │   (9)         │  │     │  │   (Immutable)  │  │     │  │   (Textual)   │  │                 │
@@ -51,12 +58,23 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 
 ## Core Components Overview
 
-### 1. Plugin Layer
-**Auto-discovery of skills and agents through the plugin system**
+### 1. Skills & Agents Registry
+**Auto-discovery of bundled skills and agents that ship with Ouroboros core**
 - Skills: 14 core workflow skills (interview, seed, run, evaluate, evolve, cancel, unstuck, update, help, setup, ralph, tutorial, welcome, status)
 - Agents: 9 specialized agents for different thinking modes
 - Hot-reload capabilities without restart
 - Magic prefix detection (`/ouroboros:`)
+
+> **Note**: This layer is the in-process registry of bundled skills and agents
+> that ship with core. It is **not** the user-installable UserLevel plugin
+> layer (introduced in [#725](https://github.com/Q00/ouroboros/issues/725)).
+> User-installable plugins live one layer above this — see
+> [`Section 7: UserLevel Programs Layer`](#7-userlevel-programs-layer) below.
+> The full layer-model and contract are described in issue
+> [#725](https://github.com/Q00/ouroboros/issues/725); a long-form RFC is
+> being drafted in PR [#743](https://github.com/Q00/ouroboros/pull/743) and
+> will land at `docs/rfc/userlevel-plugins.md` once merged. Do not conflate
+> the two registries in PRs.
 
 ### 2. Core Layer
 **Immutable data models and specifications**
@@ -94,6 +112,61 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 - Agent activity monitor
 - Cost tracking and drift visualization
 - Interactive debugging capabilities
+
+### 7. UserLevel Programs Layer
+
+**Workflows composed on top of core primitives via a declared manifest
+contract** — both first-party programs that ship today (`ooo auto`, `ooo run`,
+`ooo pm`) and a planned third-party plugin surface (introduced in
+[#725](https://github.com/Q00/ouroboros/issues/725); long-form RFC in flight
+in PR [#743](https://github.com/Q00/ouroboros/pull/743), which will land at
+`docs/rfc/userlevel-plugins.md`). The third-party install surface
+(`ooo plugin add ...`) is not yet implemented on `main`; this section
+documents the architectural target so PRs can be discussed in consistent
+terms.
+
+This layer is distinct from the in-process Skills & Agents Registry
+(Section 1):
+
+- **Skills & Agents Registry** = in-process subsystem of bundled
+  skills/agents that ship with core. Discovered via `/ouroboros:` magic
+  prefix. Used by `ooo interview`, `ooo qa`, etc.
+- **UserLevel Programs Layer** = workflows composed on top of core
+  primitives via a declared manifest contract. First-party programs
+  shipped today: `ooo auto`, `ooo run`, `ooo pm`. Installable third-party
+  plugins (e.g. `github-pr-ops`, `merge-assistant`, `jira-sync`) are
+  **planned**: the manifest schema is being prototyped at
+  [Q00/ouroboros-plugins/schemas/0.1/](https://github.com/Q00/ouroboros-plugins/tree/main/schemas/0.1)
+  and the `ooo plugin add <repo-url>` install surface is tracked under
+  [#725](https://github.com/Q00/ouroboros/issues/725); it does not exist
+  on `main` yet. First-party and installable programs will share the
+  same manifest format.
+
+```text
++----------------------------------------------------------------------+
+| UserLevel Programs Layer                                             |
+|                                                                      |
+|   Shipped (first-party):     ooo auto   ooo run   ooo pm             |
+|   Planned (third-party):     github-pr-ops  jira-sync  ...  (#725)   |
++--------------------------+-------------------------------------------+
+                           | declared manifest contract
+                           v
+                      Ouroboros core
+                      (Sections 1–6 above)
+```
+
+**Why a separate layer?** To keep `ooo auto` coherent (`goal → interview
+→ Seed → handoff` only), keep core small, and route domain-specific
+operational workflows (GitHub PR ops, Jira triage, Slack incident
+response) into pluggable packages rather than into core or `ooo auto`.
+
+**Manifest contract**: see [Q00/ouroboros-plugins/schemas/0.1/](https://github.com/Q00/ouroboros-plugins/tree/main/schemas/0.1).
+
+> **Terminology guard**: in this codebase, "plugin" by itself can refer to
+> either the in-process Skills/Agents Registry or the UserLevel Programs
+> Layer. When writing PRs or docs, qualify the term — e.g.
+> "skill plugin" (Section 1) vs "UserLevel plugin" (Section 7). When in
+> doubt, link the relevant section.
 
 ## Philosophy
 

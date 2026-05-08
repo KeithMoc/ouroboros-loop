@@ -1,0 +1,6 @@
+{
+  "repo": "Q00/ouroboros-plugins",
+  "schema_version": "0.1",
+  "vendored_at": "2026-05-07",
+  "note": "These schemas mirror Q00/ouroboros-plugins/schemas/0.1/. They reflect the locked decisions in Q00/ouroboros-plugins #6 (manifest 8+2 fields), #10 (3-value risk enum), #11 (per-major archive). Sync via scripts/sync-plugin-schemas.sh once Q00/ouroboros-plugins#13/#16/#19/#20 land on upstream main."
+}
