@@ -16,10 +16,10 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 import os
 import re
-from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from ouroboros.observability.logging import get_logger
@@ -534,7 +534,7 @@ class Invariant:
         return self.text
 
 
-def _deserialize_invariant(item: Any) -> "Invariant":
+def _deserialize_invariant(item: Any) -> Invariant:
     """Reconstruct an Invariant from a serialized form.
 
     Handles two formats for backward compatibility:
@@ -601,7 +601,7 @@ class ACPostmortem:
     status: PostmortemStatus = "pass"
     duration_seconds: float = 0.0
     ac_native_session_id: str | None = None
-    sub_postmortems: tuple["ACPostmortem", ...] = field(default_factory=tuple)
+    sub_postmortems: tuple[ACPostmortem, ...] = field(default_factory=tuple)
     # Q4 inline-QA fields — default None/0 preserves forward-compat with old chains
     qa_verdict: dict[str, Any] | None = None
     qa_status: str | None = None
@@ -627,7 +627,7 @@ class ACPostmortem:
         self,
         *,
         min_reliability: float = 0.0,
-        contradicted_keys: "frozenset[str] | None" = None,
+        contradicted_keys: frozenset[str] | None = None,
     ) -> str:
         """Render a one-line digest for compressed display in the chain.
 
@@ -698,7 +698,7 @@ class ACPostmortem:
         self,
         *,
         min_reliability: float = 0.0,
-        contradicted_keys: "frozenset[str] | None" = None,
+        contradicted_keys: frozenset[str] | None = None,
     ) -> str:
         """Render the full postmortem for the in-prompt 'recent' window.
 
@@ -781,11 +781,11 @@ class PostmortemChain:
 
     postmortems: tuple[ACPostmortem, ...] = field(default_factory=tuple)
 
-    def append(self, postmortem: ACPostmortem) -> "PostmortemChain":
+    def append(self, postmortem: ACPostmortem) -> PostmortemChain:
         """Return a new chain with ``postmortem`` appended (immutable)."""
         return PostmortemChain(postmortems=self.postmortems + (postmortem,))
 
-    def replace_last(self, postmortem: ACPostmortem) -> "PostmortemChain":
+    def replace_last(self, postmortem: ACPostmortem) -> PostmortemChain:
         """Return a new chain with the most recent postmortem replaced.
 
         Frozen-safe in-place-style update: the underlying ``postmortems``
@@ -838,9 +838,9 @@ class PostmortemChain:
 
     def merge_invariants(
         self,
-        new: "list[tuple[str, float]]",
+        new: list[tuple[str, float]],
         source_ac_id: str,
-    ) -> "tuple[Invariant, ...]":
+    ) -> tuple[Invariant, ...]:
         """Merge new invariant claims into the running chain's cumulative set.
 
         Called after each AC completes to produce the ``invariants_established``
@@ -1147,6 +1147,71 @@ class PostmortemChain:
         return text
 
 
+def _redact_chain_for_prompt(chain: PostmortemChain) -> PostmortemChain:
+    """Return a copy of ``chain`` with secrets stripped from prompt-bound text.
+
+    Wired only into :func:`build_postmortem_chain_prompt` — the parallel
+    executor builds its context section via :func:`build_context_prompt`
+    instead, so this redaction does not affect parallel mode.
+
+    [[INVARIANT: parallel mode prompts are byte-identical pre/post redactor]]
+
+    For each postmortem in the chain, we rebuild the frozen dataclass with:
+
+    - ``summary.key_output`` routed through :func:`redact_for_chain`
+      (path layer keys on the AC's own ``files_modified``).
+    - ``gotchas`` strings routed through pattern + entropy layers only
+      (path-layer suppression of agent-curated lessons would be too
+      aggressive — gotchas live in different semantic territory than raw
+      key_output excerpts).
+
+    Other fields (``files_modified``, ``tools_used``, ``invariants_established``,
+    ``diff_summary``, ``tool_trace_digest``, etc.) are preserved verbatim.
+    Persistence and resume paths render from the original chain object — only
+    the *prompt* is redacted.
+    """
+    from ouroboros.orchestrator.postmortem_redactor import redact_for_chain
+
+    new_postmortems: list[ACPostmortem] = []
+    for pm in chain.postmortems:
+        original = pm.summary
+        redacted_summary = ACContextSummary(
+            ac_index=original.ac_index,
+            ac_content=original.ac_content,
+            success=original.success,
+            tools_used=original.tools_used,
+            files_modified=original.files_modified,
+            key_output=redact_for_chain(original.key_output, original.files_modified),
+            public_api=original.public_api,
+        )
+        # Gotchas: pattern + entropy only (no path suppression — see docstring).
+        # We pass an empty files_modified so the path layer is a no-op, then
+        # apply the pattern/entropy layers via the same public entry point.
+        redacted_gotchas = tuple(
+            redact_for_chain(g, ()) for g in pm.gotchas
+        )
+        new_postmortems.append(
+            ACPostmortem(
+                summary=redacted_summary,
+                diff_summary=pm.diff_summary,
+                tool_trace_digest=pm.tool_trace_digest,
+                gotchas=redacted_gotchas,
+                qa_suggestions=pm.qa_suggestions,
+                invariants_established=pm.invariants_established,
+                retry_attempts=pm.retry_attempts,
+                status=pm.status,
+                duration_seconds=pm.duration_seconds,
+                ac_native_session_id=pm.ac_native_session_id,
+                sub_postmortems=pm.sub_postmortems,
+                qa_verdict=pm.qa_verdict,
+                qa_status=pm.qa_status,
+                qa_attempts=pm.qa_attempts,
+                final_message=pm.final_message,
+            )
+        )
+    return PostmortemChain(postmortems=tuple(new_postmortems))
+
+
 def build_postmortem_chain_prompt(
     chain: PostmortemChain,
     *,
@@ -1160,6 +1225,14 @@ def build_postmortem_chain_prompt(
     ``OUROBOROS_POSTMORTEM_FULL_K`` and ``OUROBOROS_POSTMORTEM_TOKEN_BUDGET``
     env overrides when arguments are not supplied. Returns an empty string for
     an empty chain so callers can concatenate unconditionally.
+
+    Runtime secret redaction is applied here (and only here): the rendered
+    chain is passed through :func:`_redact_chain_for_prompt` before
+    :meth:`PostmortemChain.to_prompt_text` runs, so secrets that leaked into
+    agent trace events do not propagate downstream. Parallel mode uses
+    :func:`build_context_prompt` and is unaffected.
+
+    [[INVARIANT: parallel mode prompts are byte-identical pre/post redactor]]
 
     Args:
         chain: Postmortem chain to render.
@@ -1187,7 +1260,8 @@ def build_postmortem_chain_prompt(
             )
         except ValueError:
             token_budget = POSTMORTEM_DEFAULT_TOKEN_BUDGET
-    return chain.to_prompt_text(
+    redacted_chain = _redact_chain_for_prompt(chain)
+    return redacted_chain.to_prompt_text(
         k_full=k_full,
         token_budget=token_budget,
         on_truncated=on_truncated,
@@ -1265,7 +1339,7 @@ def deserialize_postmortem_chain(data: list[dict[str, Any]]) -> PostmortemChain:
     return PostmortemChain(postmortems=tuple(postmortems))
 
 
-def extract_invariant_tags(messages: "Sequence[AgentMessage] | str") -> list[str]:
+def extract_invariant_tags(messages: Sequence[AgentMessage] | str) -> list[str]:
     """Extract ``[[INVARIANT: ...]]`` tags from agent messages or a plain string.
 
     Implements the Q3 (C-plus) tag-parsing step.  Tags are parsed with the

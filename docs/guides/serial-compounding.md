@@ -87,6 +87,8 @@ Omitting `mode` is identical to `"parallel"` — backward compatible.
 |---|---|---|
 | `OUROBOROS_POSTMORTEM_FULL_K` | `3` | Number of most-recent postmortems rendered in full form; older render as one-line digests |
 | `OUROBOROS_POSTMORTEM_TOKEN_BUDGET` | `8000` | Approximate token budget for the chain section; oldest digests drop first under pressure, full forms + cumulative invariants always preserved |
+| `OUROBOROS_POSTMORTEM_REDACT_PATHS` | _(defaults only)_ | Comma-separated globs **appended** to the built-in sensitive-path set (`.env`, `.env.*`, `*.pem`, `id_rsa*`, `id_ed25519*`, `credentials.json`, `*.kube/config`, `.aws/credentials`, `.npmrc`, `.pypirc`). When an AC modifies a matching path, that AC's `key_output` is replaced with `[redacted: path]` in the rendered chain. Set to `none` to disable defaults entirely. |
+| `OUROBOROS_POSTMORTEM_REDACT_ENTROPY` | _unset_ | Set to `1` to enable the entropy heuristic — high-entropy (≥4.5 bits/char) base64-ish runs of length ≥32 are replaced with `[redacted: entropy]`. Off by default because long opaque IDs in normal output are common false positives. |
 
 ---
 
@@ -97,7 +99,7 @@ Done before writing any code, with file:line refs. Four of these changed the pla
 | # | Finding | Implication |
 |---|---|---|
 | 1 | `runner.py:1563` — when `parallel=False`, the fall-through path sends **the whole seed's ACs in one `execute_task()` call**, not a per-AC loop. | Existing `--sequential` flag is not compounding and never was. The primitive didn't exist in either mode. |
-| 2 | `events/base.py:47-59` — `sanitize_event_data_for_persistence` strips only `raw_*` / `subscribed_*` MCP wrapper keys. `tool_input` is **preserved**. | Files touched by Write/Edit ARE reconstructible from events. Initial exploration agent was wrong about this; verified via code read. |
+| 2 | `events/base.py:47-59` — `sanitize_event_data_for_persistence` strips only `raw_*` / `subscribed_*` MCP wrapper keys. `tool_input` is **preserved**. | Files touched by Write/Edit ARE reconstructible from events. Initial exploration agent was wrong about this; verified via code read. **Update (issue #16):** runtime secret-redaction now applies at chain-build time in `build_postmortem_chain_prompt` (see `src/ouroboros/orchestrator/postmortem_redactor.py`). Event persistence is still untouched — the redactor only filters the prompt-bound copy of the chain so secrets that leaked into agent traces don't propagate to downstream ACs' system prompts. Parallel mode is unaffected (it uses `build_context_prompt`, not the chain renderer). |
 | 3 | `level_context.py:175-195` — `ACContextSummary` already carries `files_modified, tools_used, key_output, public_api` derived deterministically from events. | The postmortem primitive is ~70% already there; composition over this beats greenfield extraction. |
 | 4 | `claude_code_adapter.py` uses the subprocess-based `claude_agent_sdk`, not raw `anthropic`. System prompt is passed as a flat string via `ClaudeAgentOptions.system_prompt`. No `cache_control` surface exposed. | Prompt caching with ephemeral breakpoints is a deeper refactor than a flag flip — defer to phase 2. |
 | 5 | `parallel_executor.py:2111-3300` — `_execute_single_ac` is ~1150 lines, with runtime-handle memoization, stall-timeout cancel scopes, recovery-discontinuity events, executor-model routing, etc. | Extracting it into a shared module in phase 1 would be the single biggest regression risk. Subclass-first approach dominates. |
@@ -194,6 +196,7 @@ reused across ACs.
 | `570d9e8` | M3 + M4 + M8 | `serial_executor.py` (new), `events.py` (+factory), `runner.py` (CLAUDE.md kwargs), `parallel_executor.py` (context_override plumbing), tests (+15) |
 | `933a816` | M9 | `run.py` (`--compounding`), `execution_handlers.py` (`mode` param), `runner.py` (dispatch), tests (+6) |
 | `79a3d5b` | chore | `.gitignore` for `.ouroboros_eval_artifact.md` |
+| _(issue #16)_ | Runtime secret-redactor for postmortem chain | `postmortem_redactor.py` (new), `level_context.py` (`build_postmortem_chain_prompt` redacts before render), `test_postmortem_redactor.py` (+43 tests). Path / regex-pattern / opt-in entropy layers; parallel mode untouched. |
 
 **Test status:** 4918 unit tests pass, 2 skipped (pre-existing).
 
