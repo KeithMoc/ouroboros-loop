@@ -1,0 +1,261 @@
+# Parking-Lot Audit Seed
+#
+# Purpose
+# -------
+# Controlled experiment to measure whether **compounding mode** (serial
+# executor with postmortem chain) produces materially better cross-AC
+# coherence than **parallel mode** on a multi-AC project where later ACs
+# depend on names/types/decisions made by earlier ACs.
+#
+# This is NOT a production deliverable — it is an audit fixture. The
+# orchestrator builds the project under
+# `examples/parking-lot-audit/runs/<mode>-r<i>/output/` for each run; the
+# scoring script then compares mode-vs-mode on a fixed metric set.
+#
+# The deliverable itself (a TUI for parking AI-agent handoff work across
+# worktrees) is genuinely useful, but its quality is a side-effect of the
+# audit, not the goal.
+#
+# Forced cross-AC contracts (audit traps)
+# ---------------------------------------
+# AC-1 declares an authoritative schema. ACs 2–5 must reference its field
+# names verbatim. Each AC carries decisions later ACs cannot infer from
+# the seed alone — only from a prior AC's output. Compounding sees those
+# outputs; parallel does not.
+
+goal: |
+  Build a small, working "parking-lot" CLI + TUI in Python under
+  ``output/`` (relative to the orchestrator working directory) that lets an
+  AI agent (or human) park half-baked work across multiple projects and
+  worktrees, then resume it later.
+
+  Concrete deliverable, in 5 sequential ACs:
+
+    AC-1 — SQLite schema + Pydantic models + migration v1
+    AC-2 — Click CLI: `parking add | list | resume | done | tag`
+    AC-3 — Textual TUI: list view + detail panel + hotkeys
+    AC-4 — Worktree probe: capture git state into an entry on `parking add`
+    AC-5 — Pytest suite + README dogfood + dx-handoff exporter
+
+  Each AC must use ONLY the field names and contracts declared by AC-1
+  (which sets the schema) and AC-2 (which sets the CLI surface). Any
+  drift between ACs is a defect — the audit measures exactly that drift.
+
+constraints:
+  - "Python 3.10+ (no walrus in match statements)."
+  - "Single self-contained package under output/ — name it `parking`."
+  - "Dependencies: `click`, `textual`, `pydantic>=2`, `sqlite3` (stdlib)."
+  - "All code lives under output/parking/ — do NOT modify anything outside output/."
+  - "Tests live under output/tests/ and run with `pytest output/tests/`."
+  - "Use SQLite via stdlib `sqlite3` — no SQLAlchemy."
+  - "All public functions and classes must have type hints (PEP 604 unions ok)."
+  - "Commit per AC with a conventional-commit message in the orchestrator branch."
+  - "Emit at least one [[INVARIANT: ...]] tag per AC so later ACs can be checked against it."
+  - "Do NOT modify the `output/parking/db.py` schema once AC-1 has committed it. ACs 2–5 must adapt."
+
+acceptance_criteria:
+  - |
+    AC-1 — Storage: SQLite schema, Pydantic models, migration v1
+
+    Create:
+      - output/parking/db.py with a `connect(path: Path) -> sqlite3.Connection`
+        helper and a `migrate(conn)` function that runs migration v1.
+      - output/parking/models.py with a Pydantic v2 `ParkingEntry` model
+        whose fields are the SCHEMA OF RECORD. ACs 2–5 must reference
+        these exact names and types.
+
+    SCHEMA OF RECORD (authoritative — all later ACs must use these exact
+    names, no synonyms, no abbreviations):
+
+      entry_id:       str            (primary key, format: 'pe_' + 12 hex)
+      project:        str            (free-form, e.g. 'ouroboros-loop')
+      worktree_path:  str            (absolute path to git working tree)
+      branch:         str            (git branch name at park time)
+      head_sha:       str            (40-char git SHA at park time)
+      dirty:          bool           (TRUE iff worktree had uncommitted changes)
+      parked_at:      str            (ISO 8601 UTC, e.g. '2026-05-08T14:30:00Z')
+      tag:            str            (single tag string, e.g. 'wip', 'blocked')
+      note:           str            (free-form, may be empty)
+      resumed_at:     str | None     (ISO 8601 UTC, NULL while still parked)
+
+    Migration v1:
+      - One table `parking_entries` with the columns above.
+      - Index on (project, parked_at DESC).
+      - A `schema_version` table with a single row holding integer 1.
+      - migrate() must be idempotent (running twice is a no-op).
+
+    Tests (in output/tests/test_db.py):
+      - migrate() creates table + index + schema_version row.
+      - migrate() called twice is idempotent.
+      - ParkingEntry round-trips to/from sqlite (insert + select).
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: ParkingEntry fields are the schema-of-record; later ACs may not rename them]]
+      - [[INVARIANT: entry_id format is 'pe_' + 12 lowercase hex chars]]
+      - [[INVARIANT: parked_at is ISO 8601 UTC string ending in 'Z']]
+
+  - |
+    AC-2 — CLI: parking add | list | resume | done | tag
+
+    Create output/parking/cli.py exposing a Click group `parking` with
+    these EXACT subcommands and EXACT flag names:
+
+      parking add
+        --project TEXT          (required)
+        --worktree-path PATH    (required, must exist)
+        --tag TEXT              (required, single string)
+        --note TEXT             (optional, default '')
+        # Captures branch, head_sha, dirty via a placeholder
+        # `_probe_worktree(worktree_path)` function that returns
+        # (branch='unknown', head_sha='0' * 40, dirty=False) for now.
+        # AC-4 will replace this stub with a real probe.
+
+      parking list
+        --project TEXT          (optional, filters by project)
+        --tag TEXT              (optional, filters by tag)
+        --pending               (flag: only show entries with resumed_at IS NULL)
+        # Output: tabular text, columns: entry_id, project, branch, tag, parked_at, note (truncated to 40 chars).
+
+      parking resume ENTRY_ID
+        # Sets resumed_at = now (ISO 8601 UTC).
+        # Prints: 'cd <worktree_path> && git checkout <branch>  # <tag>: <note>'
+
+      parking done ENTRY_ID
+        # Hard-deletes the entry.
+
+      parking tag ENTRY_ID NEW_TAG
+        # Updates the tag column.
+
+    DB path resolution:
+      - $PARKING_DB if set, else ~/.local/share/parking/parking.db.
+      - Auto-create parent dirs.
+      - Auto-migrate on every CLI invocation.
+
+    Tests (in output/tests/test_cli.py) using Click's CliRunner against an
+    isolated $PARKING_DB:
+      - add → list → resume → done full lifecycle.
+      - --pending filter excludes resumed entries.
+      - tag command updates the row.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: parking CLI flag names are kebab-case mirrors of model fields]]
+      - [[INVARIANT: parking resume prints reactivation command on stdout]]
+      - [[INVARIANT: $PARKING_DB env var overrides default DB path]]
+
+  - |
+    AC-3 — TUI: Textual list + detail panel
+
+    Create output/parking/tui.py exposing a `run()` entry point that the
+    CLI can invoke as `parking ui`.
+
+    Layout:
+      - Left pane: scrollable list of entries (most-recent parked_at first).
+        Each row shows: project · branch · tag · parked_at (date only).
+      - Right pane: detail panel for the highlighted entry, showing every
+        ParkingEntry field by its SCHEMA-OF-RECORD name.
+      - Footer: hotkeys (`r` resume, `d` done, `q` quit).
+
+    Behavior:
+      - Pressing `r` on a highlighted entry invokes `parking resume <id>` via
+        subprocess and refreshes the list.
+      - Pressing `d` invokes `parking done <id>` after a confirm dialog.
+      - Pressing `q` exits cleanly.
+
+    Tests (in output/tests/test_tui.py):
+      - Render snapshot test: with one fixture entry, the detail panel shows
+        all 10 schema-of-record field names.
+      - Hotkey test: `r` triggers the resume action (mock subprocess).
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: TUI detail panel renders all 10 schema-of-record fields verbatim]]
+      - [[INVARIANT: TUI hotkeys r/d/q match footer legend]]
+
+  - |
+    AC-4 — Worktree probe
+
+    Replace the stub `_probe_worktree` in output/parking/cli.py with a real
+    probe in output/parking/git_probe.py that:
+      - Runs `git -C <worktree_path> rev-parse --abbrev-ref HEAD` for branch.
+      - Runs `git -C <worktree_path> rev-parse HEAD` for head_sha.
+      - Runs `git -C <worktree_path> status --porcelain` and sets dirty=True
+        iff stdout is non-empty.
+      - Raises a clear error if `worktree_path` is not a git working tree.
+
+    Tests (in output/tests/test_git_probe.py) using a tmp_path fixture that
+    `git init`s a real repo:
+      - Probe on clean repo returns (main_or_master, 40-char SHA, dirty=False).
+      - Probe after touching a file returns dirty=True.
+      - Probe on non-git dir raises.
+
+    Wire `_probe_worktree` in cli.py to call git_probe.probe_worktree.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: git_probe.probe_worktree returns (branch, head_sha, dirty) populating exact schema-of-record fields]]
+      - [[INVARIANT: probe raises on non-git dir, never returns sentinel values]]
+
+  - |
+    AC-5 — Test suite + README + dx-handoff exporter
+
+    Create:
+      - output/README.md — quick-start (install, add, list, resume, ui).
+      - output/parking/handoff_export.py with a function
+        `to_handoff_doc(entry: ParkingEntry) -> str` that returns a markdown
+        document compatible with the `dx:handoff` skill's format
+        (frontmatter: project, branch, parked_at; body: note + reactivation
+        command). Add `parking export ENTRY_ID` as a CLI subcommand that
+        prints to stdout.
+      - output/tests/test_handoff_export.py covering the full schema → doc
+        round-trip, asserting every schema-of-record field appears in the
+        rendered markdown by its exact name.
+      - output/tests/test_smoke.py — end-to-end: add → list → ui --check
+        (a non-interactive flag added in AC-3 that exits 0 if the TUI
+        constructs without error) → export → done.
+
+    Run `pytest output/tests/ -q` and ensure all tests pass before committing.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: handoff export contains all 10 schema-of-record field names verbatim]]
+      - [[INVARIANT: full pytest suite passes at end of AC-5]]
+
+ontology_schema:
+  name: "ParkingLotAudit"
+  description: "Cross-worktree handoff parking app — audit fixture for parallel-vs-compounding execution."
+  fields:
+    - name: "ParkingEntry"
+      field_type: "entity"
+      description: "Pydantic model + sqlite row representing one parked piece of work. Schema of record."
+    - name: "WorktreeProbe"
+      field_type: "service"
+      description: "Captures git state (branch, head_sha, dirty) for a worktree path."
+    - name: "ParkingDB"
+      field_type: "store"
+      description: "SQLite database with parking_entries + schema_version tables; migration v1."
+    - name: "ParkingCLI"
+      field_type: "interface"
+      description: "Click CLI exposing add/list/resume/done/tag/export/ui subcommands."
+    - name: "ParkingTUI"
+      field_type: "interface"
+      description: "Textual TUI rendering ParkingEntry list + detail panel."
+    - name: "HandoffExporter"
+      field_type: "service"
+      description: "Renders ParkingEntry as markdown handoff doc compatible with dx:handoff skill."
+
+evaluation_principles:
+  - name: "schema_fidelity"
+    description: "ACs 2–5 must reference AC-1's schema-of-record field names verbatim. Any rename, abbreviation, or synonym is a defect."
+  - name: "cli_surface_stability"
+    description: "AC-3 (TUI), AC-4 (probe), AC-5 (export + smoke) must invoke AC-2's CLI commands and flags exactly as declared. No improvised flag names."
+  - name: "invariant_emission"
+    description: "Every AC must emit at least one [[INVARIANT: ...]] tag. Compounding mode propagates these to later ACs; parallel mode does not."
+  - name: "test_pass_rate"
+    description: "All tests defined per-AC must pass. AC-5's smoke test covers the full chain."
+  - name: "no_orphan_fields"
+    description: "No AC may introduce a model field, CLI flag, or TUI display name that is not declared in the seed or in AC-1's schema-of-record."
+
+metadata:
+  seed_id: "parking-lot-audit"
+  parent_seed: null
+  ambiguity_score: 0.10
+  expected_decomposition_depth: 0
+  source_brainstorm: "examples/parking-lot-audit/PLAN.md"
+  execution_mode_required: null  # set per-run via --mode flag

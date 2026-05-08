@@ -154,3 +154,15 @@ docs/cli-inventory.yaml
 # (see src/ouroboros/orchestrator/serial_executor.py write_chain_artifact)
 # These are per-session inspection files, not permanent project documentation.
 docs/brainstorm/chain-*.md
+
+# Parking-lot audit per-run worktrees (created by scripts/audit/run_parking_lot_bench.sh).
+# The harness uses `git worktree add` for isolation; these are ephemeral checkouts.
+.audit-worktrees/
+
+# Per-run audit artifacts. The dir + REPORT.md + scores.json are tracked, but the heavy
+# raw outputs / event stores per run aren't worth committing.
+examples/parking-lot-audit/runs/*/output/
+examples/parking-lot-audit/runs/*/events.sqlite
+examples/parking-lot-audit/runs/*/session.log
+examples/parking-lot-audit/runs/*/commits.log
+examples/parking-lot-audit/runs/*/metrics.json
