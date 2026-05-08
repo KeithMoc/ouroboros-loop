@@ -51,7 +51,7 @@ _IDLE_TIMEOUT_ENV = "OUROBOROS_HERMES_IDLE_TIMEOUT_SECONDS"
 def _resolve_timeout_override(
     explicit: float | None,
     env_name: str,
-    fallback: float,
+    fallback: float | None,
 ) -> float | None:
     """Resolve a stream-timeout override.
 
@@ -91,6 +91,8 @@ def _resolve_timeout_override(
             fallback=fallback,
         )
         candidate = fallback
+    if candidate is None:
+        return None
     if candidate <= 0:
         return None
     return candidate
@@ -187,9 +189,10 @@ class HermesCliRuntime(AgentRuntime):
         # Resolve stream-loop timeouts (kwarg → env var → class default;
         # ``0``/negative disables the guard so the generation watchdog —
         # not the runtime's own stream loop — owns long-running liveness.
-        # Hermes runs in quiet mode (``-Q``) and emits no progress events,
-        # so the default class-level idle window can fire on legitimate
-        # long-running model calls before the watchdog has a chance.)
+        # Hermes runs in quiet mode (``-Q``) and can legitimately emit no
+        # stdout while the model is working.  Keep class defaults conservative
+        # for direct callers; watchdog-wrapped seed execution may opt out via
+        # explicit constructor kwargs.
         self._startup_output_timeout_seconds = _resolve_timeout_override(
             startup_output_timeout_seconds,
             _STARTUP_TIMEOUT_ENV,

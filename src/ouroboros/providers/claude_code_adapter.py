@@ -30,6 +30,8 @@ import asyncio
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
+from functools import lru_cache
+import inspect
 import json
 import os
 from pathlib import Path
@@ -69,6 +71,26 @@ _RETRYABLE_ERROR_PATTERNS = (
 )
 
 
+@lru_cache(maxsize=1)
+def _claude_options_field_names() -> frozenset[str]:
+    """Return parameter names accepted by ``ClaudeAgentOptions``.
+
+    Used to gate optional kwargs that may not exist across the supported
+    SDK pin range (``claude-agent-sdk>=0.1.0,<1.0.0``).  ``strict-mcp-config``
+    is only available via ``extra_args`` (CLI passthrough) on current SDK
+    versions; older releases may also lack ``extra_args`` itself, so we
+    detect support before forwarding instead of assuming a typed kwarg.
+    """
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions  # noqa: PLC0415
+    except ImportError:
+        return frozenset()
+    try:
+        return frozenset(inspect.signature(ClaudeAgentOptions).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
 class ClaudeCodeAdapter:
     """LLM adapter using Claude Agent SDK (Claude Code Max Plan).
 
@@ -102,6 +124,7 @@ class ClaudeCodeAdapter:
         max_turns: int = 1,
         on_message: Callable[[str, str], None] | None = None,
         timeout: float | None = None,
+        strict_mcp_config: bool = False,
     ) -> None:
         """Initialize Claude Code adapter.
 
@@ -124,6 +147,12 @@ class ClaudeCodeAdapter:
             timeout: Optional application-level timeout in seconds for a
                 single completion request. When set, aborts before outer
                 transport timeouts and returns a ProviderError.
+            strict_mcp_config: When ``True``, forwards ``strict_mcp_config=True``
+                to the SDK so the spawned subprocess ignores plugin-provided
+                MCP servers and inherited project ``.mcp.json`` entries. Used
+                exclusively by callers that must avoid recursion into the
+                ouroboros MCP server (notably the interview policy path);
+                generic ``allowed_tools`` envelopes keep MCP-tool access intact.
         """
         self._permission_mode: str = permission_mode
         self._cli_path: Path | None = self._resolve_cli_path(cli_path)
@@ -134,6 +163,7 @@ class ClaudeCodeAdapter:
         self._max_turns: int = max_turns
         self._on_message: Callable[[str, str], None] | None = on_message
         self._timeout: float | None = timeout if timeout and timeout > 0 else None
+        self._strict_mcp_config: bool = bool(strict_mcp_config)
         log.info(
             "claude_code_adapter.initialized",
             permission_mode=permission_mode,
@@ -628,6 +658,63 @@ class ClaudeCodeAdapter:
             # default built-ins like AskUserQuestion/ToolSearch.
             options_kwargs["allowed_tools"] = list(self._allowed_tools)
             options_kwargs["tools"] = list(self._allowed_tools)
+
+        if self._strict_mcp_config:
+            # Opt-in MCP isolation: prevents the spawned subprocess from
+            # discovering plugin-provided servers (notably ouroboros itself,
+            # which would recurse on ouroboros_interview when invoked from
+            # inside Claude Code's MCP context).  Scoped to callers that
+            # explicitly request the policy — generic explicit envelopes
+            # keep MCP-tool access intact.
+            #
+            # ``ClaudeAgentOptions`` does not expose ``strict_mcp_config``
+            # as a typed field across the supported SDK pin range
+            # (``claude-agent-sdk>=0.1.0,<1.0.0``); current releases accept
+            # the flag only via ``extra_args`` (CLI passthrough).
+            #
+            # Compatibility invariant (verified against the published
+            # PyPI history): ``extra_args`` has been a field on
+            # ``ClaudeAgentOptions`` since the earliest published release
+            # (``claude-agent-sdk==0.0.23``) and remains present at every
+            # version in the declared support range, so the
+            # ``extra_args`` branch below is the path actually taken on
+            # any pip-installed SDK in that range.  The fail-fast branch
+            # is defense-in-depth against vendored, partial, or
+            # monkey-patched SDK builds where the field has been removed:
+            # we MUST honor the caller's isolation request rather than
+            # silently re-open the recursion path.  ``test_factory.py``
+            # and ``test_claude_code_adapter.py`` lock the live-SDK
+            # invariant so any future upper-bound bump that drops
+            # ``extra_args`` fails CI before reaching production.
+            field_names = _claude_options_field_names()
+            if "strict_mcp_config" in field_names:
+                options_kwargs["strict_mcp_config"] = True
+            elif "extra_args" in field_names:
+                extra_args = dict(options_kwargs.get("extra_args") or {})
+                extra_args.setdefault("strict-mcp-config", None)
+                options_kwargs["extra_args"] = extra_args
+            else:
+                msg = (
+                    "Nested-MCP isolation was requested but the installed "
+                    "claude-agent-sdk exposes neither ``strict_mcp_config`` "
+                    "nor ``extra_args``. Upgrade claude-agent-sdk to a "
+                    "release that supports CLI-flag passthrough (any "
+                    "version with the ``extra_args`` field on "
+                    "``ClaudeAgentOptions``) so ``--strict-mcp-config`` "
+                    "can be applied."
+                )
+                log.error(
+                    "claude_code_adapter.strict_mcp_config_unsupported",
+                    hint=msg,
+                )
+                raise ProviderError(
+                    message=msg,
+                    details={
+                        "error_type": "ConfigurationError",
+                        "supported_options_fields": sorted(field_names),
+                        "required_options_field": "extra_args or strict_mcp_config",
+                    },
+                )
 
         # Pass model from CompletionConfig if specified
         # "default" is not a valid SDK model — treat it as None (use SDK default)

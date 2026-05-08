@@ -20,10 +20,17 @@ from ouroboros.auto.answerer import (
     AutoBlocker,
 )
 from ouroboros.auto.blocker_attribution import record_authoring_backend
-from ouroboros.auto.gap_detector import Gap, GapDetector
+from ouroboros.auto.gap_detector import GapDetector
 from ouroboros.auto.ledger import LedgerStatus, SeedDraftLedger
 from ouroboros.auto.progress import AutoProgressCallback, AutoProgressEvent
 from ouroboros.auto.repo_context import repo_auto_answer_context
+from ouroboros.auto.safe_defaults import (
+    AUTO_ANSWER_PREFIX,
+    SAFE_DEFAULT_SYNTHESIS_TAG,
+    SafeDefaultFinalization,
+    build_safe_default_synthesis,
+    finalize_safe_defaultable_gaps,
+)
 from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
 
 log = structlog.get_logger(__name__)
@@ -254,7 +261,38 @@ class AutoInterviewDriver:
             self._save(state)
 
         if not ledger.is_seed_ready():
-            gaps = ", ".join(ledger.open_gaps())
+            finalization = finalize_safe_defaultable_gaps(
+                ledger,
+                goal=state.goal,
+                provenance=f"auto interview max rounds {self.max_rounds}",
+                pending_question=state.pending_question,
+            )
+            state.ledger = ledger.to_dict()
+            if finalization.completed and ledger.is_seed_ready():
+                synthesis_blocker = await self._record_safe_default_synthesis(
+                    state, ledger, finalization
+                )
+                if synthesis_blocker is None:
+                    state.pending_question = None
+                    state.interview_completed = True
+                    state.mark_progress(
+                        "auto interview finalized safe-defaultable gaps at max rounds",
+                        tool_name="interview_driver",
+                    )
+                    self._save(state)
+                    return AutoInterviewResult(
+                        "seed_ready", state.interview_session_id, ledger, self.max_rounds
+                    )
+                # Synthesis could not be persisted to the interview transcript —
+                # roll back the safe-default entries so ledger.open_gaps() and
+                # the blocker message reflect the genuinely unresolved state.
+                # Without this, downstream consumers of the convergence
+                # contract (interview stalled → name the unresolved sections)
+                # would see an apparently complete ledger paired with a block.
+                _revert_safe_default_entries(ledger, finalization.defaulted_sections)
+                state.ledger = ledger.to_dict()
+            gaps_list = finalization.unsafe_gaps or tuple(ledger.open_gaps())
+            gaps = ", ".join(gaps_list)
             blocker = f"auto interview reached max rounds with unresolved gaps: {gaps}"
             state.mark_blocked(blocker, tool_name="interview_driver")
             record_authoring_backend(state)
@@ -276,27 +314,102 @@ class AutoInterviewDriver:
         answer = self.answerer.answer(question, ledger, context)
         if answer.blocker is not None:
             return answer
+        open_before = tuple(ledger.open_gaps())
+        if not open_before:
+            return answer
         gaps = self.gap_detector.detect(ledger)
-        if not gaps:
-            return answer
-        updated_sections = {section for section, _entry in answer.ledger_updates}
-        if any(gap.section in updated_sections for gap in gaps):
-            return answer
-        next_gap = gaps[0]
-        if not _can_steer_with_gap_prompt(question):
-            return answer
-        if next_gap.section == "goal" or next_gap.state in {
-            LedgerStatus.CONFLICTING,
-            LedgerStatus.BLOCKED,
-        }:
-            blocker = AutoBlocker(reason=next_gap.message, question=question)
+        first_gap = gaps[0]
+
+        # `goal` can never be filled by an auto-default — it must come from the
+        # user. Block immediately so callers don't send placeholder text to the
+        # backend.
+        if first_gap.section == "goal":
+            blocker = AutoBlocker(reason=first_gap.message, question=question)
             return AutoAnswer(
-                text=f"Cannot safely decide automatically: {next_gap.message}",
+                text=f"Cannot safely decide automatically: {first_gap.message}",
                 source=AutoAnswerSource.BLOCKER,
                 confidence=1.0,
                 blocker=blocker,
             )
-        return self.answerer.answer(_gap_prompt(next_gap), ledger, context)
+
+        # Steering only kicks in when the answer is a repeated generic fallback
+        # or the prompt is broad enough that gap-targeted steering is helpful.
+        # Backend-specific answers (e.g. an acceptance follow-up) are preserved
+        # even if they don't reduce the required-gap set this turn.
+        is_repeated_default = self._is_repeated_default_answer(answer, ledger)
+        is_broad_prompt = _can_steer_with_gap_prompt(question)
+        if not (is_repeated_default or is_broad_prompt):
+            return answer
+
+        # Same-turn repair: a current answer that actually reduces required
+        # gaps — including a CONFLICTING/BLOCKED one — is allowed through
+        # before we raise a hard blocker. This lets the driver recover from
+        # persisted ledger conflicts when the next prompt yields a correcting
+        # answer.
+        if not is_repeated_default and self._answer_reduces_open_gaps(
+            question, answer, ledger, open_before
+        ):
+            return answer
+
+        if first_gap.state in {LedgerStatus.CONFLICTING, LedgerStatus.BLOCKED}:
+            blocker = AutoBlocker(reason=first_gap.message, question=question)
+            return AutoAnswer(
+                text=f"Cannot safely decide automatically: {first_gap.message}",
+                source=AutoAnswerSource.BLOCKER,
+                confidence=1.0,
+                blocker=blocker,
+            )
+
+        gap_answer = self.answerer.answer_gap(first_gap.section, ledger, context)
+        if gap_answer.blocker is not None:
+            return gap_answer
+        if self._answer_reduces_open_gaps(question, gap_answer, ledger, open_before):
+            return gap_answer
+
+        blocker = AutoBlocker(
+            reason=(
+                f"auto answer did not reduce open required ledger gaps: {', '.join(open_before)}"
+            ),
+            question=question,
+        )
+        return AutoAnswer(
+            text=(
+                "Cannot safely decide automatically: auto answer did not reduce open "
+                f"required ledger gaps: {', '.join(open_before)}"
+            ),
+            source=AutoAnswerSource.BLOCKER,
+            confidence=1.0,
+            blocker=blocker,
+        )
+
+    def _answer_reduces_open_gaps(
+        self,
+        question: str,
+        answer: AutoAnswer,
+        ledger: SeedDraftLedger,
+        open_before: tuple[str, ...],
+    ) -> bool:
+        if answer.blocker is not None:
+            return False
+        simulated = SeedDraftLedger.from_dict(ledger.to_dict())
+        self.answerer.apply(answer, simulated, question=question)
+        open_after = tuple(simulated.open_gaps())
+        return len(open_after) < len(open_before) and set(open_after).issubset(open_before)
+
+    def _is_repeated_default_answer(self, answer: AutoAnswer, ledger: SeedDraftLedger) -> bool:
+        # Only the catch-all generic-default route counts as a "repeated
+        # generic fallback". Feature-specific helpers (acceptance, runtime,
+        # IO/actor, verification, non-goal, product behavior) may also use
+        # ``CONSERVATIVE_DEFAULT`` as their answer source but should not be
+        # treated as fallback answers — repeated specific follow-ups stay
+        # preserved instead of being swapped for an unrelated gap fill.
+        if not answer.generic_default:
+            return False
+        proposed = _normalize_answer_text(answer.prefixed_text)
+        return any(
+            _normalize_answer_text(item.get("answer", "")) == proposed
+            for item in ledger.question_history
+        )
 
     def _handle_completed_turn(
         self, state: AutoPipelineState, ledger: SeedDraftLedger, turn: InterviewTurn, rounds: int
@@ -313,6 +426,97 @@ class AutoInterviewDriver:
         record_authoring_backend(state)
         self._save(state)
         return AutoInterviewResult("blocked", state.interview_session_id, ledger, rounds, blocker)
+
+    # Maximum number of completion-signal turns the driver will send when
+    # closing the interview after safe-default finalization. The production
+    # InterviewHandler requires a stability streak of
+    # ``AUTO_COMPLETE_STREAK_REQUIRED`` (=2) qualifying completion signals
+    # before it actually closes the transcript, so a single synthesis turn
+    # does not always suffice — we send the full synthesis once and then
+    # short follow-up confirmations until the backend confirms or we hit
+    # this cap.
+    _SYNTHESIS_COMPLETION_MAX_ATTEMPTS = 3
+
+    async def _record_safe_default_synthesis(
+        self,
+        state: AutoPipelineState,
+        ledger: SeedDraftLedger,
+        finalization: SafeDefaultFinalization,
+    ) -> str | None:
+        """Persist the safe-default synthesis through the interview backend.
+
+        The downstream seed generator reads from the interview transcript on
+        disk, not from the auto ledger, so a ledger that becomes Seed-ready
+        only via :func:`finalize_safe_defaultable_gaps` would otherwise leave
+        the transcript missing those assumptions (Q00/ouroboros#763 review on
+        ``c072ed94``). Push the synthesis answer through ``backend.answer``
+        so the transcript and ledger stay in sync, then send up to
+        :pyattr:`_SYNTHESIS_COMPLETION_MAX_ATTEMPTS - 1` short confirmation
+        turns until the backend signals ``seed_ready``/``completed``. The
+        production interview handler requires a streak of two qualifying
+        completion signals before it closes the transcript (review of
+        ``64875869``), so a single synthesis turn does not reliably end the
+        session. Returns ``None`` on success or when there is nothing to
+        synthesize, and a blocker string if the synthesis cannot be
+        persisted within the attempt budget.
+        """
+        synthesis = build_safe_default_synthesis(finalization)
+        if not synthesis or not state.interview_session_id:
+            return None
+        follow_up = (
+            f"{AUTO_ANSWER_PREFIX}{SAFE_DEFAULT_SYNTHESIS_TAG} "
+            "Mark the interview complete and hand off for seed generation. "
+            "No remaining ambiguity for safe-defaultable sections."
+        )
+        # Capture the question that was pending before synthesis started so
+        # the ledger can record the correct Q/A pairing for round 1.
+        prior_pending_question = state.pending_question or "auto safe-default finalization"
+        for attempt in range(self._SYNTHESIS_COMPLETION_MAX_ATTEMPTS):
+            text = synthesis if attempt == 0 else follow_up
+            try:
+                turn = _validate_turn(
+                    await self._with_timeout(
+                        self.backend.answer(state.interview_session_id, text),
+                        state,
+                        tool_name="interview.answer",
+                    )
+                )
+            except TimeoutError as exc:
+                # The backend may or may not have processed the call —
+                # invalidate our cached pending_question so a later
+                # ``--resume`` queries live state via ``backend.resume`` and
+                # cannot replay an already-answered prompt.
+                state.pending_question = None
+                self._save(state)
+                return (
+                    "safe-default synthesis could not be persisted to the "
+                    f"interview transcript: {exc}"
+                )
+            except Exception as exc:
+                state.pending_question = None
+                self._save(state)
+                return f"safe-default synthesis answer failed: {exc}"
+            state.interview_session_id = turn.session_id
+            # Sync pending_question with the backend's latest turn so that a
+            # later ``--resume`` after synthesis failure re-enters the
+            # interview at the correct prompt instead of replaying the
+            # pre-synthesis question (review of ``cc128420``).
+            state.pending_question = turn.question or None
+            if attempt == 0:
+                ledger.record_qa(prior_pending_question, synthesis)
+                state.ledger = ledger.to_dict()
+            self._save(state)
+            if turn.seed_ready or turn.completed:
+                return None
+        # The backend still has not honoured the completion signal. Caller
+        # rolls back the safe-default entries and emits the canonical
+        # "unresolved gaps" blocker; we just signal the failure here. The
+        # final ``state.pending_question`` reflects the live backend prompt.
+        return (
+            "interview backend did not honour the safe-default completion "
+            f"signal within {self._SYNTHESIS_COMPLETION_MAX_ATTEMPTS} attempts; "
+            "transcript would still contain an unanswered question."
+        )
 
     async def _with_timeout(
         self, awaitable: Awaitable[InterviewTurn], state: AutoPipelineState, *, tool_name: str
@@ -427,35 +631,42 @@ class FunctionInterviewBackend:
         return bool(self._is_session_persisted(session_id))
 
 
+def _revert_safe_default_entries(
+    ledger: SeedDraftLedger, defaulted_sections: tuple[str, ...]
+) -> None:
+    """Remove the safe-default policy's entries from the named sections.
+
+    Used when the safe-default synthesis cannot be persisted to the interview
+    transcript: rolling back the policy's own DEFAULTED entries restores the
+    ledger to its pre-finalization state so ``open_gaps()`` and the block
+    message report the genuinely unresolved sections to downstream consumers
+    of the convergence contract.
+    """
+    for section_name in defaulted_sections:
+        section = ledger.sections.get(section_name)
+        if section is None:
+            continue
+        section.entries = [
+            entry
+            for entry in section.entries
+            if not entry.key.endswith(".safe_default_finalization")
+        ]
+
+
 def _generate_interview_id() -> str:
     """Return a unique interview id matching the engine's plugin format."""
     return f"interview_{uuid4().hex[:16]}"
 
 
+_BROAD_PROMPT_RE = re.compile(
+    r"\b(what else|anything else|additional context|more context|"
+    r"what should we know|clarify further)\b"
+)
+
+
 def _can_steer_with_gap_prompt(question: str) -> bool:
-    lowered = question.lower()
-    return bool(
-        re.search(
-            r"\b(what else|anything else|additional context|more context|what should we know|clarify further)\b",
-            lowered,
-        )
-    )
-
-
-def _gap_prompt(gap: Gap) -> str:
-    prompts = {
-        "goal": "Clarify the primary user goal for the Seed.",
-        "actors": "Who are the actors, inputs, and outputs for this task?",
-        "inputs": "Who are the actors, inputs, and outputs for this task?",
-        "outputs": "Who are the actors, inputs, and outputs for this task?",
-        "constraints": "What conservative constraints and failure modes should bound this MVP?",
-        "failure_modes": "What conservative constraints and failure modes should bound this MVP?",
-        "non_goals": "What non-goals should explicitly remain out of scope?",
-        "acceptance_criteria": "Which command output verifies the acceptance criteria?",
-        "verification_plan": "Which command output verifies the acceptance criteria?",
-        "runtime_context": "Which runtime stack, repo, and project patterns should be used?",
-    }
-    return prompts.get(gap.section, gap.message)
+    """Return True when ``question`` is broad enough to benefit from gap-targeted steering."""
+    return bool(_BROAD_PROMPT_RE.search(question.lower()))
 
 
 _AUTO_ANSWER_LOG_LIMIT = 25
@@ -494,6 +705,10 @@ def _truncate(text: str, limit: int) -> str:
     if len(flat) <= limit:
         return flat
     return f"{flat[: limit - 3]}..."
+
+
+def _normalize_answer_text(text: str) -> str:
+    return " ".join(str(text).casefold().split())
 
 
 def _validate_turn(value: object) -> InterviewTurn:

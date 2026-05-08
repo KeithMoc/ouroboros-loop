@@ -17,6 +17,7 @@ from ouroboros.auto.seed_reviewer import SeedReview, SeedReviewer
 from ouroboros.auto.state import (
     AutoPhase,
     AutoPipelineState,
+    AutoResumeCapability,
     AutoStore,
     SeedOrigin,
     utc_now_iso,
@@ -65,6 +66,15 @@ class AutoPipelineResult:
     invoked_by: str = "direct"
     provenance: dict[str, Any] | None = None
     last_authoring_backend: str | None = None
+    resume_capability: AutoResumeCapability = AutoResumeCapability.RESUME
+    """Typed :class:`AutoResumeCapability` value. Defaults to
+    :attr:`AutoResumeCapability.RESUME` so existing test constructions of
+    ``AutoPipelineResult(...)`` keep their historical behavior.
+    ``AutoPipeline._result()`` overrides it from the persisted state's
+    :meth:`AutoPipelineState.resume_capability`."""
+    ledger_provenance: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    evidence_backed_sections: tuple[str, ...] = ()
+    assumption_only_sections: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -472,6 +482,10 @@ class AutoPipeline:
         run_subagent: dict[str, Any] | None = None,
         status_override: str | None = None,
     ) -> AutoPipelineResult:
+        summary = ledger.summary()
+        ledger_provenance = {
+            source: tuple(sections) for source, sections in summary.get("provenance", {}).items()
+        }
         return AutoPipelineResult(
             status=status_override or state.phase.value,
             auto_session_id=state.auto_session_id,
@@ -505,6 +519,10 @@ class AutoPipeline:
             invoked_by=state.invoked_by(),
             provenance=dict(state.provenance) if state.provenance else None,
             last_authoring_backend=state.last_authoring_backend,
+            resume_capability=state.resume_capability(),
+            ledger_provenance=ledger_provenance,
+            evidence_backed_sections=tuple(summary.get("evidence_backed_sections", ())),
+            assumption_only_sections=tuple(summary.get("assumption_only_sections", ())),
         )
 
     def _attach_run_if_requested(self, state: AutoPipelineState) -> bool | None:

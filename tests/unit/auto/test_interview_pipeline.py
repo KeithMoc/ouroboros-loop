@@ -14,6 +14,7 @@ from ouroboros.auto.interview_driver import (
 from ouroboros.auto.ledger import LedgerEntry, LedgerSource, LedgerStatus, SeedDraftLedger
 from ouroboros.auto.pipeline import AutoPipeline
 from ouroboros.auto.repo_context import repo_auto_answer_context
+from ouroboros.auto.safe_defaults import finalize_safe_defaultable_gaps
 from ouroboros.auto.seed_repairer import SeedRepairer
 from ouroboros.auto.seed_reviewer import ReviewFinding, SeedReview, SeedReviewer
 from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
@@ -215,12 +216,66 @@ def test_seed_draft_ledger_uses_later_repeated_non_goal_as_correction() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interview_driver_blocks_after_max_rounds_with_open_gaps(tmp_path) -> None:
+async def test_interview_driver_finalizes_safe_defaults_after_max_rounds(tmp_path) -> None:
+    answer_calls: list[tuple[str, str]] = []
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What should we verify?", "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:
+        answer_calls.append((session_id, text))
+        # Mirror the production interview handler: a synthesis answer that
+        # carries the "mark the interview complete" completion signal
+        # closes the transcript on the same turn.
+        if "mark the interview complete" in text.lower():
+            return InterviewTurn("", session_id, seed_ready=True, completed=True)
+        return InterviewTurn("What else?", session_id, seed_ready=False)
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=1,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "seed_ready"
+    assert state.phase == AutoPhase.INTERVIEW
+    assert state.interview_completed is True
+    assert ledger.is_seed_ready()
+    assert ledger.summary()["open_gaps"] == []
+    final_actor = ledger.sections["actors"].entries[-1]
+    assert final_actor.status == LedgerStatus.DEFAULTED
+    assert final_actor.source == LedgerSource.ASSUMPTION
+    assert any("safe-default policy" in item for item in final_actor.evidence)
+    # Synthesis must be persisted to the interview transcript so the seed
+    # generator (which reads the transcript) sees the same assumptions the
+    # ledger now records — guards against the ledger/transcript split-brain.
+    synthesis_text = next(
+        text for _sid, text in answer_calls if "safe-default synthesis" in text.lower()
+    )
+    assert "mark the interview complete" in synthesis_text.lower()
+    assert "actors" in synthesis_text
+    assert any("safe-default" in item.get("answer", "").lower() for item in ledger.question_history)
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_blocks_when_safe_default_synthesis_rejected(tmp_path) -> None:
+    call_count = 0
+
     async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
         return InterviewTurn("What should we verify?", "interview_1")
 
     async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
-        return InterviewTurn("What else?", session_id, seed_ready=False)
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return InterviewTurn("What else?", session_id, seed_ready=False)
+        msg = "interview backend refuses post-bound synthesis"
+        raise RuntimeError(msg)
 
     state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
     ledger = SeedDraftLedger.from_goal(state.goal)
@@ -235,7 +290,518 @@ async def test_interview_driver_blocks_after_max_rounds_with_open_gaps(tmp_path)
 
     assert result.status == "blocked"
     assert state.phase == AutoPhase.BLOCKED
+    # Synthesis failure rolls back the safe-default entries so the canonical
+    # "unresolved gaps" blocker is reported and the ledger reflects the
+    # genuinely unresolved sections — preserving the convergence contract.
     assert "unresolved gaps" in (result.blocker or "")
+    assert state.interview_completed is False
+    assert ledger.open_gaps(), (
+        "rolled-back ledger must expose at least one unresolved gap so the "
+        "convergence contract still names actionable sections"
+    )
+    assert not any(
+        entry.key.endswith(".safe_default_finalization")
+        for section in ledger.sections.values()
+        for entry in section.entries
+    ), "safe-default policy entries must be reverted on synthesis failure"
+    # Backend.answer raised after the first synthesis turn — the driver
+    # cannot trust the cached pending_question because the backend may have
+    # processed (or partially processed) the call. Force ``--resume`` to
+    # query live state via ``backend.resume()`` instead of replaying.
+    assert state.pending_question is None
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_finalizes_when_backend_requires_two_completion_signals(
+    tmp_path,
+) -> None:
+    # The production interview handler closes the transcript only after a
+    # streak of two qualifying completion signals. The driver must follow up
+    # with additional confirmation turns until the backend confirms.
+    completion_streak = 0
+    answer_calls: list[tuple[str, str]] = []
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What should we verify?", "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:
+        nonlocal completion_streak
+        answer_calls.append((session_id, text))
+        if "mark the interview complete" in text.lower():
+            completion_streak += 1
+            if completion_streak >= 2:
+                return InterviewTurn("", session_id, seed_ready=True, completed=True)
+            # Streak shortfall — backend asks the user to confirm again.
+            return InterviewTurn("Type done once more", session_id, seed_ready=False)
+        return InterviewTurn("What else?", session_id, seed_ready=False)
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=1,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "seed_ready"
+    assert state.interview_completed is True
+    assert ledger.is_seed_ready()
+    # Round-1 user answer + synthesis (turn 1) + confirmation (turn 2) = 3.
+    completion_signal_calls = [
+        text for _sid, text in answer_calls if "mark the interview complete" in text.lower()
+    ]
+    assert len(completion_signal_calls) >= 2, (
+        "expected the driver to send at least two completion signals to satisfy "
+        f"the streak contract; got {completion_signal_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_blocks_when_backend_ignores_synthesis_completion_signal(
+    tmp_path,
+) -> None:
+    # The synthesis text carries a "mark the interview complete" signal; if
+    # a backend ignores it and keeps asking questions, the persisted
+    # transcript would diverge from auto state. The driver must block
+    # rather than declaring seed_ready against a still-open transcript.
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What should we verify?", "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        # Always return another question with seed_ready=False, regardless
+        # of the answer text — simulating a backend that does not honour
+        # the completion signal.
+        return InterviewTurn("Anything else?", session_id, seed_ready=False)
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=1,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert state.phase == AutoPhase.BLOCKED
+    # Backend ignored the completion signal → synthesis failed → ledger is
+    # rolled back and the canonical "unresolved gaps" blocker is emitted.
+    assert "unresolved gaps" in (result.blocker or "")
+    assert state.interview_completed is False
+    assert ledger.open_gaps()
+    # After synthesis failure the driver must leave pending_question pointing
+    # at the backend's latest live prompt (or cleared) — never the stale
+    # pre-synthesis question. A later ``--resume`` would otherwise replay an
+    # already-answered prompt against an advanced session. The fake backend
+    # always returns "Anything else?" after the synthesis turns, so that's
+    # what the auto state should now hold.
+    assert state.pending_question == "Anything else?"
+
+
+def test_safe_default_blocks_when_interview_answer_introduces_unsafe_context() -> None:
+    ledger = SeedDraftLedger.from_goal("Build a small local CLI")
+    ledger.record_qa(
+        "How should the CLI authenticate?",
+        "It needs to call the production OAuth provider with the customer access token.",
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal="Build a small local CLI",
+        provenance="unit test",
+    )
+
+    assert not result.completed
+    assert result.unsafe_gaps  # at least one gap stays unsafe
+    assert any("unsafe default context" in gap for gap in result.unsafe_gaps)
+    assert not ledger.is_seed_ready()
+
+
+def test_safe_default_ignores_from_auto_answers_in_question_history() -> None:
+    # AutoAnswerer prefixes every policy-emitted answer with "[from-auto]".
+    # Those answers routinely mention auth/credentials/production as
+    # exclusions; the unsafe gate must skip them so its own outputs do not
+    # block subsequent finalization passes.
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    ledger.record_qa(
+        "What boundary should we keep?",
+        "[from-auto][conservative_default] Avoid authentication, credentials, "
+        "and production deployment per the conservative default.",
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert result.completed
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+def test_safe_default_finalization_is_idempotent_against_its_own_synthesis() -> None:
+    # Pushing the safe-default synthesis back through the interview transcript
+    # records it as an answer in question_history. A second finalize call on
+    # the same ledger must still succeed — the gate must recognize its own
+    # synthesis (tagged with the [from-auto] prefix) as policy output, not
+    # as new user-asserted unsafe context.
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+
+    first = finalize_safe_defaultable_gaps(ledger, goal=goal, provenance="unit test pass 1")
+    assert first.completed
+    assert ledger.is_seed_ready()
+
+    # Simulate the interview driver appending the synthesis back into
+    # question_history (what _record_safe_default_synthesis does).
+    from ouroboros.auto.safe_defaults import build_safe_default_synthesis
+
+    synthesis = build_safe_default_synthesis(first)
+    assert synthesis  # sanity
+    ledger.record_qa("auto safe-default finalization", synthesis)
+
+    second = finalize_safe_defaultable_gaps(ledger, goal=goal, provenance="unit test pass 2")
+    # Nothing left to default on pass 2, and the synthesis must not have
+    # poisoned the gate.
+    assert second.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+def test_safe_default_blocks_when_conservative_default_entry_authorizes_unsafe_scope() -> None:
+    # CONSERVATIVE_DEFAULT entries land with status DEFAULTED but still carry
+    # user-derived scope — the unsafe gate must not silently treat them as
+    # safe just because their status is DEFAULTED.
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    ledger.add_entry(
+        "runtime_context",
+        LedgerEntry(
+            key="runtime_context.conservative_default",
+            value="Deploys to production with customer credentials as the conservative default.",
+            source=LedgerSource.CONSERVATIVE_DEFAULT,
+            confidence=0.6,
+            status=LedgerStatus.DEFAULTED,
+            rationale="Recorded by an earlier auto round.",
+        ),
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert not result.completed
+    assert any("unsafe default context" in gap for gap in result.unsafe_gaps)
+    assert not ledger.is_seed_ready()
+
+
+def test_safe_default_blocks_when_non_user_goal_entry_introduces_unsafe_context() -> None:
+    ledger = SeedDraftLedger.from_goal("Build a small local CLI")
+    ledger.add_entry(
+        "inputs",
+        LedgerEntry(
+            key="inputs.repo_fact",
+            value="Reads the production database credentials file from disk.",
+            source=LedgerSource.REPO_FACT,
+            confidence=0.9,
+            status=LedgerStatus.CONFIRMED,
+            rationale="Surfaced from repo scan during interview.",
+        ),
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal="Build a small local CLI",
+        provenance="unit test",
+    )
+
+    assert not result.completed
+    assert any("unsafe default context" in gap for gap in result.unsafe_gaps)
+    assert not ledger.is_seed_ready()
+
+
+@pytest.mark.parametrize(
+    "goal",
+    [
+        "Reproduce a production bug locally with the existing test fixtures",
+        "Use the production schema snapshot already in the repo",
+        "Replay a captured production trace against the local server",
+        "Document the prod logging format in the developer guide",
+        "Compile the live preview build for local QA",
+    ],
+)
+def test_safe_default_allows_benign_production_mentions(goal: str) -> None:
+    ledger = SeedDraftLedger.from_goal(goal)
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert result.completed, (
+        f"goal {goal!r} only describes local read-only context; "
+        "finalization must not block on bare production/prod/live mentions"
+    )
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+@pytest.mark.parametrize(
+    "goal",
+    [
+        "Deploy the new service to production for the launch event",
+        "Release version 2 to prod after the freeze",
+        "Push live the cutover migration on Friday",
+        "Going live with the rebuilt checkout flow next week",
+    ],
+)
+def test_safe_default_blocks_genuine_production_actions(goal: str) -> None:
+    ledger = SeedDraftLedger.from_goal(goal)
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert not result.completed, (
+        f"goal {goal!r} authorizes a production-class action; finalization must block"
+    )
+    assert any("external side effect" in gap.lower() for gap in result.unsafe_gaps)
+    assert not ledger.is_seed_ready()
+
+
+@pytest.mark.parametrize(
+    "goal",
+    [
+        "Build a CLI with no external dependencies",
+        "Use existing external API schema files only",
+        "Sync against external integration documentation already vendored in the repo",
+    ],
+)
+def test_safe_default_allows_benign_external_mentions(goal: str) -> None:
+    ledger = SeedDraftLedger.from_goal(goal)
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert result.completed
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "No production deployment.",
+        "No authentication required.",
+        "Do not use customer credentials.",
+        "Never deploy to production.",
+        "We avoid OAuth and skip billing.",
+        "No auth, credentials, and production deployment.",
+        "Without payment processing or webhook callbacks.",
+    ],
+)
+def test_safe_default_respects_negated_unsafe_terms(answer: str) -> None:
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    ledger.record_qa("How should this work?", answer)
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert result.completed, f"negated answer {answer!r} should not block finalization"
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+def test_safe_default_still_blocks_when_negation_does_not_cover_unsafe_term() -> None:
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    # Contrastive conjunctions cancel the negation scope — the second half is
+    # a positive assertion and must still flag.
+    ledger.record_qa(
+        "Walk me through the auth model.",
+        "No prod deploys, but log credentials in env so the daemon can read them.",
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert not result.completed
+    assert any("unsafe default context" in gap for gap in result.unsafe_gaps)
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected_reason_substring"),
+    [
+        # Comma + imperative verb breaks the negation scope, leaving the
+        # second clause visible to the unsafe regex bank.
+        (
+            "No production deploys, use customer credentials from Vault.",
+            "credentials",
+        ),
+        (
+            "Without billing integration, send email notifications to customers.",
+            "external side effect",
+        ),
+        # Comma + noun-led counter-clause (no imperative verb) also breaks
+        # the scope when the sentence has no list connector — the second
+        # clause is a positive assertion that must still flag.
+        (
+            "No production deploys, customer credentials from Vault are still required.",
+            "credentials",
+        ),
+        # Semicolon also breaks the scope.
+        (
+            "No external API; deploy to production for the first launch.",
+            "external side effect",
+        ),
+    ],
+)
+def test_safe_default_blocks_when_negation_does_not_cover_subsequent_clause(
+    answer: str, expected_reason_substring: str
+) -> None:
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    ledger.record_qa("How should this work?", answer)
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert not result.completed, (
+        f"answer {answer!r} contains a positively asserted clause; "
+        "finalization must not auto-default"
+    )
+    joined = "\n".join(result.unsafe_gaps).lower()
+    assert expected_reason_substring.lower() in joined, (
+        f"expected unsafe reason matching {expected_reason_substring!r} for {answer!r}, "
+        f"got {result.unsafe_gaps!r}"
+    )
+    assert not ledger.is_seed_ready()
+
+
+def test_safe_default_treats_confirmed_non_goals_as_exclusions_not_unsafe_scope() -> None:
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    ledger.add_entry(
+        "non_goals",
+        LedgerEntry(
+            key="non_goals.user_excludes",
+            value="auth, credentials, and production deployment",
+            source=LedgerSource.NON_GOAL,
+            confidence=0.95,
+            status=LedgerStatus.CONFIRMED,
+            rationale="User explicitly ruled these out during the interview.",
+        ),
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+    )
+
+    assert result.completed
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+def test_safe_default_ignores_unsafe_terms_in_interview_questions() -> None:
+    goal = "Build a small local CLI"
+    ledger = SeedDraftLedger.from_goal(goal)
+    # The backend asked about authentication and production deployment, but
+    # the user explicitly answered no. Only answers carry user intent — the
+    # question alone must not poison finalization.
+    ledger.record_qa(
+        "How should this authenticate? Does it deploy to production?",
+        "No auth and local-only execution; nothing leaves the machine.",
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal=goal,
+        provenance="unit test",
+        pending_question="Does this require any production credentials?",
+    )
+
+    assert result.completed
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+def test_safe_default_non_goals_do_not_make_later_finalization_unsafe() -> None:
+    ledger = SeedDraftLedger.from_goal("Build a small local CLI")
+    ledger.add_entry(
+        "non_goals",
+        LedgerEntry(
+            key="non_goals.safe_boundary",
+            value="Do not perform credential handling, billing, or production deployment.",
+            source=LedgerSource.ASSUMPTION,
+            confidence=0.7,
+            status=LedgerStatus.DEFAULTED,
+            rationale="Conservative scope boundary recorded by auto policy.",
+        ),
+    )
+
+    result = finalize_safe_defaultable_gaps(
+        ledger,
+        goal="Build a small local CLI",
+        provenance="unit test",
+    )
+
+    assert result.unsafe_gaps == ()
+    assert ledger.is_seed_ready()
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_keeps_unsafe_gaps_blocking_after_max_rounds(tmp_path) -> None:
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What should we verify?", "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What else?", session_id, seed_ready=False)
+
+    state = AutoPipelineState(
+        goal="Deploy the service to production and configure the required credentials",
+        cwd=str(tmp_path),
+    )
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=1,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert state.phase == AutoPhase.BLOCKED
+    assert "unresolved gaps" in (result.blocker or "")
+    assert "unsafe default context" in (result.blocker or "")
+    assert not ledger.is_seed_ready()
 
 
 @pytest.mark.asyncio
@@ -1100,6 +1666,133 @@ async def test_interview_driver_steers_generic_questions_to_open_gaps(tmp_path) 
     assert any("single local user" in item.lower() for item in answers)
     assert any("non-goals" in item.lower() or "non-goal" in item.lower() for item in answers)
     assert any("runtime" in item.lower() for item in answers)
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_uses_gap_answers_when_generic_defaults_repeat(tmp_path) -> None:
+    answers: list[str] = []
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("Anything else?", "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        answers.append(text)
+        completed = len(answers) >= 5
+        return InterviewTurn("Anything else?", session_id, completed=completed)
+
+    state = AutoPipelineState(goal="Build a local report generator", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer), store=AutoStore(tmp_path), max_rounds=6
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "seed_ready"
+    assert ledger.open_gaps() == []
+    assert sum("conservative mvp" in item.lower() for item in answers) == 1
+    assert any("single local user" in item.lower() for item in answers)
+    assert any("non-goals" in item.lower() or "non-goal" in item.lower() for item in answers)
+    assert any("runtime" in item.lower() for item in answers)
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_preserves_specific_acceptance_answers_with_open_gaps(
+    tmp_path,
+) -> None:
+    answers: list[str] = []
+    questions = iter(
+        [
+            "What acceptance criteria should the search feature satisfy?",
+            "What acceptance criteria should the export feature satisfy?",
+        ]
+    )
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn(next(questions), "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        answers.append(text)
+        try:
+            next_q = next(questions)
+        except StopIteration:
+            return InterviewTurn("Anything else?", session_id, completed=True)
+        return InterviewTurn(next_q, session_id)
+
+    state = AutoPipelineState(goal="Build a local CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer), store=AutoStore(tmp_path), max_rounds=4
+    )
+
+    await driver.run(state, ledger)
+
+    # Both specific feature/acceptance prompts should produce feature-specific
+    # answers even though other required ledger sections (e.g. actors,
+    # runtime_context) remain open. The driver must not replace them with
+    # gap-targeted fallbacks.
+    assert len(answers) >= 2, answers
+    assert "search feature" in answers[0].lower()
+    assert "export feature" in answers[1].lower()
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_preserves_repeated_specific_acceptance_answer(
+    tmp_path,
+) -> None:
+    """A specific feature/acceptance prompt asked twice while other sections are
+    still open should still be answered specifically each time, not silently
+    replaced by a gap-targeted fallback.
+    """
+    answers: list[str] = []
+    repeated_question = "What acceptance criteria should the search feature satisfy?"
+    rounds = {"n": 0}
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn(repeated_question, "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        answers.append(text)
+        rounds["n"] += 1
+        if rounds["n"] >= 2:
+            return InterviewTurn("Anything else?", session_id, completed=True)
+        return InterviewTurn(repeated_question, session_id)
+
+    state = AutoPipelineState(goal="Build a local CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer), store=AutoStore(tmp_path), max_rounds=4
+    )
+
+    await driver.run(state, ledger)
+
+    assert len(answers) >= 2, answers
+    assert "search feature" in answers[0].lower()
+    assert "search feature" in answers[1].lower()
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_blocks_blank_goal_before_gap_defaults(tmp_path) -> None:
+    answers: list[str] = []
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("Anything else?", "interview_1")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        answers.append(text)
+        return InterviewTurn("Anything else?", session_id)
+
+    state = AutoPipelineState(goal="Build a local tool", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal("")
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer), store=AutoStore(tmp_path), max_rounds=3
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert "goal is weak" in (result.blocker or "")
+    assert answers == []
 
 
 def test_auto_state_rejects_malformed_resume_optional_fields() -> None:
@@ -2738,3 +3431,158 @@ async def test_interview_driver_resumes_existing_session_after_partial_failure(
     assert not start_calls
     assert result.session_id == persisted_session
     assert state.interview_session_id == persisted_session
+
+
+def test_interview_start_timeout_state_routes_to_interview_on_resume_with_retry_capability() -> (
+    None
+):
+    """An ``interview.start`` timeout is a recoverable resume path but classifies as RETRY.
+
+    The #688 invariant: ``_recoverable_phase_for_tool('interview.start')`` returns
+    :class:`AutoPhase.INTERVIEW` (so :meth:`AutoPipeline.run` routes the resume
+    back into the interview phase), *and* :meth:`AutoPipelineState.resume_capability`
+    classifies the post-timeout state as :class:`AutoResumeCapability.RETRY`
+    because no ``interview_session_id`` was persisted — there is no prior
+    progress to recover.
+    """
+    from ouroboros.auto.pipeline import _recoverable_phase_for_tool
+    from ouroboros.auto.state import AutoResumeCapability
+
+    state = AutoPipelineState(goal="Build a CLI", cwd="/tmp/project")
+    state.transition(AutoPhase.INTERVIEW, "interview")
+    state.mark_blocked("interview.start timed out", tool_name="interview.start")
+
+    assert state.phase is AutoPhase.BLOCKED
+    assert state.last_tool_name == "interview.start"
+    assert state.interview_session_id is None
+    assert state.pending_question is None
+    assert _recoverable_phase_for_tool("interview.start") is AutoPhase.INTERVIEW
+    assert state.resume_capability() is AutoResumeCapability.RETRY
+
+
+@pytest.mark.asyncio
+async def test_convergence_contract_broad_benign_goal_resolves_with_safe_assumptions(
+    tmp_path,
+) -> None:
+    """Broad benign goals may proceed only with auditable required sections."""
+
+    rounds = 0
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What else should we know?", "interview_contract")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        nonlocal rounds
+        rounds += 1
+        return InterviewTurn(
+            "What else should we know?",
+            session_id,
+            seed_ready=rounds >= 5,
+            completed=rounds >= 5,
+        )
+
+    state = AutoPipelineState(goal="Build a local note taking CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=6,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "seed_ready"
+    assert ledger.is_seed_ready()
+    assert ledger.open_gaps() == []
+    for required in (
+        "actors",
+        "inputs",
+        "outputs",
+        "non_goals",
+        "acceptance_criteria",
+        "verification_plan",
+        "runtime_context",
+    ):
+        assert ledger.sections[required].entries, required
+    assert {entry.source for entry in ledger.sections["actors"].entries} <= {
+        LedgerSource.ASSUMPTION,
+        LedgerSource.USER_GOAL,
+    }
+    assert any(
+        entry.status == LedgerStatus.DEFAULTED
+        for entry in ledger.sections["acceptance_criteria"].entries
+    )
+
+
+@pytest.mark.asyncio
+async def test_convergence_contract_unsafe_authority_question_blocks(tmp_path) -> None:
+    """Unsafe authority gaps are blockers, not auto-filled defaults."""
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn(
+            "Which production access token should auto configure?",
+            "interview_contract",
+        )
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        raise AssertionError("unsafe blocker should stop before backend.answer")
+
+    state = AutoPipelineState(goal="Deploy a service", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=3,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert state.phase == AutoPhase.BLOCKED
+    assert "credential or secret value required" in (result.blocker or "")
+
+
+@pytest.mark.asyncio
+async def test_convergence_contract_stalled_generic_followups_report_actionable_gaps(
+    tmp_path,
+) -> None:
+    """Generic ``What else?`` follow-up loops must blocker on unresolved sections.
+
+    This pins the documented stall pattern from
+    ``docs/auto-interview-convergence-contract.md``: when the backend keeps asking
+    ``What else?`` / ``Any additional context?``-style questions and required
+    sections never resolve, the round-cap blocker has to name the unresolved
+    gaps, not just say that ``max_rounds`` was reached.
+    """
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What else should we know?", "interview_contract")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("What else should we know?", session_id)
+
+    state = AutoPipelineState(
+        goal="Build a small note-taking CLI",
+        cwd=str(tmp_path),
+    )
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=AutoStore(tmp_path),
+        max_rounds=1,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    blocker = result.blocker or ""
+    assert result.status == "blocked"
+    assert state.phase == AutoPhase.BLOCKED
+    assert "unresolved gaps" in blocker
+    open_gaps = ledger.open_gaps()
+    assert open_gaps, "stalled generic loop must leave at least one open required gap"
+    # The blocker must name at least one specific unresolved section, not just
+    # report that max_rounds was reached.
+    assert any(section in blocker for section in open_gaps)

@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.20.0,<1.0.0",
     "anyio>=4.0.0,<5.0.0",
+    "jsonschema>=4.21.0,<5.0.0",
     "pydantic>=2.0.0,<3.0.0",
     "prompt-toolkit>=3.0.0,<4.0.0",
     "pyyaml>=6.0.0,<7.0.0",
@@ -64,6 +65,7 @@ packages = ["src/ouroboros"]
 # the same wheel via this same config.
 exclude = [
     "src/ouroboros/opencode/plugin/**",
+    "src/ouroboros/plugin/schemas/**",
 ]
 
 [tool.hatch.build.targets.wheel.force-include]
@@ -72,6 +74,11 @@ exclude = [
 # reliably finds ouroboros-bridge.ts / package.json / tsconfig.json in the
 # installed wheel, independent of hatchling's implicit asset handling.
 "src/ouroboros/opencode/plugin" = "ouroboros/opencode/plugin"
+# Same pattern for the vendored UserLevel plugin schemas — `_load_schema`
+# in `ouroboros.plugin.manifest` resolves them via `importlib.resources`,
+# so they must reach the installed wheel as package data, not just the
+# source tree.
+"src/ouroboros/plugin/schemas" = "ouroboros/plugin/schemas"
 
 [dependency-groups]
 dev = [
