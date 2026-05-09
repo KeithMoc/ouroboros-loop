@@ -52,6 +52,7 @@ constraints:
   - "Commit per AC with a conventional-commit message in the orchestrator branch."
   - "Emit at least one [[INVARIANT: ...]] tag per AC so later ACs can be checked against it."
   - "Do NOT modify the `output/parking/db.py` schema once AC-1 has committed it. ACs 2–5 must adapt."
+  - "ISOLATION: Operate ONLY in the current working directory. Do NOT `cd` to any absolute path outside cwd. Do NOT use absolute paths to read/write files outside cwd. The seed file is at `./seed.yaml` and the project root is the cwd at orchestrator launch. All file paths in the ACs (e.g. `output/parking/db.py`) are relative to cwd."
 
 acceptance_criteria:
   - |
