@@ -1,0 +1,428 @@
+# Parking-Lot Audit — v2
+#
+# Purpose
+# -------
+# Same controlled experiment as v1 (compounding-vs-parallel orchestrator
+# audit), but the seed is **deliberately under-specified** on four axes
+# where AC-1 must pick a binding representation that downstream ACs cannot
+# infer from the seed alone. This is the regime compounding's postmortem
+# chain is supposed to win: AC-N+1 needs AC-N's choice, and only the chain
+# carries it.
+#
+# Read examples/parking-lot-audit/REPORT.md for v1's findings and why this
+# v2 design is necessary.
+#
+# Forced ambiguity axes (AC-1 picks; ACs 2-8 must align)
+# ------------------------------------------------------
+# Axis 1: Timestamp format
+#   AC-1 picks ONE of: ISO 8601 string ('2026-05-09T14:30:00Z'),
+#   Unix epoch int (1747403400), or RFC 3339 string with offset.
+#   The seed does NOT say which.
+#
+# Axis 2: Tag representation
+#   AC-1 picks ONE of: single string column, CSV string column,
+#   or JSON array column. The seed says ONLY that 'tag' must support
+#   "one or more labels" — the encoding is AC-1's choice.
+#
+# Axis 3: Entry-ID format
+#   AC-1 picks ONE of: 'pe_' + 12 hex chars, UUID v4, or ULID.
+#   The seed says ONLY that the ID must be globally unique and stable.
+#
+# Axis 4: Soft-delete semantics
+#   AC-1 picks ONE of: hard DELETE on `parking done`, `deleted_at`
+#   timestamp column with row preservation, or `status` enum
+#   ('active' | 'done' | 'archived'). The seed says ONLY that
+#   `parking done` must "mark the entry as completed" and that
+#   `parking list` must "by default not show completed entries."
+#
+# Each ambiguity axis is one drift opportunity. Compounding sees AC-1's
+# choice via the postmortem chain; parallel guesses each time.
+#
+# Bonus axis introduced at AC-7
+# -----------------------------
+# Axis 5 (mid-chain): Priority encoding for migration v2.
+#   AC-7 picks ONE of: integer 1..5 (low), or enum 'low'|'med'|'high'.
+#   ACs 2 (CLI), 4 (TUI), and 5 (export) must accommodate AC-7's choice
+#   in their migration-v2 update. This tests whether the postmortem
+#   chain can carry a decision made *mid-chain* through to subsequent
+#   ACs that come after AC-7.
+
+goal: |
+  Build a small, working "parking-lot" CLI + TUI in Python under
+  ``output/`` (relative to orchestrator working directory) that lets an
+  AI agent (or human) park half-baked work across multiple projects and
+  worktrees, then resume it later.
+
+  Concrete deliverable, in 8 sequential ACs:
+
+    AC-1 — SQLite schema + Pydantic models + migration v1
+           **AC-1 must pick a binding representation for: timestamp
+           format, tag representation, entry-id format, soft-delete
+           semantics.** Record those choices in module docstrings AND
+           in [[INVARIANT: ...]] tags so later ACs can find them.
+
+    AC-2 — Click CLI: ``parking add | list | resume | done | tag``
+    AC-3 — Worktree probe: capture git state populating AC-1's schema
+    AC-4 — Textual TUI: list view + detail panel + hotkeys
+    AC-5 — ``parking export`` markdown handoff (compatible with dx:handoff)
+    AC-6 — ``parking sync`` over a file-based dropbox (push/pull JSONL)
+    AC-7 — Migration v2: adds ``priority`` field. **AC-7 picks a binding
+           encoding for priority (int 1..5 or enum low/med/high).**
+           Updates ACs 2, 4, and 5 callers to handle the v2 schema.
+    AC-8 — Pytest suite + smoke harness + README + ``parking export``
+           dx-handoff format compliance check
+
+  Each AC after AC-1 must use the EXACT representations AC-1 picked.
+  If AC-1 chose ISO 8601 timestamps, AC-2 must accept/parse ISO 8601 and
+  reject other formats. If AC-1 chose a JSON array column for tag,
+  AC-2's ``--tag`` flag must produce a JSON array on INSERT. Drift
+  between AC-1's choice and downstream usage is a defect. The audit
+  measures exactly that drift.
+
+constraints:
+  - "Python 3.10+ (no walrus in match statements)."
+  - "Single self-contained package under output/ — name it ``parking``."
+  - "Dependencies: ``click``, ``textual``, ``pydantic>=2``, ``sqlite3`` (stdlib). Add ``ulid-py`` only if AC-1 picks ULID."
+  - "All code lives under output/parking/. Tests under output/tests/."
+  - "Use SQLite via stdlib ``sqlite3`` — no SQLAlchemy."
+  - "All public functions and classes must have type hints."
+  - "Commit per AC with conventional-commit messages."
+  - "Emit at least TWO ``[[INVARIANT: ...]]`` tags per AC: one stating the AC's contribution, one binding a downstream contract."
+  - "ISOLATION: Operate ONLY in cwd. Do NOT cd outside cwd. Do NOT use absolute paths to files outside cwd."
+  - "ONCE AC-1 commits its representation choices, ACs 2-8 may not change them. Migration v2 in AC-7 may ADD fields but may not REPLACE AC-1's existing fields."
+  - "AC-1's docstring in models.py must declare its 4 axis choices in a structured way that downstream ACs and the audit score script can mechanically extract."
+
+acceptance_criteria:
+  - |
+    AC-1 — Schema + models + migration v1 (PICKS 4 AMBIGUITY AXES)
+
+    Create:
+      - output/parking/db.py: ``connect(path: Path) -> sqlite3.Connection``
+        and ``migrate(conn)`` that runs migration v1.
+      - output/parking/models.py: a Pydantic v2 model for parking entries
+        whose field set is the SCHEMA OF RECORD for v1.
+
+    REQUIRED FIELDS (semantics fixed; representation picked by AC-1):
+      - entry_id      — unique, stable, immutable identifier
+      - project       — str, free-form (e.g. 'ouroboros-loop')
+      - worktree_path — str, absolute path to git working tree
+      - branch        — str, git branch at park time
+      - head_sha      — str, 40-char git SHA
+      - dirty         — bool, TRUE iff worktree had uncommitted changes
+      - parked_at     — timestamp (AC-1 picks format)
+      - tag           — one or more labels (AC-1 picks representation)
+      - note          — str, free-form, may be empty
+      - resumed_at    — timestamp or NULL (uses same format as parked_at)
+
+    AC-1 MUST PICK:
+      Axis 1 (timestamp): ISO 8601 string | Unix epoch int | RFC 3339 string
+      Axis 2 (tag):       single string | CSV string | JSON array column
+      Axis 3 (entry_id):  'pe_'+12hex | UUID v4 | ULID
+      Axis 4 (soft-delete): hard DELETE | deleted_at column | status enum
+
+    AC-1 MUST RECORD ITS CHOICES in BOTH:
+      (a) A module-level docstring at the top of output/parking/models.py
+          starting with the exact heading line:
+            # AC-1 ambiguity-axis choices (binding for ACs 2-8)
+          followed by exactly four lines of the form:
+            # axis_<N>_<name>: <choice-token>
+          where choice-token is one of:
+            axis_1_timestamp:   iso8601 | unix_epoch | rfc3339
+            axis_2_tag:         single_string | csv_string | json_array
+            axis_3_entry_id:    pe_hex12 | uuid4 | ulid
+            axis_4_soft_delete: hard_delete | deleted_at | status_enum
+      (b) Four [[INVARIANT: ...]] tags, one per axis, of the form:
+            [[INVARIANT: axis_<N>_<name> = <choice-token>]]
+
+    Migration v1:
+      - One table parking_entries with the chosen columns.
+      - Index on (project, parked_at DESC).
+      - schema_version table holding integer 1.
+      - migrate() must be idempotent.
+
+    Tests in output/tests/test_db.py:
+      - migrate() creates table + index + schema_version row.
+      - migrate() called twice is idempotent.
+      - Round-trip insert + select for a sample ParkingEntry.
+      - Field type round-trip respects AC-1's choices (e.g. if axis_1
+        is unix_epoch, parked_at is stored/returned as int).
+
+    INVARIANT EMISSIONS (in addition to the 4 axis-choice invariants):
+      - [[INVARIANT: AC-1 schema is the source of truth; AC-2..8 may not rename or replace its fields]]
+      - [[INVARIANT: migrate() is idempotent — calling it on an already-migrated DB is a no-op]]
+
+  - |
+    AC-2 — CLI: parking add | list | resume | done | tag
+
+    Create output/parking/cli.py with a Click group ``parking`` exposing:
+
+      parking add
+        --project TEXT       (required)
+        --worktree-path PATH (required, must exist)
+        --tag TEXT           (required)
+        --note TEXT          (optional, default '')
+        # If AC-1 picked axis_2_tag = single_string:  --tag accepts ONE label.
+        # If AC-1 picked axis_2_tag = csv_string:     --tag accepts comma-separated, e.g. 'wip,blocked'.
+        # If AC-1 picked axis_2_tag = json_array:     --tag accepts JSON array, e.g. '["wip","blocked"]'.
+        # parked_at is set to "now" in AC-1's chosen timestamp format.
+        # Captures branch, head_sha, dirty via a placeholder
+        # _probe_worktree() that returns ('unknown', '0'*40, False).
+        # AC-3 will replace the stub with a real probe.
+        # entry_id is generated in AC-1's chosen format.
+
+      parking list
+        --project TEXT (optional filter)
+        --tag TEXT     (optional filter; semantics match AC-1's tag rep)
+        # By default does NOT show completed entries (per AC-1's
+        # soft-delete semantics).
+        --all          (flag: include completed entries)
+        # Output: tabular text. Columns must reference AC-1's exact
+        # field names; timestamps rendered in AC-1's chosen format.
+
+      parking resume ENTRY_ID
+        # Sets resumed_at = now in AC-1's chosen timestamp format.
+        # Prints reactivation command on stdout.
+
+      parking done ENTRY_ID
+        # Marks the entry as completed using AC-1's chosen soft-delete
+        # mechanism (hard DELETE | set deleted_at=now | set status='done').
+
+      parking tag ENTRY_ID NEW_TAG
+        # Updates the tag column. Input format matches AC-1's tag rep.
+
+    DB path resolution:
+      - $PARKING_DB if set, else ~/.local/share/parking/parking.db.
+      - Auto-create parent dirs.
+      - Auto-migrate on every CLI invocation.
+
+    AC-2 MUST READ AC-1's choices from the docstring/INVARIANT tags it
+    finds in models.py, NOT guess. The CLI's input parsing and output
+    rendering must mirror AC-1's representations.
+
+    Tests in output/tests/test_cli.py (Click CliRunner, isolated $PARKING_DB):
+      - add → list → resume → done full lifecycle.
+      - --all flag includes completed entries; default does not.
+      - --tag filter respects AC-1's tag representation.
+      - parking tag command updates the row.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: parking CLI honors AC-1's axis_1 timestamp format on input AND output]]
+      - [[INVARIANT: parking CLI honors AC-1's axis_2 tag representation on --tag input]]
+      - [[INVARIANT: parking done uses AC-1's axis_4 soft-delete mechanism]]
+
+  - |
+    AC-3 — Worktree probe
+
+    Create output/parking/git_probe.py with ``probe_worktree(path: Path)``
+    that:
+      - Runs ``git -C <path> rev-parse --abbrev-ref HEAD`` for branch.
+      - Runs ``git -C <path> rev-parse HEAD`` for head_sha.
+      - Runs ``git -C <path> status --porcelain`` and sets dirty=True
+        iff stdout is non-empty.
+      - Raises a clear error if path is not a git working tree.
+
+    Wire ``_probe_worktree`` in cli.py to call ``git_probe.probe_worktree``.
+
+    The probe returns values for the SAME field names AC-1 declared
+    (branch, head_sha, dirty). If AC-1 picked axis_4 = status_enum and
+    the schema added a status column, probe results still populate the
+    same branch/head_sha/dirty fields — probe does not need to know about
+    status, but its output must be insertable into AC-1's schema.
+
+    Tests in output/tests/test_git_probe.py (tmp_path with ``git init``):
+      - Probe on clean repo returns (default-branch-name, 40-char SHA, False).
+      - Probe after touching a file returns dirty=True.
+      - Probe on non-git dir raises.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: probe_worktree populates AC-1 schema fields branch/head_sha/dirty]]
+      - [[INVARIANT: probe_worktree raises on non-git directories — never returns sentinel]]
+
+  - |
+    AC-4 — TUI: Textual list + detail panel
+
+    Create output/parking/tui.py with a ``run()`` entry point invokable
+    as ``parking ui``. Layout:
+      - Left: scrollable list, most-recent parked_at first.
+        Row format: project · branch · tag · parked_at-as-date.
+      - Right: detail panel showing every ParkingEntry field by AC-1's
+        EXACT field names AND in AC-1's chosen representations.
+        - Timestamps rendered in AC-1's chosen format (axis_1).
+        - Tag rendered in AC-1's chosen representation (axis_2).
+        - Soft-deleted entries shown only if --all toggled (axis_4).
+      - Footer: hotkey legend (r resume, d done, q quit, a toggle all).
+
+    The TUI must read AC-1's choices from models.py (via the same
+    docstring/INVARIANT mechanism AC-2 uses). No hard-coded representation
+    decisions in tui.py.
+
+    Tests in output/tests/test_tui.py:
+      - Snapshot test: detail panel displays all 10 schema-of-record
+        field names verbatim.
+      - Timestamp formatting test: rendered output matches AC-1's chosen
+        format (regex against axis_1's choice).
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: TUI detail panel shows all AC-1 schema fields by AC-1's exact names]]
+      - [[INVARIANT: TUI rendering reads AC-1's axis choices, not hard-coded]]
+
+  - |
+    AC-5 — parking export — dx-handoff markdown
+
+    Create output/parking/handoff_export.py with:
+      - ``to_handoff_doc(entry: ParkingEntry) -> str`` returning markdown
+        with frontmatter (project, branch, parked_at) and body
+        (note + reactivation command). Field NAMES and timestamp/tag
+        FORMATS must match AC-1.
+      - Add ``parking export ENTRY_ID`` CLI subcommand printing the
+        rendered markdown to stdout.
+
+    The frontmatter MUST include all AC-1 schema field names verbatim,
+    with values in AC-1's chosen formats. Timestamp keys use ISO 8601
+    only if axis_1 == iso8601 — otherwise use AC-1's representation
+    (the dx:handoff skill is loose on format).
+
+    Tests in output/tests/test_handoff_export.py:
+      - Round-trip: create entry → render → assert every AC-1 schema
+        field name appears in the rendered markdown verbatim.
+      - axis_1 conformance: rendered timestamp matches AC-1's format
+        (regex per axis_1 choice).
+      - axis_2 conformance: rendered tag value matches AC-1's tag
+        representation.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: handoff export contains all AC-1 schema field names verbatim]]
+      - [[INVARIANT: handoff export timestamp matches AC-1's axis_1 format]]
+
+  - |
+    AC-6 — parking sync — file-based dropbox
+
+    Create output/parking/sync.py implementing:
+      - ``parking sync push DROPBOX_PATH``: serializes all non-completed
+        entries to a JSONL file at ``DROPBOX_PATH/<project>.jsonl``,
+        one JSON object per line, using AC-1's exact field names.
+        Timestamp values are emitted in AC-1's axis_1 format. Tag
+        values use AC-1's axis_2 representation (str | csv | array).
+      - ``parking sync pull DROPBOX_PATH``: reads the JSONL file and
+        upserts entries by entry_id. New entries are inserted; existing
+        entries are updated only if the incoming parked_at is newer.
+
+    Add ``parking sync push|pull DROPBOX_PATH`` CLI subcommands to cli.py.
+
+    The push/pull encoding is round-trip-correct: ``pull`` of a ``push``
+    leaves the database identical (ignoring soft-delete semantics).
+
+    Tests in output/tests/test_sync.py:
+      - push then pull on a fresh DB recreates the original entries
+        (entry_id, all fields preserved by name + format).
+      - Pull of a stale entry (older parked_at) does NOT overwrite
+        the local row.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: sync push emits AC-1 field names with axis_1/axis_2 formatting]]
+      - [[INVARIANT: sync pull is idempotent and respects parked_at recency]]
+
+  - |
+    AC-7 — Migration v2: priority field (PICKS A NEW AMBIGUITY AXIS)
+
+    Create migration v2 in output/parking/db.py that adds a ``priority``
+    column to ``parking_entries``. AC-7 PICKS:
+      Axis 5 (priority encoding): integer 1..5 | enum 'low'|'med'|'high'
+
+    AC-7 records its choice in:
+      (a) A heading-anchored block in db.py docstring:
+            # AC-7 ambiguity-axis choice (binding for migration-v2 callers)
+            # axis_5_priority: int_1to5 | enum_low_med_high
+      (b) Two [[INVARIANT: ...]] tags:
+            [[INVARIANT: axis_5_priority = <choice-token>]]
+            [[INVARIANT: migration v2 adds priority column with axis_5 encoding]]
+
+    Update:
+      - models.py — add ``priority`` to ParkingEntry, type matches axis_5.
+      - cli.py — ``parking add`` gains optional ``--priority VALUE`` and
+        ``parking priority ENTRY_ID NEW_VALUE``. Input parsed per axis_5.
+      - tui.py — detail panel shows priority field.
+      - handoff_export.py — frontmatter includes priority.
+      - sync.py — JSONL round-trips priority per axis_5.
+
+    All updates must be MECHANICAL — they reuse the EXISTING patterns
+    each callee established earlier. No renames or removals.
+
+    Tests:
+      - Migration v2 idempotency.
+      - CLI accepts priority in axis_5 format.
+      - TUI/export/sync all carry priority through.
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: migration v2 is additive — does not modify v1 columns]]
+      - [[INVARIANT: priority callers (cli, tui, export, sync) parse/render per axis_5]]
+
+  - |
+    AC-8 — Pytest suite + smoke harness + README
+
+    Create:
+      - output/README.md — quick-start (install, add, list, resume, ui,
+        export, sync). README's example commands and timestamps must
+        use AC-1's chosen formats.
+      - output/tests/test_smoke.py — non-interactive end-to-end test:
+        ``parking add`` → ``list`` → ``priority``-set → ``export`` →
+        ``sync push`` → ``done``. All via subprocess. Asserts each
+        step exits 0 and stdout matches AC-1's representations.
+      - Run ``pytest output/tests/ -q`` and ensure all tests pass before
+        committing AC-8.
+
+    The smoke test should be runnable from any cwd (use a tmp_path
+    fixture for $PARKING_DB and a tmp dropbox).
+
+    INVARIANT EMISSIONS:
+      - [[INVARIANT: output/tests/test_smoke.py covers the full add→export→sync→done lifecycle]]
+      - [[INVARIANT: README example commands match AC-1's representations]]
+
+ontology_schema:
+  name: "ParkingLotAuditV2"
+  description: "Cross-worktree handoff parking app with deliberately ambiguous representation choices — audit fixture for parallel-vs-compounding execution at chain-length 8."
+  fields:
+    - name: "ParkingEntry"
+      field_type: "entity"
+      description: "Pydantic model + sqlite row. Field names fixed by AC-1; representations picked by AC-1."
+    - name: "AmbiguityAxes"
+      field_type: "decision_record"
+      description: "AC-1 chooses {timestamp, tag, entry_id, soft_delete}; AC-7 chooses {priority}. Choices are recorded in module docstrings and INVARIANT tags."
+    - name: "WorktreeProbe"
+      field_type: "service"
+      description: "Captures git state into AC-1 schema fields."
+    - name: "ParkingDB"
+      field_type: "store"
+      description: "SQLite with parking_entries + schema_version + (per axis_4) optional deleted_at/status."
+    - name: "ParkingCLI"
+      field_type: "interface"
+      description: "Click CLI honoring AC-1 representations on input + output."
+    - name: "ParkingTUI"
+      field_type: "interface"
+      description: "Textual TUI rendering AC-1 schema by exact names + AC-1 representations."
+    - name: "HandoffExporter"
+      field_type: "service"
+      description: "Renders ParkingEntry as dx:handoff-compatible markdown."
+    - name: "DropboxSync"
+      field_type: "service"
+      description: "JSONL push/pull preserving AC-1 representations end-to-end."
+
+evaluation_principles:
+  - name: "axis_alignment"
+    description: "ACs 2-8 must align with AC-1's choices on all 4 axes (and AC-7's choice on axis 5). Mis-alignment is the headline defect this audit measures."
+  - name: "schema_fidelity"
+    description: "Field names from AC-1 are immutable. Migration v2 may add fields but may not rename or replace v1 fields."
+  - name: "invariant_emission"
+    description: "Every AC emits ≥2 [[INVARIANT: ...]] tags. AC-1 emits ≥4 axis-choice invariants. AC-7 emits ≥2 axis_5 invariants."
+  - name: "test_pass_rate"
+    description: "All AC-level tests pass. AC-8's smoke test covers the full chain end-to-end."
+  - name: "no_orphan_fields"
+    description: "No AC may introduce a model field, CLI flag, or TUI display name that is not declared in the seed or in AC-1's/AC-7's recorded choices."
+
+metadata:
+  seed_id: "parking-lot-audit-v2"
+  parent_seed: "parking-lot-audit"
+  ambiguity_score: 0.55  # higher than v1 (0.10) — deliberate
+  expected_decomposition_depth: 0
+  source_brainstorm: "examples/parking-lot-audit/REPORT.md"
+  execution_mode_required: null  # set per-run via --compounding flag

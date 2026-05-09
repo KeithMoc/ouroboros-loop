@@ -167,3 +167,11 @@ examples/parking-lot-audit/runs/*/session.log
 examples/parking-lot-audit/runs/*/commits.log
 examples/parking-lot-audit/runs/*/metrics.json
 examples/parking-lot-audit/bench-driver.log
+
+# Parking-lot audit v2 — same shape as v1 (per-run heavy data ignored, REPORT/scores tracked)
+examples/parking-lot-audit-v2/runs/*/output/
+examples/parking-lot-audit-v2/runs/*/events.sqlite
+examples/parking-lot-audit-v2/runs/*/session.log
+examples/parking-lot-audit-v2/runs/*/commits.log
+examples/parking-lot-audit-v2/runs/*/metrics.json
+examples/parking-lot-audit-v2/bench-driver.log
