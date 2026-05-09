@@ -166,3 +166,4 @@ examples/parking-lot-audit/runs/*/events.sqlite
 examples/parking-lot-audit/runs/*/session.log
 examples/parking-lot-audit/runs/*/commits.log
 examples/parking-lot-audit/runs/*/metrics.json
+examples/parking-lot-audit/bench-driver.log

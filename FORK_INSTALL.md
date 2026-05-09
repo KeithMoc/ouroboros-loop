@@ -6,6 +6,16 @@ redactor, Q4.1 mode-resolution, etc.). Use these instructions to install the for
 directly — the upstream `ouroboros-ai` package on PyPI does **not** include these
 features.
 
+> **Audit evidence:** A controlled comparison of `--compounding` vs default
+> parallel execution on a 5-AC project lives at
+> [`examples/parking-lot-audit/REPORT.md`](examples/parking-lot-audit/REPORT.md).
+> The audit's headline finding: on tasks where every cross-AC contract is
+> spelled out in the seed, compounding does **not** outperform parallel — its
+> postmortem chain has nothing to carry. The harness, score script, and the
+> v2 audit design (deliberately ambiguous contracts, longer chain) are all
+> in [`scripts/audit/`](scripts/audit/) for anyone who wants to reproduce
+> or extend the experiment.
+
 ## Recommended: `uv tool install` from git
 
 ```bash

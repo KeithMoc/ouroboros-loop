@@ -1,0 +1,120 @@
+{
+  "runs": [
+    {
+      "run_id": "compounding-r1",
+      "mode": "compounding",
+      "replay": 1,
+      "ac_count": 0,
+      "tokens_total": 0,
+      "wall_seconds_total": 1928.0,
+      "schema_drift": 0,
+      "cli_drift": 0,
+      "invariant_count": 24,
+      "tests_passed": 92,
+      "tests_failed": 7,
+      "smoke_ok": 0,
+      "notes": []
+    },
+    {
+      "run_id": "compounding-r2",
+      "mode": "compounding",
+      "replay": 2,
+      "ac_count": 0,
+      "tokens_total": 0,
+      "wall_seconds_total": 1503.0,
+      "schema_drift": 0,
+      "cli_drift": 0,
+      "invariant_count": 24,
+      "tests_passed": 84,
+      "tests_failed": 0,
+      "smoke_ok": 0,
+      "notes": []
+    },
+    {
+      "run_id": "compounding-r3",
+      "mode": "compounding",
+      "replay": 3,
+      "ac_count": 0,
+      "tokens_total": 0,
+      "wall_seconds_total": 1517.0,
+      "schema_drift": 0,
+      "cli_drift": 0,
+      "invariant_count": 26,
+      "tests_passed": 69,
+      "tests_failed": 0,
+      "smoke_ok": 0,
+      "notes": []
+    },
+    {
+      "run_id": "parallel-r1",
+      "mode": "parallel",
+      "replay": 1,
+      "ac_count": 0,
+      "tokens_total": 0,
+      "wall_seconds_total": 1467.0,
+      "schema_drift": 0,
+      "cli_drift": 0,
+      "invariant_count": 60,
+      "tests_passed": 119,
+      "tests_failed": 0,
+      "smoke_ok": 0,
+      "notes": []
+    },
+    {
+      "run_id": "parallel-r2",
+      "mode": "parallel",
+      "replay": 2,
+      "ac_count": 0,
+      "tokens_total": 0,
+      "wall_seconds_total": 1390.0,
+      "schema_drift": 0,
+      "cli_drift": 0,
+      "invariant_count": 35,
+      "tests_passed": 95,
+      "tests_failed": 0,
+      "smoke_ok": 0,
+      "notes": []
+    },
+    {
+      "run_id": "parallel-r3",
+      "mode": "parallel",
+      "replay": 3,
+      "ac_count": 0,
+      "tokens_total": 0,
+      "wall_seconds_total": 1440.0,
+      "schema_drift": 0,
+      "cli_drift": 0,
+      "invariant_count": 51,
+      "tests_passed": 75,
+      "tests_failed": 0,
+      "smoke_ok": 0,
+      "notes": []
+    }
+  ],
+  "aggregates": {
+    "parallel": {
+      "n": 3,
+      "ac_count_mean": 0,
+      "tokens_total_mean": 0,
+      "wall_seconds_total_mean": 1432.3333333333333,
+      "schema_drift_mean": 0,
+      "cli_drift_mean": 0,
+      "invariant_count_mean": 48.666666666666664,
+      "tests_passed_mean": 96.33333333333333,
+      "tests_failed_mean": 0,
+      "smoke_ok_rate": 0
+    },
+    "compounding": {
+      "n": 3,
+      "ac_count_mean": 0,
+      "tokens_total_mean": 0,
+      "wall_seconds_total_mean": 1649.3333333333333,
+      "schema_drift_mean": 0,
+      "cli_drift_mean": 0,
+      "invariant_count_mean": 24.666666666666668,
+      "tests_passed_mean": 81.66666666666667,
+      "tests_failed_mean": 2.3333333333333335,
+      "smoke_ok_rate": 0
+    }
+  }
+}
