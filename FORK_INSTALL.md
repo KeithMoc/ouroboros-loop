@@ -6,15 +6,26 @@ redactor, Q4.1 mode-resolution, etc.). Use these instructions to install the for
 directly — the upstream `ouroboros-ai` package on PyPI does **not** include these
 features.
 
-> **Audit evidence:** A controlled comparison of `--compounding` vs default
-> parallel execution on a 5-AC project lives at
-> [`examples/parking-lot-audit/REPORT.md`](examples/parking-lot-audit/REPORT.md).
-> The audit's headline finding: on tasks where every cross-AC contract is
-> spelled out in the seed, compounding does **not** outperform parallel — its
-> postmortem chain has nothing to carry. The harness, score script, and the
-> v2 audit design (deliberately ambiguous contracts, longer chain) are all
-> in [`scripts/audit/`](scripts/audit/) for anyone who wants to reproduce
-> or extend the experiment.
+> **Audit evidence:** Two controlled comparisons of `--compounding` vs default
+> parallel execution live in this repo:
+>
+> - **v1** (5-AC, fully-specified contracts):
+>   [`examples/parking-lot-audit/REPORT.md`](examples/parking-lot-audit/REPORT.md).
+>   Compounding did **not** outperform parallel — its postmortem chain
+>   had nothing to carry because the seed pinned every contract.
+>
+> - **v2** (8-AC, deliberately ambiguous contracts):
+>   [`examples/parking-lot-audit-v2/REPORT.md`](examples/parking-lot-audit-v2/REPORT.md).
+>   Drift hypothesis still unfalsified — agents converged on identical
+>   "Pythonic default" picks across all 5 ambiguity axes in both modes.
+>   Compounding *was* cheaper on tool/message counts when it completed
+>   (~18-59% reductions) but ~17% slower on wall and 2/5 runs hit a
+>   13s fast-fail (likely Claude API rate-limit). v3 design notes are
+>   in the v2 report.
+>
+> Harness, score script, and metrics extractor are in
+> [`scripts/audit/`](scripts/audit/) — reusable for anyone who wants
+> to reproduce or extend the experiment.
 
 ## Recommended: `uv tool install` from git
 
