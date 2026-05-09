@@ -107,13 +107,21 @@ AXES = {
 }
 
 AXIS_5_PRIORITY = {
-    "tokens": ("int_1to5", "enum_low_med_high"),
+    # Accept multiple token spellings — agent has been seen to emit int_1_5
+    # instead of the seed's int_1to5. Both denote the same choice.
+    "tokens": ("int_1to5", "int_1_5", "enum_low_med_high", "enum_low_high"),
     "downstream_signal": {
         "int_1to5": [
             re.compile(r"priority:\s*int|--priority\s+(?:INTEGER|INT)|\b1\s*<=\s*priority"),
         ],
+        "int_1_5": [
+            re.compile(r"priority:\s*int|--priority\s+(?:INTEGER|INT)|\b1\s*<=\s*priority"),
+        ],
         "enum_low_med_high": [
             re.compile(r"['\"]low['\"]|['\"]med['\"]|['\"]high['\"]"),
+        ],
+        "enum_low_high": [
+            re.compile(r"['\"]low['\"]|['\"]high['\"]"),
         ],
     },
 }
@@ -326,10 +334,13 @@ def score_run(run_dir: Path) -> RunScore:
     db_py = _read_text(run_dir / "output" / "parking" / "db.py")
     score.ac7_priority_pick = _extract_priority_pick(db_py)
 
-    # Aggregate downstream source (cli + tui + handoff_export + sync), exclude models/db itself
+    # Aggregate downstream source. Include models.py too — agents commonly
+    # put ID-generation helpers there (e.g. `_new_entry_id`) and downstream
+    # callers just import the helper, so the alignment signal lives in the
+    # helper's body. Excluding models.py made axis_3 (entry_id) under-detect.
     downstream = "\n".join(
         _read_text(run_dir / "output" / "parking" / f)
-        for f in ("cli.py", "tui.py", "handoff_export.py", "sync.py", "git_probe.py")
+        for f in ("cli.py", "tui.py", "handoff_export.py", "sync.py", "git_probe.py", "models.py", "db.py")
     )
 
     score.axis_1_aligned = _check_axis_alignment(

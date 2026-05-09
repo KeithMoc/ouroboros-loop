@@ -72,7 +72,7 @@ run_one() {
   pushd "$clone_dir" >/dev/null
   set +e
   uv run --frozen --project "$REPO_ROOT" ouroboros run workflow "$clone_dir/seed.yaml" \
-    $mode_flag --runtime claude \
+    $mode_flag --runtime claude --max-decomposition-depth 0 \
     > "$clone_dir/session.log" 2>&1
   local exit_code=$?
   set -e
