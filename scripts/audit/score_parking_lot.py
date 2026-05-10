@@ -4,7 +4,8 @@
 Walks examples/parking-lot-audit/runs/<mode>-r<i>/ for each completed run,
 extracts a fixed set of metrics, and writes:
 
-    examples/parking-lot-audit/REPORT.md      — human-readable report
+    examples/parking-lot-audit/REPORT.auto.md — auto-generated data tables
+    (REPORT.md itself is curated and NEVER overwritten by this script)
     examples/parking-lot-audit/scores.json    — machine-readable sidecar
 
 Metrics extracted per run:
@@ -43,7 +44,7 @@ from statistics import mean
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = REPO_ROOT / "examples" / "parking-lot-audit"
 RUNS_ROOT = AUDIT_ROOT / "runs"
-REPORT_PATH = AUDIT_ROOT / "REPORT.md"
+REPORT_PATH = AUDIT_ROOT / "REPORT.auto.md"
 SCORES_PATH = AUDIT_ROOT / "scores.json"
 
 SCHEMA_FIELDS = (

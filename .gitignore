@@ -175,3 +175,9 @@ examples/parking-lot-audit-v2/runs/*/session.log
 examples/parking-lot-audit-v2/runs/*/commits.log
 examples/parking-lot-audit-v2/runs/*/metrics.json
 examples/parking-lot-audit-v2/bench-driver.log
+
+# REPORT.auto.md — auto-generated data tables from score script. The curated
+# REPORT.md (tracked) holds the human analysis; the .auto.md sidecar is
+# regenerable from scores.json and is gitignored to prevent merge churn.
+examples/parking-lot-audit/REPORT.auto.md
+examples/parking-lot-audit-v2/REPORT.auto.md

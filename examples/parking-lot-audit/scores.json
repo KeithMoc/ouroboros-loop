@@ -70,8 +70,8 @@
       "schema_drift": 0,
       "cli_drift": 0,
       "invariant_count": 35,
-      "tests_passed": 95,
-      "tests_failed": 0,
+      "tests_passed": 94,
+      "tests_failed": 1,
       "smoke_ok": 0,
       "notes": []
     },
@@ -100,8 +100,8 @@
       "schema_drift_mean": 0,
       "cli_drift_mean": 0,
       "invariant_count_mean": 48.666666666666664,
-      "tests_passed_mean": 96.33333333333333,
-      "tests_failed_mean": 0,
+      "tests_passed_mean": 96,
+      "tests_failed_mean": 0.3333333333333333,
       "smoke_ok_rate": 0
     },
     "compounding": {

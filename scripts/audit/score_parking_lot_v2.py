@@ -33,7 +33,10 @@ from statistics import mean
 REPO_ROOT = Path(__file__).resolve().parents[2]
 AUDIT_ROOT = REPO_ROOT / "examples" / "parking-lot-audit-v2"
 RUNS_ROOT = AUDIT_ROOT / "runs"
-REPORT_PATH = AUDIT_ROOT / "REPORT.md"
+# REPORT_AUTO_PATH is rewritten on every score run with the auto-generated table.
+# REPORT.md is the curated human-written analysis and is NEVER overwritten by
+# this script — to refresh data tables there, copy from REPORT.auto.md by hand.
+REPORT_AUTO_PATH = AUDIT_ROOT / "REPORT.auto.md"
 SCORES_PATH = AUDIT_ROOT / "scores.json"
 
 # AC-1 ambiguity axes. Each axis maps to:
@@ -474,7 +477,7 @@ def main() -> int:
             print(f"skipping {d}: {e}", file=sys.stderr)
     agg_par = aggregate(scores, "parallel")
     agg_comp = aggregate(scores, "compounding")
-    REPORT_PATH.write_text(render_report(scores, agg_par, agg_comp), encoding="utf-8")
+    REPORT_AUTO_PATH.write_text(render_report(scores, agg_par, agg_comp), encoding="utf-8")
     SCORES_PATH.write_text(
         json.dumps(
             {"runs": [asdict(s) for s in scores],
@@ -483,8 +486,9 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    print(f"wrote {REPORT_PATH}")
+    print(f"wrote {REPORT_AUTO_PATH}")
     print(f"wrote {SCORES_PATH}")
+    print("(REPORT.md is curated and NOT overwritten — see REPORT.auto.md for fresh data)")
     return 0
 
 
